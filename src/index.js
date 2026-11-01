@@ -12,6 +12,7 @@
 
 import { createBoard } from './board.js'
 import { createDispatcher } from './dispatcher.js'
+import { createRoster } from './roster.js'
 
 export const name = 'cs-bots'
 
@@ -40,6 +41,16 @@ export function apply(ctx, config = {}) {
   // ⚠️ 两个域的构造签名不同（board 是 `(ctx, config)`，dispatcher 也是 `(ctx, config)`）；
   //    日志一律用**字符串拼接**而非 `%s` 占位（避免形态差异导致格式串未插值）。
   const services = {}
+
+  // RosterService 先装配：K1 闸门需要它判定「哪些会话是 Bot」。
+  try {
+    services.roster = createRoster(ctx, { stateDir: config.stateDir })
+    log(`[cs-bots] RosterService 就绪（stateDir=${services.roster.paths?.stateDir ?? '?'}，durable=${services.roster.durable}）`)
+  } catch (error) {
+    warn(`[cs-bots] RosterService 装配失败 → 降级（Bot 注册表不可用，K1 保守放行）：${error?.message ?? error}`)
+    services.roster = undefined
+  }
+
   try {
     services.board = createBoard(ctx, { stateDir: config.stateDir })
     log(`[cs-bots] BoardService 就绪（stateDir=${services.board.paths?.stateDir ?? '?'}）`)
@@ -59,7 +70,8 @@ export function apply(ctx, config = {}) {
     services.dispatcher = undefined
   }
 
-  installBlockingToolGate(ctx, { warn })
+  installBlockingToolGate(ctx, { warn, roster: services.roster })
+  installBotToolTrimmer(ctx, { warn, roster: services.roster })
 
   // ── 生命周期收尾：停止定时器，避免进程退出被挂起的 timer 拖住 ────────────────
   // 用官方 ctx.effect（若可用）保证插件卸载时被调用；不可用则退化为不注册。
@@ -67,7 +79,7 @@ export function apply(ctx, config = {}) {
     try {
       services.dispatcher?.dispose?.()
     } catch (error) {
-      warn('[cs-bots] dispatcher dispose 失败：%s', error?.message ?? error)
+      warn(`[cs-bots] dispatcher dispose 失败：${error?.message ?? error}`)
     }
   }
   if (typeof ctx.effect === 'function') {
@@ -92,7 +104,7 @@ export function apply(ctx, config = {}) {
  * 需要在 `agent/created` 时按 Bot 身份施加 —— 那要等 RosterService（P5）判定
  * 「哪些会话是 Bot」。当前阶段**保守判定**，不误伤人类会话与官方 teammate。
  */
-function installBlockingToolGate(ctx, { warn }) {
+function installBlockingToolGate(ctx, { warn, roster }) {
   const tools = service(ctx, 'tools')
   if (!tools || typeof tools.guard !== 'function') {
     warn('[cs-bots] tools 服务不可用 → K1 闸门未装（降级，不阻塞启动）')
@@ -101,11 +113,11 @@ function installBlockingToolGate(ctx, { warn }) {
   try {
     return tools.guard((exec) => {
       if (exec?.name !== BLOCKING_QUESTION_TOOL) return undefined
-      if (!isBotSession(exec?.agent)) return undefined
+      if (!isBotSession(exec?.agent, roster)) return undefined
       return `Bot 会话不能使用 ${BLOCKING_QUESTION_TOOL}（会堵住整条多智能体投递链）。请在回复里直接提问。`
     })
   } catch (error) {
-    warn('[cs-bots] 装 K1 闸门失败：%s', error?.message ?? error)
+    warn(`[cs-bots] 装 K1 闸门失败：${error?.message ?? error}`)
     return undefined
   }
 }
@@ -113,16 +125,21 @@ function installBlockingToolGate(ctx, { warn }) {
 /**
  * 判定一个 agent 是否属于本平台的 Bot。
  *
- * P1 阶段尚无 RosterService ⇒ **保守返回 false**（不禁用任何会话的工具），
- * 以免误伤人类会话与官方 teammate。RosterService（P5）落地后改为查注册表。
+ * P5 起接入 RosterService：按 **sessionId** 查注册表（口径 = 「该会话已被注册为 Bot 且未退役」）。
+ * 无 roster（降级）或查不到时**保守返回 false** —— 宁可漏拦，也不误伤人类会话与官方 teammate。
  *
  * @param {unknown} agent
+ * @param {{ list?: Function } | undefined} roster
  * @returns {boolean}
  */
-function isBotSession(agent) {
-  // TODO(P5): 接入 RosterService 后按 sessionId 查表。
-  void agent
-  return false
+function isBotSession(agent, roster) {
+  const sid = agent?.id ?? agent?.session?.id
+  if (!sid || !roster || typeof roster.list !== 'function') return false
+  try {
+    return roster.list().some((bot) => bot?.sessionId === sid)
+  } catch {
+    return false
+  }
 }
 
 /**
@@ -146,6 +163,38 @@ export function hideBlockingToolsFromBot(agent, { warn } = {}) {
     if (deny.length === 0) return
     agentTools.restrict({ deny })
   } catch (error) {
-    warn?.('[cs-bots] 移除 Bot 的 %s 失败：%s', BLOCKING_QUESTION_TOOL, error?.message ?? error)
+    warn?.(`[cs-bots] 移除 Bot 的 ${BLOCKING_QUESTION_TOOL} 失败：${error?.message ?? error}`)
+  }
+}
+
+/**
+ * 装 `agent/created` 监听器（K1 双保险之二）。
+ *
+ * 官方语义原文（`ds-bot/src/host/tools.js:736` 注释）：
+ *   "Creation waits for this listener, so the Agent's first step already lacks the tool."
+ * ⇒ 在**第一个 step 之前**就把工具摘掉，模型既看不到也调不到（省 token）。
+ *
+ * 缺 `ctx.on` 或 roster 时**只 warn 不抛**（降级安全）。
+ */
+function installBotToolTrimmer(ctx, { warn, roster }) {
+  if (typeof ctx.on !== 'function') {
+    warn('[cs-bots] ctx.on 不可用 → K1 工具摘除未装（仅靠 guard 兜底）')
+    return
+  }
+  if (!roster) {
+    warn('[cs-bots] 无 RosterService → K1 工具摘除未装（仅靠 guard 兜底）')
+    return
+  }
+  try {
+    ctx.on('agent/created', ({ agent }) => {
+      try {
+        if (!isBotSession(agent, roster)) return
+        hideBlockingToolsFromBot(agent, { warn })
+      } catch (error) {
+        warn(`[cs-bots] agent/created 处理失败：${error?.message ?? error}`)
+      }
+    })
+  } catch (error) {
+    warn(`[cs-bots] 注册 agent/created 失败：${error?.message ?? error}`)
   }
 }
