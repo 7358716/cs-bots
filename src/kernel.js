@@ -15,7 +15,83 @@
  */
 
 // ── 唯一的宿主 import 面 ────────────────────────────────────────────────────
-import { createUserMessage } from '@deepseek-ai/dsh-llm'
+//
+// ⚠️ 刻意**不用静态 import**，改惰性 + 多锚点解析。原因（2026-11-01 实测踩到）：
+//   官方包只存在于 **dsh 安装目录**（本机 `/usr/lib/node_modules/@deepseek-ai/dsh/node_modules/`），
+//   而它的**兄弟包**（本插件在 profile 的 `node_modules` 里）**解析不到** `@deepseek-ai/dsh-llm`
+//   —— profile 的 `node_modules/@deepseek-ai/` 只有 `cosmokit` 与 `schemastery`。
+//   静态 import 会让「宿主包位置一变，插件直接加载失败」，与「绝不阻塞启动」纪律冲突。
+//
+// 惰性的另一收益：**不构造消息的调用路径完全不依赖宿主包** —— 单元测试因此可离线跑。
+import { createRequire } from 'node:module'
+import { existsSync } from 'node:fs'
+
+const HOST_LLM = '@deepseek-ai/dsh-llm'
+
+/** @type {Function | null} */
+let _createUserMessage = null
+/** @type {Error | null} */
+let _loadError = null
+
+/**
+ * 探测 dsh 安装锚点（按可靠性排序）。
+ * 环境变量 `CS_BOTS_DSH_ROOT` 可显式指定（测试与非常规安装用）。
+ * @returns {string[]}
+ */
+function dshAnchors() {
+  const anchors = []
+  if (process.env.CS_BOTS_DSH_ROOT) anchors.push(process.env.CS_BOTS_DSH_ROOT)
+  // 1) 本文件自身位置：装进 dsh 内时通常已经可解析
+  anchors.push(import.meta.url)
+  // 2) 常见全局安装布局（本机实测命中第 3 条）
+  anchors.push('/usr/lib/node_modules/@deepseek-ai/dsh/package.json')
+  anchors.push('/usr/local/lib/node_modules/@deepseek-ai/dsh/package.json')
+  // 3) 从 dsh 可执行文件反推（PATH 上的 dsh 多半在 <root>/bin/ 或 <root>/resources/...）
+  for (const dir of (process.env.PATH ?? '').split(':')) {
+    if (!dir) continue
+    anchors.push(`${dir}/../package.json`)
+    anchors.push(`${dir}/../node_modules/@deepseek-ai/dsh/package.json`)
+    anchors.push(`${dir}/../lib/node_modules/@deepseek-ai/dsh/package.json`)
+  }
+  // 4) 本机 dsh 默认 home 的邻居（供容器/云机兜底）
+  const home = process.env.HOME
+  if (home) anchors.push(`${home}/.dsh/../node_modules/@deepseek-ai/dsh/package.json`)
+  return anchors.filter((a) => typeof a === 'string' && a.length > 0)
+}
+
+/**
+ * 惰性加载宿主的 `createUserMessage`。
+ * @returns {Function}
+ * @throws {Error} 所有锚点都失败时（**带排查提示**，不静默）
+ */
+function loadCreateUserMessage() {
+  if (_createUserMessage) return _createUserMessage
+  if (_loadError) throw _loadError
+
+  const tried = []
+  for (const anchor of dshAnchors()) {
+    try {
+      // 文件锚点需先存在，createRequire 才不会因怪路径抛错
+      if (anchor.startsWith('/') && !existsSync(anchor)) continue
+      const req = createRequire(anchor)
+      const mod = req(HOST_LLM)
+      const fn = mod?.createUserMessage
+      if (typeof fn === 'function') {
+        _createUserMessage = fn
+        return fn
+      }
+      tried.push(`${anchor}: 已解析但无 createUserMessage 导出`)
+    } catch (error) {
+      tried.push(`${anchor}: ${error?.code ?? error?.message ?? error}`)
+    }
+  }
+  _loadError = new Error(
+    `cs-bots kernel: 无法解析宿主包 ${HOST_LLM}。\n` +
+      `  已知锚点尝试：\n    ${tried.join('\n    ')}\n` +
+      `  对策：设 CS_BOTS_DSH_ROOT=<dsh 安装目录>，或用 \`dsh --profile <p>\` 启动（宿主会暴露解析锚）。`,
+  )
+  throw _loadError
+}
 
 /**
  * 惰性取服务：兼容「新 API 有 get」与「老/测试上下文直接挂属性」两种形态。
@@ -99,14 +175,26 @@ const SOURCE = { kind: 'plugin', name: 'cs-bots' }
 
 /**
  * 构造一条可投递的用户消息。**不投递**，只构造（便于幂等键先记账再发送）。
+ * 宿主包解析失败时抛错（调用方需知道失败原因，这里不降级）。
  * @param {string} text
  * @returns {object} 冻结的 UserMessage
  */
 export function buildMessage(text) {
+  const createUserMessage = loadCreateUserMessage()
   return createUserMessage({
     content: [{ type: 'text', text: String(text ?? '') }],
     source: SOURCE,
   })
+}
+
+/** 宿主包是否可解析（诊断用，**不抛错**）。 */
+export function hostLlmAvailable() {
+  try {
+    loadCreateUserMessage()
+    return true
+  } catch {
+    return false
+  }
 }
 
 /**
