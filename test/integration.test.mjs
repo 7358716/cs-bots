@@ -25,7 +25,7 @@ import { apply } from '../src/index.js'
  * @param {{ withAgent?: boolean, maxPerTarget?: number }} [opts]
  */
 function boot(opts = {}) {
-  const { withAgent = true } = opts
+  const { withAgent = true, withTools = false, withOn = true } = opts
   const stateDir = mkdtempSync(join(tmpdir(), 'cs-bots-e2e-'))
   const logs = []
   const warns = []
@@ -44,11 +44,36 @@ function boot(opts = {}) {
     },
   }
 
+  // 动态 Bot 会话注册表：roster.create 走 kernel.createSession → agents.create
+  const createdSessions = new Map()
   const agents = {
-    get: (id) => (id === sessionId ? fakeAgent : undefined),
-    list: () => [fakeAgent],
+    get: (id) => (id === sessionId ? fakeAgent : createdSessions.get(id)),
+    list: () => [fakeAgent, ...createdSessions.values()],
+    create: async (options) => {
+      const handle = { id: options?.sessionId, meta: options?.meta }
+      createdSessions.set(options?.sessionId, handle)
+      return handle
+    },
   }
 
+  // 工具面替身：guard 收闸门、restrict 收摘除请求
+  const guards = []
+  const restricted = []
+  const botToolCtx = () => ({
+    tools: {
+      guard: (fn) => {
+        guards.push(fn)
+        return () => {}
+      },
+      schemas: () => [{ name: 'ask_user_question' }, { name: 'bash' }],
+      restrict: (filter) => {
+        restricted.push(filter)
+        return () => {}
+      },
+    },
+  })
+
+  const listeners = {}
   const ctx = {
     logger: {
       info: (...a) => logs.push(a.join(' ')),
@@ -56,8 +81,10 @@ function boot(opts = {}) {
     },
     get: (key) => {
       if (key === 'agents') return withAgent ? agents : undefined
+      if (key === 'tools' && withTools) return botToolCtx().tools
       return undefined
     },
+    ...(withOn ? { on: (name, fn) => { listeners[name] = fn } } : {}),
     effect: () => {},
   }
 
@@ -65,16 +92,27 @@ function boot(opts = {}) {
 
   const board = ctx.csBots?.board
   const dispatcher = ctx.csBots?.dispatcher
+  const roster = ctx.csBots?.roster
 
   return {
     ctx,
     board,
     dispatcher,
+    roster,
     sessionId,
     delivered,
     logs,
     warns,
     stateDir,
+    guards,
+    restricted,
+    /** 触发已注册的宿主事件（如 agent/created）。 */
+    emit(name, payload) {
+      return listeners[name]?.(payload)
+    },
+    hasListener(name) {
+      return typeof listeners[name] === 'function'
+    },
     tick(ms) {
       clock += ms
     },
@@ -354,5 +392,164 @@ test('CAS：过期 revision 必须抛错而非静默覆盖', () => {
     )
   } finally {
     h.cleanup()
+  }
+})
+
+// ── P5：RosterService 集成（目录隔离 + K1 接线）──────────────────────────────
+
+test('P5 装配：roster / board / dispatcher 三域就绪', () => {
+  const h = boot()
+  try {
+    assert.ok(h.roster, 'roster 应就绪')
+    assert.ok(h.board, 'board 应就绪')
+    assert.ok(h.dispatcher, 'dispatcher 应就绪')
+  } finally {
+    h.cleanup()
+  }
+})
+
+test('P5 目录隔离：roster.create 把 cwd 传给 agents.create 的 meta（真正的写入边界）', async () => {
+  const h = boot()
+  try {
+    const cwd = join(h.stateDir, 'bot-a-dir')
+    const bot = await h.roster.create({ name: 'bot-a', cwd, byId: 'lead' })
+    assert.equal(bot.cwd, cwd)
+
+    // 决定性断言：请求体必须带 meta.cwd（不是"Bot 对象里有 cwd 字段"）
+    const handle = h.roster.get(bot.id)
+    assert.ok(handle, 'bot 应可 get')
+    const created = [...h.ctx.csBots.roster.list()].find((b) => b.id === bot.id)
+    assert.ok(created, 'bot 应在 list 里')
+
+    // 直接查宿主收到的调用参数
+    const agentHandle = h.ctx.get('agents').get(bot.sessionId)
+    assert.ok(agentHandle, 'agents.create 应已注册该会话')
+    assert.equal(agentHandle.meta?.cwd, cwd, 'agents.create 必须收到 meta.cwd')
+  } finally {
+    h.cleanup()
+  }
+})
+
+test('P5 目录隔离：cwd 拒绝相对路径与 $DSH_HOME（防止污染宿主数据）', async () => {
+  const h = boot()
+  try {
+    await assert.rejects(() => h.roster.create({ name: 'bad-1', cwd: 'relative/path', byId: 'lead' }))
+    const dshHome = process.env.DSH_HOME || `${process.env.HOME}/.dsh`
+    await assert.rejects(
+      () => h.roster.create({ name: 'bad-2', cwd: `${dshHome}/cs-bots`, byId: 'lead' }),
+      /DSH_HOME|\.dsh/i,
+      '不得把 Bot 目录建在 DSH_HOME 内',
+    )
+  } finally {
+    h.cleanup()
+  }
+})
+
+test('P5 官方做不到的能力：改名 + 退役后**名额可回收**', async () => {
+  const h = boot()
+  try {
+    const cwd = join(h.stateDir, 'dir-x')
+    const b1 = await h.roster.create({ name: 'worker', cwd, byId: 'lead' })
+
+    // 官方 roster 不可改名（README:205 flat immutable）——本平台可以
+    const renamed = h.roster.rename({ id: b1.id, name: 'worker-renamed', expectedRev: b1.rev, byId: 'lead' })
+    assert.equal(renamed.name, 'worker-renamed')
+
+    // 退役
+    const retired = h.roster.retire({ id: b1.id, reason: 'done', byId: 'lead' })
+    assert.equal(retired.state, 'retired')
+
+    // 旧名与目录**可被新 Bot 复用**（官方的名字永不复用）
+    const b2 = await h.roster.create({ name: 'worker', cwd, byId: 'lead' })
+    assert.ok(b2.id)
+    assert.notEqual(b2.id, b1.id)
+  } finally {
+    h.cleanup()
+  }
+})
+
+test('P5 同名拒绝（大小写归一）', async () => {
+  const h = boot()
+  try {
+    await h.roster.create({ name: 'dup', cwd: join(h.stateDir, 'd1'), byId: 'lead' })
+    await assert.rejects(
+      () => h.roster.create({ name: 'DUP', cwd: join(h.stateDir, 'd2'), byId: 'lead' }),
+      // 实现给的错误文案（中文，明确说明归一后冲突）："名字 ... 已被占用（大小写不敏感归一后冲突）"
+      /已被占用|占用|冲突|unique/i,
+    )
+  } finally {
+    h.cleanup()
+  }
+})
+
+test('P5 K1：agent/created 时把 ask_user_question 从 Bot 工具表摘除', async () => {
+  const h = boot({ withTools: true, withOn: true })
+  try {
+    assert.ok(h.hasListener('agent/created'), 'agent/created 监听器应已注册')
+
+    const cwd = join(h.stateDir, 'k1-dir')
+    const bot = await h.roster.create({ name: 'k1-bot', cwd, byId: 'lead' })
+
+    // 模拟宿主为这个 Bot 会话创建 agent
+    const agent = { id: bot.sessionId, ctx: { tools: { schemas: () => [{ name: 'ask_user_question' }, { name: 'bash' }], restrict: (f) => h.restricted.push(f) } } }
+    h.emit('agent/created', { agent })
+
+    assert.ok(
+      h.restricted.some((f) => Array.isArray(f?.deny) && f.deny.includes('ask_user_question')),
+      `Bot 会话应被摘除 ask_user_question，实际=${JSON.stringify(h.restricted)}`,
+    )
+  } finally {
+    h.cleanup()
+  }
+})
+
+test('P5 K1：闸门放行非 Bot 会话（不误伤人类会话/官方 teammate）', () => {
+  const h = boot({ withTools: true })
+  try {
+    assert.ok(h.guards.length >= 1, '应有 guard 注册')
+    const guard = h.guards[0]
+
+    // 未注册的人类会话 → 放行
+    const human = { name: 'ask_user_question', agent: { id: 'session-human-not-bot' } }
+    assert.equal(guard(human), undefined, '非 Bot 会话必须放行')
+
+    // 其他工具 → 放行
+    const other = { name: 'bash', agent: { id: 'session-human-not-bot' } }
+    assert.equal(guard(other), undefined, '非目标工具必须放行')
+  } finally {
+    h.cleanup()
+  }
+})
+
+test('P5 K1：闸门拦截已注册 Bot 会话（拒绝理由可读）', async () => {
+  const h = boot({ withTools: true })
+  try {
+    const bot = await h.roster.create({ name: 'k1-gate', cwd: join(h.stateDir, 'k1g'), byId: 'lead' })
+    const guard = h.guards[0]
+
+    const blocked = guard({ name: 'ask_user_question', agent: { id: bot.sessionId } })
+    assert.ok(typeof blocked === 'string' && blocked.length > 0, 'Bot 会话应被拒且理由可读')
+    assert.match(blocked, /投递链|ask_user_question/, '理由应说明原因')
+  } finally {
+    h.cleanup()
+  }
+})
+
+test('P5 回放：roster 重启后视图一致', async () => {
+  const h = boot()
+  const stateDir = h.stateDir
+  try {
+    await h.roster.create({ name: 'persist-1', cwd: join(stateDir, 'p1'), byId: 'lead' })
+    const before = h.roster.list().map((b) => `${b.id}:${b.name}`).sort()
+
+    h.dispatcher.dispose()
+    const ctx2 = { logger: { info: () => {}, warn: () => {} }, get: () => undefined, effect: () => {} }
+    apply(ctx2, { stateDir })
+    const after = ctx2.csBots.roster.list().map((b) => `${b.id}:${b.name}`).sort()
+
+    assert.deepEqual(after, before, '回放后 roster 必须一致')
+    ctx2.csBots.dispatcher?.dispose?.()
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true })
   }
 })
