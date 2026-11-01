@@ -1,4 +1,38 @@
-# cs-bots bundle patch —— 只 insert 自己，绝不 insert 官方行
+# cs-bots bundle patch —— 只 insert 自己，绝不 insert 官方行。
+#
+# 安装：dsh plugin --profile web add github:7358716/cs-bots#v0.1.0
+# 本 patch 由 bundle 机制自动应用，**不要**再往 profile 的 cordis.patch.yml 手动
+# insert 同一 id（重复 loader entry id 会让加载失败）。
+
 - insert:
     - id: cs-bots
       name: 'cs-bots'
+
+# ─────────────────────────────────────────────────────────────────────────────
+# P1 路径 A：解除官方 Agent Teams 的 8 人上限（2026-11-01 实测依据）
+#
+# 官方事实（已复跑）：
+#   · dsh-experimental-agent-team/lib/index.js:1420  const DEFAULT_MAX_MEMBERS = 16
+#   · 同文件 :1439  schema = z.number().step(1).min(1).default(DEFAULT_MAX_MEMBERS)
+#     → **默认 16、无上限**；本机看到 8 是 agent-team-profile 的 patch 主动压下去的
+#   · 官方 roster 是 flat immutable（README:205）：**无改名、无删除、名字永不复用**
+#     → 这才是「要不要自建 RosterService」的真理由（不是数量上限）
+#
+# 覆盖语义（dsh-app-boot/lib/index.js 实测）：
+#   · 不带 insert 的顶层 id = **按 id 覆盖既有行**（不是 insert）
+#   · insert 不去重（data.push(...insert)）→ 两个包禁止 insert 同一 id
+#   · config 是**整体覆盖**（逐 key: target[key] = value）→ **必须重述全部 4 个字段**，
+#     只写 maxMembers 会丢掉其余三个 → 触发 required 校验失败 → 整个 profile 起不来
+#   · 层序：bundles 列表按序应用 → 之后才是 profile 自己的 patch
+#     ⇒ 本 bundle 必须在 dsh.profile.bundles 中排在 agent-team-profile 之后
+#
+# 前置：目标 profile 已启用 @deepseek-ai/dsh-experimental-agent-team-profile。
+# 若未启用，本段会因「找不到 id」被 warn 跳过（不报错），平台的协作能力降级为
+# 「仅内建域服务」——符合「缺服务只记日志、绝不阻塞启动」的纪律。
+- id: agent-team
+  name: '@deepseek-ai/dsh-experimental-agent-team'
+  config:
+    maxMembers: 32
+    maxTasks: 256
+    maxMessageBytes: 65536
+    disposalTimeoutMs: 5000
