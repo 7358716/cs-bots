@@ -1,0 +1,4 @@
+# cs-bots bundle patch —— 只 insert 自己，绝不 insert 官方行
+- insert:
+    - id: cs-bots
+      name: 'cs-bots'
