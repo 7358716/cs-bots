@@ -7,8 +7,11 @@
  *     本文件及后续业务文件一律从 kernel.js 取宿主能力。
  *   - **缺服务只记日志、绝不阻塞启动**：所有服务惰性获取 + 降级。
  *
- * 当前阶段：P1（解封 maxMembers + K1 闸门）。
+ * 当前阶段：P1（解封 maxMembers + K1 闸门）+ P2（任务板闭环 + 唤醒桥）。
  */
+
+import { createBoard } from './board.js'
+import { createDispatcher } from './dispatcher.js'
 
 export const name = 'cs-bots'
 
@@ -33,7 +36,50 @@ export function apply(ctx, config = {}) {
 
   log('[cs-bots] 装配中')
 
+  // ── L2 域服务：一律惰性装配、各自降级，**任一失败都不阻塞启动** ──────────────
+  // ⚠️ 两个域的构造签名不同（board 是 `(ctx, config)`，dispatcher 也是 `(ctx, config)`）；
+  //    日志一律用**字符串拼接**而非 `%s` 占位（避免形态差异导致格式串未插值）。
+  const services = {}
+  try {
+    services.board = createBoard(ctx, { stateDir: config.stateDir })
+    log(`[cs-bots] BoardService 就绪（stateDir=${services.board.paths?.stateDir ?? '?'}）`)
+  } catch (error) {
+    warn(`[cs-bots] BoardService 装配失败 → 降级（无任务板）：${error?.message ?? error}`)
+    services.board = undefined
+  }
+
+  try {
+    services.dispatcher = createDispatcher(ctx, { stateDir: config.stateDir })
+    if (services.dispatcher.durable === false) {
+      warn(`[cs-bots] Dispatcher 状态目录不可写 → 唤醒记录不持久：${services.dispatcher.probeError ?? ''}`)
+    }
+    log(`[cs-bots] Dispatcher 就绪（durable=${services.dispatcher.durable}）`)
+  } catch (error) {
+    warn(`[cs-bots] Dispatcher 装配失败 → 降级（不自动唤醒）：${error?.message ?? error}`)
+    services.dispatcher = undefined
+  }
+
   installBlockingToolGate(ctx, { warn })
+
+  // ── 生命周期收尾：停止定时器，避免进程退出被挂起的 timer 拖住 ────────────────
+  // 用官方 ctx.effect（若可用）保证插件卸载时被调用；不可用则退化为不注册。
+  const dispose = () => {
+    try {
+      services.dispatcher?.dispose?.()
+    } catch (error) {
+      warn('[cs-bots] dispatcher dispose 失败：%s', error?.message ?? error)
+    }
+  }
+  if (typeof ctx.effect === 'function') {
+    try {
+      ctx.effect(() => dispose, 'cs-bots:dispose')
+    } catch {
+      /* 注册失败不阻塞 */
+    }
+  }
+
+  // 暴露给同 fiber 的其他模块/测试（非官方契约，仅供本插件内部与测试使用）。
+  ctx.csBots = services
 
   log('[cs-bots] 装配完成')
 }
