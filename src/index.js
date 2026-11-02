@@ -17,6 +17,7 @@ import { createRoom } from './room.js'
 import { createMemory } from './memory.js'
 import { installTools } from './tools.js'
 import { setServices } from './registry.js'
+import { service } from './kernel.js'
 import { installApi } from './api.js'
 
 export const name = 'cs-bots'
@@ -30,11 +31,6 @@ export const name = 'cs-bots'
  *   ⇒ 在多智能体结构里，**同步等用户的提问工具会堵住整条投递链**，是结构性反模式。
  */
 const BLOCKING_QUESTION_TOOL = 'ask_user_question'
-
-/** 惰性取服务：兼容「新 API 有 get」与「老/测试上下文直接挂属性」两种形态。 */
-function service(ctx, key) {
-  return ctx?.get?.(key) ?? ctx?.[key]
-}
 
 export function apply(ctx, config = {}) {
   const log = (...args) => ctx.logger?.info?.(...args)

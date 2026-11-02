@@ -94,13 +94,46 @@ function loadCreateUserMessage() {
 }
 
 /**
- * 惰性取服务：兼容「新 API 有 get」与「老/测试上下文直接挂属性」两种形态。
+ * 惰性取服务 —— **可选依赖**的正确姿势。
+ *
+ * 三条通路按优先级尝试（2026-11-02 实测，这是**真 bug 的修复**）：
+ *   ① `ctx.reflect.get(key, false)` —— 官方注释原文：
+ *      "Read a service from the store **without the inject requirement**."
+ *      ⇒ 这是唯一**不声明 inject 也能读**的服务通道，正是「缺服务就降级」所需。
+ *   ② `ctx.get(key)` —— 老/测试上下文形态；在真实 Cordis ctx 上会抛
+ *      `cannot get property "X" without inject`（实测），故必须 try/catch。
+ *   ③ `ctx[key]` —— 直接挂属性的测试替身；同样会抛，故 try/catch。
+ *
+ * ⚠️ 教训：不做 try/catch 会让插件在真实宿主里**加载失败**
+ *    （`Error: cannot get property "webServer" without inject`），
+ *    而单元测试用普通对象反而全绿 —— 典型的「测了但没测真」。
+ *
  * @param {object} ctx
  * @param {string} key
- * @returns {unknown}
+ * @returns {unknown} 服务实例，或 undefined（缺失/不可读）
  */
-function service(ctx, key) {
-  return ctx?.get?.(key) ?? ctx?.[key]
+export function service(ctx, key) {
+  if (!ctx || typeof ctx !== 'object') return undefined
+  // ① 不要求 inject 的反射读取（首选）
+  try {
+    const viaReflect = ctx.reflect?.get?.(key, false)
+    if (viaReflect !== undefined) return viaReflect
+  } catch {
+    /* 反射层不可用 → 继续尝试其它通路 */
+  }
+  // ② ctx.get()
+  try {
+    const viaGet = ctx.get?.(key)
+    if (viaGet !== undefined) return viaGet
+  } catch {
+    /* 真实 ctx 未声明 inject 时会抛 → 忽略 */
+  }
+  // ③ 直接属性（测试替身）
+  try {
+    return ctx[key]
+  } catch {
+    return undefined
+  }
 }
 
 // ── 能力探测 ───────────────────────────────────────────────────────────────
