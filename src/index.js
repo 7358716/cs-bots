@@ -16,6 +16,7 @@ import { createRoster } from './roster.js'
 import { createRoom } from './room.js'
 import { createMemory } from './memory.js'
 import { installTools } from './tools.js'
+import { setServices } from './registry.js'
 
 export const name = 'cs-bots'
 
@@ -94,7 +95,9 @@ export function apply(ctx, config = {}) {
 
   // ── 模型面：注册全部工具（**没有这一层，新机器上装完插件模型看不到任何能力**）─
   // 必须在域服务就绪之后注册：工具执行时从 `ctx.csBots` 取服务。
-  ctx.csBots = services
+  // ⚠️ 不能 `ctx.csBots = services`：Cordis ctx 禁止任意属性（实测报
+  //    `cannot set property "csBots" without provide`）→ 走 WeakMap 注册表。
+  setServices(ctx, services)
   const toolNames = installTools(ctx, { warn })
   if (toolNames.length === 0) {
     warn('[cs-bots] 未注册任何工具（tools 服务不可用？）→ 模型将看不到平台能力')

@@ -19,6 +19,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { apply } from '../src/index.js'
+import { getServices } from '../src/registry.js'
 
 /**
  * 造一个可控宿主替身 + 隔离状态目录，并按插件真实入口装配。
@@ -90,9 +91,9 @@ function boot(opts = {}) {
 
   apply(ctx, { stateDir })
 
-  const board = ctx.csBots?.board
-  const dispatcher = ctx.csBots?.dispatcher
-  const roster = ctx.csBots?.roster
+  const board = getServices(ctx).board
+  const dispatcher = getServices(ctx).dispatcher
+  const roster = getServices(ctx).roster
 
   return {
     ctx,
@@ -357,9 +358,9 @@ test('回放：重新装配后 board 视图与之前一致（重启不丢）', (
       effect: () => {},
     }
     apply(ctx2, { stateDir })
-    const after = ctx2.csBots.board.list().map((t) => `${t.id}:${t.status}:${t.rev}`).sort()
+    const after = getServices(ctx2).board.list().map((t) => `${t.id}:${t.status}:${t.rev}`).sort()
     assert.deepEqual(after, snapshotIds, '回放后的视图必须与重启前一致')
-    ctx2.csBots.dispatcher?.dispose?.()
+    getServices(ctx2).dispatcher?.dispose?.()
   } finally {
     rmSync(stateDir, { recursive: true, force: true })
   }
@@ -418,7 +419,7 @@ test('P5 目录隔离：roster.create 把 cwd 传给 agents.create 的 meta（�
     // 决定性断言：请求体必须带 meta.cwd（不是"Bot 对象里有 cwd 字段"）
     const handle = h.roster.get(bot.id)
     assert.ok(handle, 'bot 应可 get')
-    const created = [...h.ctx.csBots.roster.list()].find((b) => b.id === bot.id)
+    const created = [...getServices(h.ctx).roster.list()].find((b) => b.id === bot.id)
     assert.ok(created, 'bot 应在 list 里')
 
     // 直接查宿主收到的调用参数
@@ -545,10 +546,10 @@ test('P5 回放：roster 重启后视图一致', async () => {
     h.dispatcher.dispose()
     const ctx2 = { logger: { info: () => {}, warn: () => {} }, get: () => undefined, effect: () => {} }
     apply(ctx2, { stateDir })
-    const after = ctx2.csBots.roster.list().map((b) => `${b.id}:${b.name}`).sort()
+    const after = getServices(ctx2).roster.list().map((b) => `${b.id}:${b.name}`).sort()
 
     assert.deepEqual(after, before, '回放后 roster 必须一致')
-    ctx2.csBots.dispatcher?.dispose?.()
+    getServices(ctx2).dispatcher?.dispose?.()
   } finally {
     rmSync(stateDir, { recursive: true, force: true })
   }

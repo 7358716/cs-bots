@@ -13,6 +13,7 @@
  */
 
 import { registerTool } from './kernel.js'
+import { getServices } from './registry.js'
 
 /** 统一的失败构造（所有工具都返回它，绝不抛出去让宿主崩）。 */
 function failure(reason, extra = {}) {
@@ -30,7 +31,7 @@ function success(payload) {
  * @returns {{ board?: object, roster?: object, room?: object, memory?: object, dispatcher?: object }}
  */
 function servicesOf(ctx) {
-  return ctx?.csBots ?? {}
+  return getServices(ctx)
 }
 
 /** 取调用者标识（审计流必填字段用）。 */
