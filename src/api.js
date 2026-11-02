@@ -98,7 +98,7 @@ export function installApi(ctx, { warn } = {}) {
     try {
       // ── 读：状态总览 ──────────────────────────────────────────────────────
       if (request.method === 'GET' && path === '/status') {
-        const out = { ok: true, services: {} }
+        const out = { ok: true, services: {}, compat: services.compat ?? null }
         for (const key of ['roster', 'board', 'dispatcher', 'room', 'memory']) {
           const svc = services[key]
           out.services[key] = svc

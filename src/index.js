@@ -20,6 +20,7 @@ import { setServices } from './registry.js'
 import { service, stateDir as kernelStateDir } from './kernel.js'
 import { installApi } from './api.js'
 import { loadSettings } from './settings.js'
+import { probeHost, formatReport } from './compat.js'
 
 export const name = 'cs-bots'
 
@@ -33,16 +34,59 @@ export const name = 'cs-bots'
  */
 const BLOCKING_QUESTION_TOOL = 'ask_user_question'
 
+/**
+ * 插件入口 —— **绝不抛错**。
+ *
+ * 为什么必须这样（真实教训）：宿主在 `apply()` 抛错时**整个 DSH 起不来**，
+ * 用户只能「禁用插件才能打开」。所以这里做最后一道兜底：
+ * 任何漏网的异常都只记日志，**不向外抛**。
+ * 代价是"静默降级"，但绝不让一个插件拖垮整个宿主。
+ *
+ * @param {object} ctx
+ * @param {object} [config]
+ */
 export function apply(ctx, config = {}) {
-  const log = (...args) => ctx.logger?.info?.(...args)
-  const warn = (...args) => ctx.logger?.warn?.(...args)
+  let log = () => {}
+  let warn = () => {}
+  try {
+    log = (...args) => ctx?.logger?.info?.(...args)
+    warn = (...args) => ctx?.logger?.warn?.(...args)
+  } catch {
+    /* 连 logger 都取不到 → 用空实现 */
+  }
 
+  try {
+    applyInner(ctx, config, { log, warn })
+  } catch (error) {
+    // 最后一道防线：不让插件把宿主启动搞崩
+    try {
+      warn(`[cs-bots] 装配异常已被兜底（插件降级，DSH 可正常启动）：${error?.message ?? error}`)
+      warn(`[cs-bots] 若需完整功能，请把这段错误发回开发者：${String(error?.stack ?? '').split('\n').slice(0, 6).join(' | ')}`)
+    } catch {
+      /* 日志也失败 → 完全静默，但宿主安全 */
+    }
+  }
+}
+
+function applyInner(ctx, config, { log, warn }) {
   log('[cs-bots] 装配中')
+
+  // ── 宿主兼容性探测（**先探测再装配**；探测本身不抛）──────────────────────
+  let compat
+  try {
+    compat = probeHost(ctx, { warn })
+    log(`[cs-bots] 宿主兼容性：${formatReport(compat)}`)
+    if (compat.notes?.length) for (const n of compat.notes) warn(`[cs-bots] ${n}`)
+  } catch (error) {
+    warn(`[cs-bots] 兼容性探测失败（继续装配）：${error?.message ?? error}`)
+    compat = { dshVersion: undefined, node: 'unknown', available: {}, missing: [], notes: [] }
+  }
 
   // ── L2 域服务：一律惰性装配、各自降级，**任一失败都不阻塞启动** ──────────────
   // ⚠️ 两个域的构造签名不同（board 是 `(ctx, config)`，dispatcher 也是 `(ctx, config)`）；
   //    日志一律用**字符串拼接**而非 `%s` 占位（避免形态差异导致格式串未插值）。
   const services = {}
+  services.compat = compat
 
   // ── 设置：**先读，再拿去装配各域**（改设置才真的改变行为）────────────────
   const settingsDir = config.stateDir ?? kernelStateDir()

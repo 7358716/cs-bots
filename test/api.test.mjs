@@ -93,6 +93,9 @@ test('GET /status 返回五个域服务状态', async () => {
       assert.ok(key in json.services, `status 应含 ${key}`)
       assert.equal(json.services[key].available, true, `${key} 应就绪`)
     }
+    // 兼容性报告也要暴露（rc1/rc5 差异时用户可自助诊断）
+    assert.ok(json.compat, '/status 应带 compat 报告')
+    assert.ok(json.compat.available, 'compat 应含 available 矩阵')
   } finally {
     h.cleanup()
   }
