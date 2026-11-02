@@ -1,9 +1,8 @@
 {
   "name": "cs-bots",
   "version": "0.1.0",
-  "private": true,
   "type": "module",
-  "description": "cs-bots — 多智能体协作平台",
+  "description": "cs-bots — DSH 多智能体协作平台：跨会话任务板 / 房间群聊 / 分层记忆 / Bot 注册表（独立工作目录），零第三方运行时依赖",
   "main": "src/index.js",
   "exports": {
     ".": "./src/index.js",
@@ -13,6 +12,7 @@
   "files": [
     "src",
     "cordis.patch.yml",
+    "install.sh",
     "README.md",
     "LICENSE"
   ],
@@ -23,6 +23,32 @@
     "client": {
       "platform": "web"
     }
+  },
+  "engines": {
+    "node": ">=22.5"
+  },
+  "scripts": {
+    "test": "bash test/run-all.sh",
+    "ci": "bash test/ci-zero-dep.sh",
+    "install:check": "bash install.sh --check-only"
+  },
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "dsh",
+    "multi-agent",
+    "agents",
+    "agent-teams",
+    "task-board",
+    "collaboration"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/7358716/cs-bots.git"
+  },
+  "homepage": "https://github.com/7358716/cs-bots#readme",
+  "bugs": {
+    "url": "https://github.com/7358716/cs-bots/issues"
   },
   "license": "MIT"
 }
