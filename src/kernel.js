@@ -319,7 +319,43 @@ export function registerRoute(ctx, path, handler) {
   return webServer.register({ kind: 'prefix', path, handler })
 }
 
-// ── 工具守卫与限制 ──────────────────────────────────────────────────────────
+// ── 工具注册（模型面）────────────────────────────────────────────────────────
+
+/**
+ * 注册一条模型可见工具。
+ *
+ * 官方契约（`dsh-tools/lib/types/index.d.ts:115-146`）：
+ *   `ToolDefinition = ToolSchema + { output: { schema, render }, execute(args, exec) }`
+ *   —— `output` 是**强制**的，且 `execute` 只返回**规范无损 JSON 值**（渲染交给 `render`）。
+ *
+ * 缺 tools 服务时返回 `undefined`（降级：模型看不到该工具，但域服务照常工作）。
+ *
+ * @param {object} ctx
+ * @param {{ name: string, description: string, parameters: object,
+ *           outputSchema: object, render: Function, execute: Function }} spec
+ * @returns {(() => void) | undefined} disposer
+ */
+export function registerTool(ctx, spec) {
+  const tools = service(ctx, 'tools')
+  if (!tools || typeof tools.register !== 'function') return undefined
+  const { name, description, parameters, outputSchema, render, execute } = spec ?? {}
+  if (!name || typeof execute !== 'function') {
+    throw new Error('cs-bots kernel.registerTool: 需要 name 与 execute')
+  }
+  return tools.register({
+    name,
+    description: description ?? '',
+    parameters: parameters ?? { type: 'object', properties: {}, additionalProperties: false },
+    output: {
+      schema: outputSchema ?? { type: 'object' },
+      render:
+        typeof render === 'function'
+          ? render
+          : (_args, value) => [{ type: 'text', text: JSON.stringify(value ?? null, null, 2) }],
+    },
+    execute,
+  })
+}
 
 /**
  * 装一条全局工具执行闸门（K1 用）。缺 tools 服务时返回 `undefined`。

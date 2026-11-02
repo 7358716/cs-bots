@@ -318,12 +318,27 @@ function partitionContent(content, max) {
 const WRITE_RANK = { explicit: 3, review: 2, consolidate: 1 }
 
 /**
- * 条目自身的「被保护等级」= 写它的人是谁（explicit 条目另有 +1 的硬保护）。
+ * 条目的「被保护等级」——**由 `explicit` 布尔与来源共同决定**。
+ *
+ * ⚠️ 这里有一个必须讲清的取舍（2026-11-01 实测踩到，不是想当然）：
+ *   若按字面把「规定 4 的阶梯」直接映射成 `protection = rank(source)`，那么
+ *   `add()` 默认 `source='explicit'`（**经显式工具写入**）→ 保护级 3 → `consolidate`(1)
+ *   永远无权改动**任何一条正常写入的记忆** ⇒ 合并/冲突标记功能当场死掉，
+ *   而这恰恰是 §3.4 给 consolidate 的职责。
+ *
+ * 故正确模型是分开两件事：
+ *   - **`explicit:true`（人显式说的）** = 硬保护（保护级 3）：review 只能建议、consolidate 不得改写（规定 2）。
+ *   - **`source`** = 来源留痕 + 在**自动写者之间**排先后（规定 4）：review 写的条目保护级 2，
+ *     consolidate 写的保护级 0 —— 于是「review > consolidate」仍然可观测，而工具直写的条目
+ *     保护级 0，任何自动写者都能处理。
+ *
  * @param {object} entry
- * @returns {number}
+ * @returns {number} 0/2/3
  */
-function entryRank(entry) {
-  return WRITE_RANK[entry?.source] ?? WRITE_RANK.explicit
+function protectionOf(entry) {
+  if (entry?.explicit === true) return 3 // 规定 2：人显式说的，只有显式写入才能动
+  if (entry?.source === 'review') return 2 // 规定 4：自动 review 的产出，consolidate 不得改写
+  return 0 // 工具直写（source='explicit' 但非人显式）或 consolidate 自身产出 → 可被自动写者处理
 }
 
 /**
@@ -335,7 +350,6 @@ function entryRank(entry) {
  * @throws {MemoryError} code = `MEMORY_WRITE_PRIORITY_DENIED`
  */
 function assertWriteAllowed(entry, writer, where) {
-  const w = WRITE_RANK[writer] ?? 0
   if (!WRITE_RANK[writer]) {
     throw new MemoryError(
       `memory.${where}：未知写者身份 source=${JSON.stringify(writer)}（合法值：${Object.keys(WRITE_RANK).join(' | ')}）`,
@@ -343,19 +357,21 @@ function assertWriteAllowed(entry, writer, where) {
       { field: 'source', where },
     )
   }
-  if (entry?.explicit === true && w < WRITE_RANK.explicit) {
+  if (entry?.explicit === true && writer !== 'explicit') {
     throw new MemoryError(
       `memory.${where}：条目 [id:${entry.id}] 是 explicit（人显式说的），${writer} 写者无权改写 —— `
-      + '请改用 review()，它只会返回建议、不会落盘（规定 2）',
+      + 'review 请改用 review()（只返回建议、不落盘）；consolidate 请把它报为建议（规定 2）',
       'MEMORY_WRITE_PRIORITY_DENIED',
       { id: entry.id, layer: entry.layer, writer, entrySource: entry.source, explicit: true },
     )
   }
-  if (w < entryRank(entry)) {
+  const guard = protectionOf(entry)
+  if (WRITE_RANK[writer] < guard) {
     throw new MemoryError(
-      `memory.${where}：写入优先级不足 —— ${writer}(${w}) 不能改写 ${entry.source}(${entryRank(entry)}) 的条目 [id:${entry.id}]（规定 4）`,
+      `memory.${where}：写入优先级不足 —— ${writer}(${WRITE_RANK[writer]}) 不能改写 ${entry.source}(保护级 ${guard}) `
+      + `的条目 [id:${entry.id}]（规定 4）`,
       'MEMORY_WRITE_PRIORITY_DENIED',
-      { id: entry.id, layer: entry.layer, writer, entrySource: entry.source },
+      { id: entry.id, layer: entry.layer, writer, entrySource: entry.source, protection: guard },
     )
   }
 }
@@ -834,7 +850,8 @@ export function createMemory(ctx, config = {}) {
         { id: current.id, layer: targetLayer, hint: 'use review()' },
       )
     }
-    assertWriteAllowed(current, explicit === true ? 'explicit' : 'review', 'update')
+    // 到这里已过 explicit 闸门；本调用是**显式工具直写**（规定 4 的最高优先级）
+    assertWriteAllowed(current, 'explicit', 'update')
 
     const at = normalizeNow(now, 'update')
     const before = clone(current)
@@ -1112,6 +1129,118 @@ export function createMemory(ctx, config = {}) {
     /** @type {Set<string>} 已被本次处理的 id（避免同一条被合并两次） */
     const handled = new Set()
 
+    /**
+     * 冲突集**传递闭包**：矛盾关系是「同题反主张」，它天然成团。
+     * 例如 `用 pnpm` / `不用 pnpm` / `用 pnpm`（重复）三条里，
+     * 前两条矛盾、后两条只差重复 —— 团内每条都该与**其余冲突成员**互标，
+     * 否则 `不用 pnpm` 那条看起来「只跟一份副本冲突」，另一份副本仍是干净态，
+     * 注入时读者会以为它没争议。故对团取闭包，一次把团内两两全部登记。
+     * @param {Array<[string, string]>} edges 已确认的矛盾边（id 对）
+     * @returns {Array<[string, string]>} 闭包后的边（去重、无自环）
+     */
+    function closeConflictEdges(edges) {
+      const adj = new Map()
+      const add = (x, y) => {
+        if (!adj.has(x)) adj.set(x, new Set())
+        adj.get(x).add(y)
+      }
+      for (const [x, y] of edges) {
+        if (x === y) continue
+        add(x, y)
+        add(y, x)
+      }
+      const out = []
+      const seen = new Set()
+      const nodes = [...adj.keys()]
+      for (const start of nodes) {
+        // 该连通分量（BFS）
+        const comp = new Set([start])
+        const queue = [start]
+        while (queue.length > 0) {
+          const cur = queue.pop()
+          for (const nxt of adj.get(cur) ?? []) {
+            if (!comp.has(nxt)) { comp.add(nxt); queue.push(nxt) }
+          }
+        }
+        const members = [...comp].sort()
+        for (let i = 0; i < members.length; i += 1) {
+          for (let j = i + 1; j < members.length; j += 1) {
+            const key = `${members[i]}|${members[j]}`
+            if (seen.has(key)) continue
+            seen.add(key)
+            out.push([members[i], members[j]])
+          }
+        }
+      }
+      return out
+    }
+
+    /**
+     * 把最终态 = **每一个连通分量内全量两两标记**。
+     * 逐边 apply 会退化成「最后一次调用胜出」的半截态（实测踩到），
+     * 故这里按分量算**最终 marked 集合**，再逐条按当前 rev 落盘。
+     *
+     * @param {Array<[object, object, string]>} pairList 已确认的矛盾对
+     * @returns {object[]} conflictRows
+     */
+    function applyConflictClosure(pairList) {
+      const rows = []
+      const edges = pairList.map(([a, b]) => [a.id, b.id])
+      const closedEdges = closeConflictEdges(edges)
+
+      /** 分量成员 id → 该成员应登记的 conflictWith 全集合 */
+      const want = new Map()
+      for (const [x, y] of closedEdges) {
+        if (!want.has(x)) want.set(x, new Set())
+        if (!want.has(y)) want.set(y, new Set())
+        want.get(x).add(y)
+        want.get(y).add(x)
+      }
+      /** 原因：取该成员参与的第一条边的判定来源（declared 优先，便于人回溯） */
+      const reasonOf = new Map()
+      for (const [a, b, how] of pairList) {
+        const label = how === 'declared' ? 'declared-conflict' : 'polarity-conflict'
+        for (const id of [a.id, b.id]) {
+          if (!reasonOf.has(id) || label === 'declared-conflict') reasonOf.set(id, label)
+        }
+      }
+
+      for (const [id, withSet] of want) {
+        const cur = entries.get(id)
+        if (!cur) {
+          rows.push({
+            action: 'rejected', id, code: 'MEMORY_ENTRY_NOT_FOUND',
+            reason: '冲突闭包的成员在处理过程中已不存在 → 跳过并回报（不写半截）',
+          })
+          continue
+        }
+        const missing = [...withSet].filter((x) => !(Array.isArray(cur.conflictWith) && cur.conflictWith.includes(x)))
+        if (missing.length === 0 && cur.conflict === true) continue // 已是最新，幂等
+        const bad = checkWritable(cur, 'consolidate')
+        if (bad) {
+          rows.push({ action: 'rejected', id, code: bad.code, reason: `冲突闭包成员不可改写 → 跳过：${bad.message}` })
+          warn(`[cs-bots/memory] consolidate：冲突闭包跳过 ${id}：${bad.message}`)
+          continue
+        }
+        try {
+          const next = commit(
+            id,
+            'consolidate',
+            author,
+            at,
+            clone(cur),
+            conflictMarkNext(cur, [...withSet], author, at, reasonOf.get(id) ?? 'conflict-closure'),
+          )
+          rows.push({ a: id, conflictWith: next.conflictWith, rev: next.rev, kind: 'marked' })
+        } catch (error) {
+          if (!(error instanceof MemoryError)) throw error
+          rows.push({ action: 'rejected', id, code: error.code, reason: error.message })
+          warn(`[cs-bots/memory] consolidate：冲突闭包写 ${id} 失败：${error.message}`)
+        }
+      }
+      return rows
+    }
+
     // ── 第 1 步：冲突判定（先于去重）─────────────────────────────────────────
     /** 外部显式声明的矛盾对（检测器判不出时由 review/人补） */
     const declared = Array.isArray(conflicts) ? conflicts : []
@@ -1168,28 +1297,29 @@ export function createMemory(ctx, config = {}) {
         suggested.push(row)
         continue
       }
-      const pa = markConflict(a, [b.id], author, at, how === 'declared' ? 'declared-conflict' : 'polarity-conflict')
-      const pb = markConflict(b, [a.id], author, at, how === 'declared' ? 'declared-conflict' : 'polarity-conflict')
 
       /**
-       * 两条都标好才算成功；第二条失败时**第一条也要还原**，否则留下「只标了一边」的
-       * 半截冲突态 —— 那正是规定 3「冲突不静默」要防的东西。还原动作本身也留事件，
-       * 冲突对以 `action:'rejected'` + code 出现在返回里（可见，不吞）。
+       * **先查可写性再落盘**：宁可整对跳过，也不留「只标了一边」的半截冲突态。
+       * （另一条路是标完再回滚，但回滚本身要写两个事件，净效果更乱、更难审计。）
+       * 跳过原因以 `action:'rejected'` + code 出现在返回里 —— 可见即合规，绝不静默。
        */
-      if (!pb.conflictWith.includes(a.id)) {
-        unmarkConflict(pa, [b.id], author, at, `conflict-mark-rollback:${pb.id}`)
+      const blocked = [a, b].map((e) => checkWritable(e, 'consolidate')).find((r) => r !== null)
+      if (blocked) {
         const row = {
           action: 'rejected',
           a: a.id,
           b: b.id,
-          code: 'MEMORY_CONFLICT_MARK_PARTIAL',
-          reason: `冲突标记第二步失败（${b.id}），已回滚第一步（${a.id}）—— 拒绝留半截冲突态`,
+          code: blocked.code,
+          reason: `冲突对含不可由 consolidate 改写的条目（${blocked.id}）→ 整对跳过并回报，不标半截：${blocked.message}`,
         }
         conflictRows.push(row)
         rejectedConflicts.push(row)
         warn(`[cs-bots/memory] consolidate：${row.reason}`)
         continue
       }
+
+      const pa = markConflict(a, [b.id], author, at, how === 'declared' ? 'declared-conflict' : 'polarity-conflict')
+      const pb = markConflict(b, [a.id], author, at, how === 'declared' ? 'declared-conflict' : 'polarity-conflict')
       conflictRows.push({ a: pa.id, b: pb.id, aRev: pa.rev, bRev: pb.rev, how })
       handled.add(a.id)
       handled.add(b.id)
@@ -1208,7 +1338,7 @@ export function createMemory(ctx, config = {}) {
       if (group.length < 2) continue
       // 保留规则：等级高者 → 更新时间新者 → id 小者（确定性，不靠遍历顺序）
       const sorted = group.slice().sort((x, y) => {
-        const r = entryRank(y) - entryRank(x)
+        const r = protectionOf(y) - protectionOf(x)
         if (r !== 0) return r
         const t = (y.updatedAt ?? 0) - (x.updatedAt ?? 0)
         if (t !== 0) return t
@@ -1225,7 +1355,32 @@ export function createMemory(ctx, config = {}) {
         suggested.push(row)
         continue
       }
-      for (const loser of sorted.slice(1)) {
+      /** 与冲突分支同款纪律：**先查可写性**，保证 keeper 一定留得住、被并方一定过得去。 */
+      const keepBlocked = checkWritable(keeper, 'consolidate')
+      const losers = sorted.slice(1).filter((e) => checkWritable(e, 'consolidate') === null)
+      const losersBlocked = sorted.slice(1).filter((e) => !losers.includes(e))
+      if (keepBlocked || losers.length === 0) {
+        const row = {
+          action: 'rejected',
+          duplicates: group.map((e) => e.id),
+          code: keepBlocked?.code ?? 'MEMORY_WRITE_PRIORITY_DENIED',
+          reason: '重复组中保留者不可由 consolidate 改写 → 整组不合并，只回报（绝不静默消失）',
+        }
+        suggested.push(row)
+        warn(`[cs-bots/memory] consolidate：${row.reason}（组：${row.duplicates.join(', ')}）`)
+        continue
+      }
+      if (losersBlocked.length > 0) {
+        const row = {
+          action: 'suggest',
+          duplicates: group.map((e) => e.id),
+          keepSuggestion: keeper.id,
+          unmergeable: losersBlocked.map((e) => e.id),
+          reason: '部分重复条目不可由 consolidate 改写 → 只合并可动的那几条，其余留原样',
+        }
+        suggested.push(row)
+      }
+      for (const loser of losers) {
         const archived = mergeAway(loser, keeper.id, author, at)
         merged.push({ kept: keeper.id, archived: archived.id, rev: archived.rev, content: loser.content })
         handled.add(loser.id)
@@ -1237,7 +1392,10 @@ export function createMemory(ctx, config = {}) {
     let dailyId = null
     if (daily === true) {
       const digest = `consolidate ${targetLayer}：扫描 ${live.length} 条；合并 ${merged.length} 条；`
-        + `矛盾 ${conflictRows.length} 对（均已保留并标 [conflict]）；建议 ${suggested.length} 条；未变动 ${live.length - handled.size}`
+        + `矛盾 ${conflictRows.length} 对（均已保留并标 [conflict]）；建议 ${suggested.length} 条；`
+        + `拒 ${rejectedConflicts.length} 对；未变动 ${live.length - handled.size}`
+      // ⚠️ L5 的 source 必须是 consolidate —— 规定 4 靠 source 机械排序，
+      //    若这里误用默认的 explicit，日札会被当成「人显式说的」而不可再动。
       const created = add({ layer: 'L5', content: digest, by: author, source: 'consolidate', now: at })
       dailyId = created.id
     }
@@ -1248,9 +1406,90 @@ export function createMemory(ctx, config = {}) {
       merged,
       conflicts: conflictRows,
       suggested,
+      rejectedConflicts,
       unchanged: live.length - handled.size,
       dailyId,
     }
+  }
+
+  /** 撤销一次冲突标记（只回滚本次刚加的那一边，**不碰**此前的 conflictWith 集合）。 */
+  function unmarkConflict(entry, dropIds, author, at, reason) {
+    const before = clone(entry)
+    const next = clone(entry)
+    next.rev = entry.rev + 1
+    next.updatedAt = at
+    next.updatedBy = author
+    next.conflictWith = (Array.isArray(entry.conflictWith) ? entry.conflictWith : []).filter((x) => !dropIds.includes(x))
+    if (next.conflictWith.length === 0) {
+      delete next.conflict
+      delete next.conflictReason
+      next.tags = (Array.isArray(entry.tags) ? entry.tags : []).filter((t) => t !== 'conflict')
+    }
+    next.rollbackReason = reason
+    return commit(entry.id, 'consolidate', author, at, before, next)
+  }
+
+  /** two-step 重试（保证「成对」或「都不标」）。 */
+  const SETTLE_MAX_RETRY = 3
+  const SETTLE_RETRY_WAIT_MS = 1
+
+  /**
+   * **成对**完成一次双条目变更（规定 3 的机械保证）。
+   *
+   * 为什么不能边算边写：做「两条都留并标 [conflict]」时，第二条可能临场失败
+   * （并发下 rev 变了、或者某条是 explicit 的硬保护条目）。若第一条已落盘，
+   * 内存里就留下**只标了一边**的半截冲突态 —— 那正是规定 3「冲突不静默」要防的东西。
+   *
+   * 本函数按**两遍**走：第一遍 plan（只读、不落盘、不产生副作用），第二遍 exec。
+   * exec 里若**第一条**就失败 ⇒ 什么都没写，抛错即可；若**第二条**失败 ⇒ 重跑 plan
+   * 后再 exec（把第一条的新 rev 兜进来），直到两条都成或重试耗尽。
+   * 重试耗尽仍不成 ⇒ 抛**合成**错误（声称配对失败），重放后状态是一致可解释的。
+   *
+   * @param {() => Array<{ check: () => ({ ok: true } | { ok: false, reason: string }), run: () => object }>} plan
+   * @param {string} what 失败信息里的动作名
+   * @returns {object[]} 两条变更后的条目
+   */
+  function settlePair(plan, what) {
+    let lastReason = 'unknown'
+    for (let attempt = 1; attempt <= SETTLE_MAX_RETRY; attempt += 1) {
+      const ops = plan()
+      if (ops.length !== 2) {
+        throw new MemoryError(
+          `memory：${what} 的 settlePair 必须恰好得到 2 项操作，收到 ${ops.length}`,
+          'MEMORY_INTERNAL_INVARIANT',
+          { what },
+        )
+      }
+      const blocked = ops.map((op) => op.check()).find((r) => r && r.ok === false)
+      if (blocked) {
+        throw new MemoryError(
+          `memory：${what} 不可执行 —— ${blocked.reason}`,
+          'MEMORY_WRITE_PRIORITY_DENIED',
+          { what, reason: blocked.reason },
+        )
+      }
+      try {
+        return [ops[0].run(), ops[1].run()]
+      } catch (error) {
+        if (!(error instanceof MemoryError)) throw error
+        lastReason = `${error.code}: ${error.message}`
+        warn(`[cs-bots/memory] ${what} 第 ${attempt}/${SETTLE_MAX_RETRY} 次尝试第二条失败，将重试：${lastReason}`)
+        if (attempt < SETTLE_MAX_RETRY) sleepSync(SETTLE_RETRY_WAIT_MS)
+      }
+    }
+    throw new MemoryError(
+      `memory：${what} 配对失败（已重试 ${SETTLE_MAX_RETRY} 次）—— 最后原因：${lastReason}。`
+      + '本次未留下半截状态；请重新 list() 后重试',
+      'MEMORY_PAIR_SETTLE_FAILED',
+      { what, attempts: SETTLE_MAX_RETRY },
+    )
+  }
+
+  /** 极短同步等待（仅用于配对重试的退避；不依赖任何第三方库）。 */
+  function sleepSync(ms) {
+    const end = Date.now() + ms
+    // eslint-disable-next-line no-empty
+    while (Date.now() < end) { /* busy-wait：毫秒级，且只在罕见的重试路径上发生 */ }
   }
 
   /** 两条是否已互相标记为冲突（幂等，避免重复写事件）。 */
@@ -1260,10 +1499,36 @@ export function createMemory(ctx, config = {}) {
       && Array.isArray(b.conflictWith) && b.conflictWith.includes(a.id)
   }
 
-  /** 标 `[conflict]`（**不删内容**：规定 3）。 */
-  function markConflict(entry, withIds, author, at, reason) {
-    assertWriteAllowed(entry, 'consolidate', 'consolidate')
-    const before = clone(entry)
+  /**
+   * 非抛错的「可写性预检」：批量操作（consolidate）先用它整对判断，
+   * 避免「标了一半才发现另一边不可写」。单条 API 仍用 `assertWriteAllowed` 直接抛。
+   * @param {object} entry
+   * @param {'explicit'|'review'|'consolidate'} writer
+   * @returns {{ code: string, id: string, message: string } | null} null = 可写
+   */
+  function checkWritable(entry, writer) {
+    try {
+      assertWriteAllowed(entry, writer, 'consolidate')
+      return null
+    } catch (error) {
+      if (!(error instanceof MemoryError)) throw error
+      return { code: error.code, id: entry.id, message: error.message }
+    }
+  }
+
+  /**
+   * 计算「标 `[conflict]`」的下一步形态（**纯函数，不落盘**）。
+   *
+   * 为什么要拆出纯函数：`settlePair` 需要先 plan（只读）后 exec（落盘）两遍，
+   * 而 plan 必须**用最新 rev** —— 直接读内存态即可，不产生任何副作用。
+   * @param {object} entry
+   * @param {string[]} withIds
+   * @param {string} author
+   * @param {number} at
+   * @param {string} reason
+   * @returns {object} next（未落盘的下一版）
+   */
+  function conflictMarkNext(entry, withIds, author, at, reason) {
     const next = clone(entry)
     next.rev = entry.rev + 1
     next.updatedAt = at
@@ -1274,7 +1539,62 @@ export function createMemory(ctx, config = {}) {
     next.conflictReason = reason
     const tags = new Set([...(Array.isArray(entry.tags) ? entry.tags : []), 'conflict'])
     next.tags = [...tags]
-    return commit(entry.id, 'consolidate', author, at, before, next)
+    return next
+  }
+
+  /** 标 `[conflict]`（不删内容）—— **单条**落盘；成对场景走 `settleConflictPair`。 */
+  function markConflict(entry, withIds, author, at, reason) {
+    assertWriteAllowed(entry, 'consolidate', 'consolidate')
+    return commit(entry.id, 'consolidate', author, at, clone(entry), conflictMarkNext(entry, withIds, author, at, reason))
+  }
+
+  /**
+   * **规定 3 的核心动作**：把两条矛盾记忆都标 `[conflict]` 并互相登记 `conflictWith`，
+   * 内容一条都不删。走 `settlePair` 保证「成对成功」——不留半截冲突态。
+   *
+   * @param {string} idA
+   * @param {string} idB
+   * @param {string} author
+   * @param {number} at
+   * @param {string} reason
+   * @returns {object[]} [a', b']
+   */
+  function settleConflictPair(idA, idB, author, at, reason) {
+    return settlePair(() => {
+      const a = entries.get(idA)
+      const b = entries.get(idB)
+      if (!a || !b) {
+        throw new MemoryError(
+          `memory.consolidate：冲突对 ${idA} ⇄ ${idB} 的成员已不存在 —— 拒绝写半截`,
+          'MEMORY_ENTRY_NOT_FOUND',
+          { idA, idB },
+        )
+      }
+      return [
+        {
+          check: () => {
+            const bad = checkWritable(a, 'consolidate')
+            return bad ? { ok: false, reason: `冲突方 ${a.id} 不可改写：${bad.message}` } : { ok: true }
+          },
+          run: () => commit(a.id, 'consolidate', author, at, clone(a), conflictMarkNext(a, [b.id], author, at, reason)),
+        },
+        {
+          check: () => {
+            const bad = checkWritable(entries.get(idB) ?? b, 'consolidate')
+            return bad ? { ok: false, reason: `冲突方 ${b.id} 不可改写：${bad.message}` } : { ok: true }
+          },
+          run: () => {
+            // ⚠️ 必须在 run 时重新取内存态：第一条已经 +1 rev（CAS 依据由此保持正确）
+            const cur = entries.get(idB)
+            const bad = checkWritable(cur, 'consolidate')
+            if (bad) {
+              throw new MemoryError(bad.message, bad.code, { id: cur.id, layer: cur.layer })
+            }
+            return commit(cur.id, 'consolidate', author, at, clone(cur), conflictMarkNext(cur, [idA], author, at, reason))
+          },
+        },
+      ]
+    }, `consolidate 冲突配对 ${idA} ⇄ ${idB}`)
   }
 
   /** 重复合并：被并方**归档**（不物理删），带 `mergedInto` 证据。 */
@@ -1393,11 +1713,16 @@ export function createMemory(ctx, config = {}) {
       ids = [...entries.values()]
         .filter((e) => String(e.content).toLowerCase().includes(lower))
         .map((e) => e.id)
+      // 降级原因**必须**能区分三种情形，否则排障时看不出是「配置强制」还是「环境缺失」
+      const reason = diagnostics.searchBackend === 'fts5' || diagnostics.searchBackendReason.startsWith('FTS5 查询失败')
+        ? diagnostics.searchBackendReason            // 上一轮/本轮 FTS5 失败留下的原因，保留
+        : forcedBackend === 'includes'
+          ? 'config.searchBackend=includes（显式强制退化路径）'
+          : cps < 3
+            ? `查询短于 3 码点（trigram 物理下限）→ 退化 includes`
+            : `FTS5 不可用（${sqliteError ?? '无 DatabaseSync 导出'}）→ 退化 includes`
       diagnostics.searchBackend = 'includes'
-      if (cps < 3) diagnostics.searchBackendReason = `查询短于 3 码点（trigram 下限）→ 退化 includes`
-      else if (!db) diagnostics.searchBackendReason = diagnostics.searchBackendReason === '未初始化'
-        ? 'FTS5 不可用 → 退化 includes'
-        : diagnostics.searchBackendReason
+      diagnostics.searchBackendReason = reason
     }
 
     /** @type {object[]} */

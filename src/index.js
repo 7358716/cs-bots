@@ -7,12 +7,15 @@
  *     本文件及后续业务文件一律从 kernel.js 取宿主能力。
  *   - **缺服务只记日志、绝不阻塞启动**：所有服务惰性获取 + 降级。
  *
- * 当前阶段：P1（解封 maxMembers + K1 闸门）+ P2（任务板闭环 + 唤醒桥）。
+ * 当前阶段：P0–P5 全域服务 + 模型面工具。
  */
 
 import { createBoard } from './board.js'
 import { createDispatcher } from './dispatcher.js'
 import { createRoster } from './roster.js'
+import { createRoom } from './room.js'
+import { createMemory } from './memory.js'
+import { installTools } from './tools.js'
 
 export const name = 'cs-bots'
 
@@ -70,8 +73,34 @@ export function apply(ctx, config = {}) {
     services.dispatcher = undefined
   }
 
+  try {
+    services.room = createRoom(ctx, { stateDir: config.stateDir })
+    log(`[cs-bots] RoomService 就绪（stateDir=${services.room.paths?.stateDir ?? '?'}）`)
+  } catch (error) {
+    warn(`[cs-bots] RoomService 装配失败 → 降级（无房间/群聊）：${error?.message ?? error}`)
+    services.room = undefined
+  }
+
+  try {
+    services.memory = createMemory(ctx, { stateDir: config.stateDir })
+    log(`[cs-bots] MemoryService 就绪（stateDir=${services.memory.paths?.stateDir ?? '?'}）`)
+  } catch (error) {
+    warn(`[cs-bots] MemoryService 装配失败 → 降级（无分层记忆）：${error?.message ?? error}`)
+    services.memory = undefined
+  }
+
   installBlockingToolGate(ctx, { warn, roster: services.roster })
   installBotToolTrimmer(ctx, { warn, roster: services.roster })
+
+  // ── 模型面：注册全部工具（**没有这一层，新机器上装完插件模型看不到任何能力**）─
+  // 必须在域服务就绪之后注册：工具执行时从 `ctx.csBots` 取服务。
+  ctx.csBots = services
+  const toolNames = installTools(ctx, { warn })
+  if (toolNames.length === 0) {
+    warn('[cs-bots] 未注册任何工具（tools 服务不可用？）→ 模型将看不到平台能力')
+  } else {
+    log(`[cs-bots] 已注册 ${toolNames.length} 个工具：${toolNames.join(', ')}`)
+  }
 
   // ── 生命周期收尾：停止定时器，避免进程退出被挂起的 timer 拖住 ────────────────
   // 用官方 ctx.effect（若可用）保证插件卸载时被调用；不可用则退化为不注册。
@@ -89,9 +118,6 @@ export function apply(ctx, config = {}) {
       /* 注册失败不阻塞 */
     }
   }
-
-  // 暴露给同 fiber 的其他模块/测试（非官方契约，仅供本插件内部与测试使用）。
-  ctx.csBots = services
 
   log('[cs-bots] 装配完成')
 }
