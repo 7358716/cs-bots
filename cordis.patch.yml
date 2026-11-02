@@ -1,38 +1,30 @@
-# cs-bots bundle patch —— 只 insert 自己，绝不 insert 官方行。
+# cs-bots bundle patch —— **只 insert 自己，绝不动官方行**（默认最安全）。
 #
-# 安装：dsh plugin --profile web add github:7358716/cs-bots#v0.1.0
+# 安装：dsh plugin --profile web add git+ssh://git@github.com/7358716/cs-bots.git#v0.1.1
 # 本 patch 由 bundle 机制自动应用，**不要**再往 profile 的 cordis.patch.yml 手动
 # insert 同一 id（重复 loader entry id 会让加载失败）。
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# 【2026-11-03 重要变更】原来的「覆盖 agent-team.maxMembers」已**移出默认 patch**
+#
+# 原因（真实风险，非理论）：覆盖官方行的 `config` 是**整体替换**（逐 key），
+# 所以我们必须重述 agent-team 的全部 4 个字段（maxMembers / maxTasks /
+# maxMessageBytes / disposalTimeoutMs）。**若目标 DSH 版本的 schema 少了其中任何
+# 一个字段 → config 校验失败 → 整个 profile 起不来** ——
+# 这正是「重启 DSH 报错、必须禁用插件才能打开」那一类故障。
+#
+# 我们在 0.2.1-rc.2 上实测过该 schema，但主管环境是 rc1（可升 rc5），
+# 版本面不同 → 为不拿宿主启动冒险，**默认不覆盖**。
+#
+# ⇒ 想要「解除官方 Team 的 8 人上限」，用显式开关：
+#      bash install.sh --channel git --with-agent-team-override
+#    或手动把同目录的 `cordis.patch.agent-team.yml` 内容并入 profile 的
+#    cordis.patch.yml（并确认本 bundle 排在 agent-team-profile **之后**）。
+#
+# 注：**不覆盖也不影响本平台核心能力** —— 本平台的 Bot 注册表（RosterService）
+# 走 root agent + 独立 cwd，**不受官方 maxMembers 约束**。覆盖只是让"官方 Team
+# 也能超过 8 人"，属锦上添花。
 
 - insert:
     - id: cs-bots
       name: 'cs-bots'
-
-# ─────────────────────────────────────────────────────────────────────────────
-# P1 路径 A：解除官方 Agent Teams 的 8 人上限（2026-11-01 实测依据）
-#
-# 官方事实（已复跑）：
-#   · dsh-experimental-agent-team/lib/index.js:1420  const DEFAULT_MAX_MEMBERS = 16
-#   · 同文件 :1439  schema = z.number().step(1).min(1).default(DEFAULT_MAX_MEMBERS)
-#     → **默认 16、无上限**；本机看到 8 是 agent-team-profile 的 patch 主动压下去的
-#   · 官方 roster 是 flat immutable（README:205）：**无改名、无删除、名字永不复用**
-#     → 这才是「要不要自建 RosterService」的真理由（不是数量上限）
-#
-# 覆盖语义（dsh-app-boot/lib/index.js 实测）：
-#   · 不带 insert 的顶层 id = **按 id 覆盖既有行**（不是 insert）
-#   · insert 不去重（data.push(...insert)）→ 两个包禁止 insert 同一 id
-#   · config 是**整体覆盖**（逐 key: target[key] = value）→ **必须重述全部 4 个字段**，
-#     只写 maxMembers 会丢掉其余三个 → 触发 required 校验失败 → 整个 profile 起不来
-#   · 层序：bundles 列表按序应用 → 之后才是 profile 自己的 patch
-#     ⇒ 本 bundle 必须在 dsh.profile.bundles 中排在 agent-team-profile 之后
-#
-# 前置：目标 profile 已启用 @deepseek-ai/dsh-experimental-agent-team-profile。
-# 若未启用，本段会因「找不到 id」被 warn 跳过（不报错），平台的协作能力降级为
-# 「仅内建域服务」——符合「缺服务只记日志、绝不阻塞启动」的纪律。
-- id: agent-team
-  name: '@deepseek-ai/dsh-experimental-agent-team'
-  config:
-    maxMembers: 32
-    maxTasks: 256
-    maxMessageBytes: 65536
-    disposalTimeoutMs: 5000

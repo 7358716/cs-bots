@@ -14,6 +14,68 @@
  */
 
 /**
+ * 从 dsh 安装目录读版本号（**绝不抛**）。
+ *
+ * 为什么要读它：主管环境是 rc1（可升 rc5），我们必须能报出真实版本，
+ * 否则「兼容性差异」只能靠猜。
+ * @returns {string | undefined}
+ */
+function readDshVersion() {
+  try {
+    return safeReadVersion()
+  } catch {
+    return undefined
+  }
+}
+
+function safeReadVersion() {
+  // 动态引入 node 内置（避免在浏览器/受限环境报错）
+  const { createRequire } = requireNode('node:module')
+  const { existsSync, readFileSync } = requireNode('node:fs')
+  if (!createRequire || !readFileSync) return undefined
+
+  const anchors = []
+  try {
+    anchors.push(new URL('../../package.json', import.meta.url).pathname) // 同级/上级
+  } catch {}
+  anchors.push('/usr/lib/node_modules/@deepseek-ai/dsh/package.json')
+  anchors.push('/usr/local/lib/node_modules/@deepseek-ai/dsh/package.json')
+  for (const dir of String(process.env.PATH ?? '').split(':')) {
+    if (!dir) continue
+    anchors.push(`${dir}/../lib/node_modules/@deepseek-ai/dsh/package.json`)
+    anchors.push(`${dir}/../node_modules/@deepseek-ai/dsh/package.json`)
+  }
+
+  for (const file of anchors) {
+    try {
+      if (!file || (file.startsWith('/') && !existsSync(file))) continue
+      const pkg = JSON.parse(readFileSync(file, 'utf8'))
+      if (pkg?.name === '@deepseek-ai/dsh' && typeof pkg.version === 'string') return pkg.version
+    } catch {
+      /* 单个锚点失败不影响其它 */
+    }
+  }
+  // 最后试 require.resolve（宿主内运行时通常能解析到）
+  try {
+    const req = createRequire(anchors.find((a) => a && (!a.startsWith('/') || existsSync(a))) ?? import.meta.url)
+    const pkg = req('@deepseek-ai/dsh/package.json')
+    if (typeof pkg?.version === 'string') return pkg.version
+  } catch {}
+  return undefined
+}
+
+/** 惰性取 node 内置模块（失败返回 undefined，绝不抛）。 */
+function requireNode(spec) {
+  try {
+    // 顶层已用 ESM；这里用 process.getBuiltinModule（Node 22+）或 globalThis.require 兜底
+    if (typeof process.getBuiltinModule === 'function') return process.getBuiltinModule(spec) ?? {}
+    return {}
+  } catch {
+    return {}
+  }
+}
+
+/**
  * 尝试求值，失败返回 undefined（**绝不抛**）。
  * @template T
  * @param {() => T} fn
@@ -88,9 +150,11 @@ export function probeHost(ctx, { warn } = {}) {
   check('service.agentTeams', () => safe(() => ctx?.reflect?.get?.('agentTeams', false)) !== undefined)
 
   // ── 版本信息（拿不到就留空，不猜）──────────────────────────────────────────
+  // 依次尝试：环境变量 → profileContext → 从 dsh 安装目录读 package.json
   const dshVersion =
     safe(() => process.env.DSH_VERSION) ??
     safe(() => ctx?.reflect?.get?.('profileContext', false)?.dshVersion) ??
+    readDshVersion() ??
     undefined
 
   const node = safe(() => process.version) ?? 'unknown'

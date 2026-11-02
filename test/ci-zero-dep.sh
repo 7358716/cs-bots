@@ -57,7 +57,14 @@ case "$deps" in
 esac
 
 echo "== 检查 3：cordis.patch.yml 每个 name 只能是 'cs-bots' 或以 @deepseek-ai/ 开头 =="
-names="$(grep -E '^[[:space:]]*name:' cordis.patch.yml | sed -E "s/^[[:space:]]*name:[[:space:]]*//; s/^['\"]//; s/['\"]\$//")"
+PATCH_FILES="cordis.patch.yml"
+[ -f cordis.patch.agent-team.yml ] && PATCH_FILES="$PATCH_FILES cordis.patch.agent-team.yml"
+names=""
+for pf in $PATCH_FILES; do
+  names="$names$(grep -E '^[[:space:]]*name:' "$pf" | sed -E "s/^[[:space:]]*name:[[:space:]]*//; s/^['\"]//; s/['\"]\$//")
+"
+done
+names="$(printf '%s' "$names" | grep -v '^$' || true)"
 if [ -z "$names" ]; then
   echo "  失败: 未解析到任何 name: 行"
   fail=1
@@ -89,7 +96,12 @@ except ImportError:
     print('SKIP:pyyaml-missing')
     sys.exit(0)
 
-docs = yaml.safe_load(open('cordis.patch.yml', encoding='utf-8')) or []
+docs = []
+for _f in ('cordis.patch.yml', 'cordis.patch.agent-team.yml'):
+    try:
+        docs += (yaml.safe_load(open(_f, encoding='utf-8')) or [])
+    except FileNotFoundError:
+        pass
 # 官方 agent-team 的必填 config 字段（dsh-experimental-agent-team/lib/index.js:1437-1445）
 REQUIRED = {
     'agent-team': {'maxMembers', 'maxTasks', 'maxMessageBytes', 'disposalTimeoutMs'},

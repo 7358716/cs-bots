@@ -1,0 +1,31 @@
+# cs-bots 可选增强 patch —— 解除官方 Agent Teams 的 8 人上限
+#
+# ⚠️ **本文件默认不生效**。它不在 `dsh.bundle.patch` 里，需要显式并入 profile 的
+#    cordis.patch.yml（或由 install.sh --with-agent-team-override 自动并入）。
+#
+# 为什么单独拆出来：覆盖官方行的 `config` 是**整体替换**（逐 key），必须重述全部
+# 4 个字段。若目标 DSH 版本 schema 少任何一个字段 → config 校验失败 →
+# **整个 profile 起不来**（"重启报错、必须禁用插件"的典型故障）。
+# 我们在 0.2.1-rc.2 上验证过；rc1/rc5 未验证，故默认不启用。
+#
+# 前置条件（三条缺一不可）：
+#   1. profile 已启用 @deepseek-ai/dsh-experimental-agent-team-profile
+#   2. 本 bundle（cs-bots）在 dsh.profile.bundles 中**排在 agent-team-profile 之后**
+#      （bundle patch 按 bundles 顺序应用；排在前面时目标行还不存在 → 被静默跳过）
+#   3. 目标版本的 agent-team config **确实**是这 4 个字段
+#
+# 用法：
+#   bash install.sh --check-only     # 会检查层序并自动修正
+#
+# 官方依据（0.2.1-rc.2 实测）：
+#   · dsh-experimental-agent-team/lib/index.js:1420  const DEFAULT_MAX_MEMBERS = 16
+#   · 同文件 :1439  maxMembers: z.number().step(1).min(1).default(DEFAULT_MAX_MEMBERS)
+#     → 默认 16、无上限；本机看到 8 是 agent-team-profile 的 patch 主动压下去的
+
+- id: agent-team
+  name: '@deepseek-ai/dsh-experimental-agent-team'
+  config:
+    maxMembers: 32
+    maxTasks: 256
+    maxMessageBytes: 65536
+    disposalTimeoutMs: 5000

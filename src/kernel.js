@@ -102,7 +102,8 @@ function loadCreateUserMessage() {
  *      ⇒ 这是唯一**不声明 inject 也能读**的服务通道，正是「缺服务就降级」所需。
  *   ② `ctx.get(key)` —— 老/测试上下文形态；在真实 Cordis ctx 上会抛
  *      `cannot get property "X" without inject`（实测），故必须 try/catch。
- *   ③ `ctx[key]` —— 直接挂属性的测试替身；同样会抛，故 try/catch。
+ *   ③ `key in ctx` 探路 —— 更老宿主可能没有 ctx.reflect，靠 `in` 判存在再取。
+ *   ④ `ctx[key]` —— 直接挂属性的测试替身；同样会抛，故 try/catch。
  *
  * ⚠️ 教训：不做 try/catch 会让插件在真实宿主里**加载失败**
  *    （`Error: cannot get property "webServer" without inject`），
@@ -128,7 +129,14 @@ export function service(ctx, key) {
   } catch {
     /* 真实 ctx 未声明 inject 时会抛 → 忽略 */
   }
-  // ③ 直接属性（测试替身）
+  // ③ `in` 探路 + 直接属性：更老宿主（如 rc1）可能没有 ctx.reflect，
+  //    用 `in` 先判存在再取值，可绕开代理 get 陷阱的抛错。
+  try {
+    if (key in ctx) return ctx[key]
+  } catch {
+    /* `in` 也被拒 → 继续 */
+  }
+  // ④ 直接属性（测试替身）
   try {
     return ctx[key]
   } catch {

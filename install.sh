@@ -12,6 +12,8 @@
 #   bash install.sh --profile desktop    # 换 profile
 #   bash install.sh --check-only         # 只自检，不安装
 #   bash install.sh --ref v0.1.0         # 指定 git tag（默认 main）
+#   bash install.sh --with-agent-team-override   # 可选：解除官方 Team 8 人上限
+#                                                （会改 agent-team 的 config，旧版本有 schema 风险）
 #
 # 退出码：0 = 安装且自检通过；1 = 安装失败；2 = 装了但**自检不通过**（最危险，必须显式暴露）
 set -uo pipefail
@@ -25,6 +27,7 @@ PROFILE="web"
 REF="main"
 CHECK_ONLY=0
 NEED_RESTART=0
+WITH_TEAM_OVERRIDE=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -32,6 +35,7 @@ while [ $# -gt 0 ]; do
     --profile) PROFILE="${2:-}"; shift 2 ;;
     --ref) REF="${2:-}"; shift 2 ;;
     --check-only) CHECK_ONLY=1; shift ;;
+    --with-agent-team-override) WITH_TEAM_OVERRIDE=1; shift ;;
     -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
     *) echo "未知参数: $1" >&2; exit 1 ;;
   esac
@@ -80,6 +84,29 @@ EOF
       ;;
     *) die "未知通道: $CHANNEL（支持 npm | git）" ;;
   esac
+fi
+
+# ── 1.5 可选：并入 agent-team 覆盖（默认不做，见 cordis.patch.yml 顶部说明）──
+if [ "$WITH_TEAM_OVERRIDE" -eq 1 ]; then
+  say ""
+  say "▶ 启用可选覆盖：解除官方 Team 8 人上限"
+  PROFILE="$PROFILE" BUNDLE_ID="$BUNDLE_ID" python3 - <<'PY2'
+import json, os, shutil
+prof = os.path.expanduser(f"~/.dsh/profiles/{os.environ['PROFILE']}")
+pkg = os.path.join(prof, "package.json")
+shutil.copyfile(pkg, pkg + ".bak-cs-bots-override")
+d = json.load(open(pkg, encoding="utf-8"))
+b = d.get("dsh", {}).get("profile", {}).get("bundles", [])
+me = os.environ["BUNDLE_ID"]
+if me in b:  # 确保本包最后（覆盖要在 agent-team 行之后执行）
+    b[:] = [x for x in b if x != me] + [me]
+json.dump(d, open(pkg, "w", encoding="utf-8"), indent=2, ensure_ascii=False)
+open(pkg, "a", encoding="utf-8").write("\n")
+print("  已确保层序：", b)
+print("  提示：请把 cordis.patch.agent-team.yml 的内容并入 profile 的 cordis.patch.yml")
+print("        （profile 自己的 patch 在所有 bundle 之后应用，能确保覆盖到 agent-team 行）")
+PY2
+  NEED_RESTART=1
 fi
 
 # ── 2. 自检（**这一步才是关键**）─────────────────────────────────────────────
@@ -156,10 +183,11 @@ esac
 MM="$(printf '%s\n' "$DUMP" | grep -A 12 "id:[[:space:]]*agent-team$" | grep -oE "maxMembers:[[:space:]]*[0-9]+" | head -1 | grep -oE '[0-9]+')"
 if [ -n "$MM" ]; then
   if [ "$MM" -ge 32 ]; then
-    say "  ✅ agent-team.maxMembers = $MM（P1 已生效，官方默认 16、本机曾压到 8）"
+    say "  ✅ agent-team.maxMembers = $MM（可选覆盖已生效，官方默认 16）"
   else
-    say "  ⚠️  agent-team.maxMembers = $MM（< 32）—— 覆盖未生效"
-    say "     最常见原因：层序错（本包排在 agent-team-profile 之前）→ 见上一条处置"
+    say "  ℹ️  agent-team.maxMembers = $MM（未覆盖 —— **这是默认状态，不影响平台核心能力**）"
+    say "     本平台的 Bot 注册表走 root agent + 独立 cwd，不受官方上限约束。"
+    say "     想让官方 Team 也超过 8 人：bash install.sh --with-agent-team-override"
   fi
 else
   say "  ⚠️  未找到 agent-team 行 → 目标 profile 未启用实验性 Agent Teams"

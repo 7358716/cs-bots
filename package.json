@@ -12,6 +12,7 @@
   "files": [
     "src",
     "cordis.patch.yml",
+    "cordis.patch.agent-team.yml",
     "install.sh",
     "README.md",
     "LICENSE"
