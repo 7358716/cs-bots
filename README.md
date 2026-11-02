@@ -37,6 +37,27 @@ bash install.sh --channel npm      # 或 --channel git
 
 退出码：`0`=装好且自检通过；`1`=安装失败；**`2`=装了但自检不通过**（最危险，必须处理）。
 
+#### ⚠️ 一个必踩的坑：**bundle 层序**
+
+`dsh plugin add` 只往 `dsh.profile.bundles` **末尾追加**。而 bundle patch 按 **bundles 顺序**依次应用，
+之后才是 profile 自己的 patch。
+
+⇒ **本插件必须排在 `@deepseek-ai/dsh-experimental-agent-team-profile` 之后**，
+否则我们对 `agent-team.maxMembers` 的**覆盖会在目标行还不存在时执行 → 被静默跳过**（`entry not found`）。
+
+**实测复现**（2026-11-02）：先装 `cs-bots`、后装 `agent-team-profile` → `maxMembers` 仍是 `8`。
+
+`install.sh` 会**检测并自动重排**（备份为 `package.json.bak-cs-bots-order`），
+然后以 **exit=2** 提示「需重启 DSH 后重跑自检」。
+
+手动安装时请**先启用 agent-team，再装本插件**；或装完跑一次 `install.sh --check-only` 让它修正。
+
+#### 另一个坑：**不要用 npm 装 agent-team-profile**
+
+`dsh plugin add @deepseek-ai/dsh-experimental-agent-team-profile` 会从 registry 拉到**另一个版本**
+（实测拉到 `0.1.5-alpha.2`，而 dsh 自带的是 `0.2.1-rc.2`）。
+正确做法：**只在 `dsh.profile.bundles` 里按名引用**（不装包），它会从 dsh 安装目录解析，版本天然对齐。
+
 ---
 
 ## 装好后你得到什么

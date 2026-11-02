@@ -24,6 +24,7 @@ CHANNEL="npm"
 PROFILE="web"
 REF="main"
 CHECK_ONLY=0
+NEED_RESTART=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -101,14 +102,64 @@ else
   exit 2
 fi
 
-# 判据 2：我们覆盖的 maxMembers 真的生效（P1 路径 A 的验收点）
+# 判据 2：**层序** —— 本包必须在 agent-team-profile 之后（否则覆盖静默失效）
+# 实测（2026-11-02）：`dsh plugin add` 只往 bundles **末尾追加**；若先装本插件、
+# 后装 agent-team-profile，本包的覆盖 patch 会在 agent-team 行还不存在时执行 →
+# 被 warn 跳过 → maxMembers 仍是 8。
+ORDER_OK="$(PROFILE="$PROFILE" BUNDLE_ID="$BUNDLE_ID" python3 - <<'PY'
+import json, os
+p = os.path.expanduser(f"~/.dsh/profiles/{os.environ['PROFILE']}/package.json")
+try:
+    d = json.load(open(p, encoding="utf-8"))
+except Exception:
+    print("UNKNOWN"); raise SystemExit(0)
+b = d.get("dsh", {}).get("profile", {}).get("bundles", [])
+me = os.environ["BUNDLE_ID"]
+tm = "@deepseek-ai/dsh-experimental-agent-team-profile"
+if me not in b or tm not in b:
+    print("SKIP"); raise SystemExit(0)
+print("OK" if b.index(me) > b.index(tm) else "REORDER")
+PY
+)"
+
+case "$ORDER_OK" in
+  OK)
+    say "  ✅ 层序正确（$BUNDLE_ID 在 agent-team-profile 之后）"
+    ;;
+  REORDER)
+    say "  ⚠️  层序错误：$BUNDLE_ID 排在 agent-team-profile **之前** → 覆盖会静默失效"
+    say "     正在自动修正（把 $BUNDLE_ID 移到 bundles 末尾）..."
+    PROFILE="$PROFILE" BUNDLE_ID="$BUNDLE_ID" python3 - <<'PY'
+import json, os, shutil
+p = os.path.expanduser(f"~/.dsh/profiles/{os.environ['PROFILE']}/package.json")
+shutil.copyfile(p, p + ".bak-cs-bots-order")
+d = json.load(open(p, encoding="utf-8"))
+b = d["dsh"]["profile"]["bundles"]
+me = os.environ["BUNDLE_ID"]
+b[:] = [x for x in b if x != me] + [me]
+json.dump(d, open(p, "w", encoding="utf-8"), indent=2, ensure_ascii=False)
+open(p, "a", encoding="utf-8").write("\n")
+print(f"     已重排：{b}")
+PY
+    say "     （原文件已备份为 package.json.bak-cs-bots-order）"
+    NEED_RESTART=1
+    ;;
+  SKIP)
+    say "  ⚠️  目标 profile 未启用 agent-team-profile → 层序无关（平台降级运行）"
+    ;;
+  *)
+    say "  ⚠️  无法判定层序（profile package.json 读取失败）"
+    ;;
+esac
+
+# 判据 3：我们覆盖的 maxMembers 真的生效（P1 路径 A 的验收点）
 MM="$(printf '%s\n' "$DUMP" | grep -A 12 "id:[[:space:]]*agent-team$" | grep -oE "maxMembers:[[:space:]]*[0-9]+" | head -1 | grep -oE '[0-9]+')"
 if [ -n "$MM" ]; then
   if [ "$MM" -ge 32 ]; then
     say "  ✅ agent-team.maxMembers = $MM（P1 已生效，官方默认 16、本机曾压到 8）"
   else
     say "  ⚠️  agent-team.maxMembers = $MM（< 32）—— 覆盖未生效"
-    say "     检查：本 bundle 是否排在 agent-team-profile **之后**（层序决定谁覆盖谁）"
+    say "     最常见原因：层序错（本包排在 agent-team-profile 之前）→ 见上一条处置"
   fi
 else
   say "  ⚠️  未找到 agent-team 行 → 目标 profile 未启用实验性 Agent Teams"
@@ -126,6 +177,13 @@ else
 fi
 
 say ""
+if [ "$NEED_RESTART" -eq 1 ]; then
+  say "⚠️  已安装，但**层序刚被修正，需重启 DSH 才生效**。"
+  say "    请：① 重启 DSH  ② 重跑 bash install.sh --check-only --profile $PROFILE"
+  say "    在此之前 agent-team.maxMembers 仍是旧值（平台可用，但官方 Team 仍受旧上限约束）。"
+  exit 2
+fi
+
 say "✅ 安装并自检通过。"
 say "   下一步：重启 DSH 后，在会话里应能看到 bot_* 工具（bot_task_create 等）。"
 say "   若看不到工具：检查 tools 服务是否可用（本平台缺它时只 warn 不崩）。"
