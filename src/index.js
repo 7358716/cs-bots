@@ -17,6 +17,7 @@ import { createRoom } from './room.js'
 import { createMemory } from './memory.js'
 import { installTools } from './tools.js'
 import { setServices } from './registry.js'
+import { installApi } from './api.js'
 
 export const name = 'cs-bots'
 
@@ -98,6 +99,9 @@ export function apply(ctx, config = {}) {
   // ⚠️ 不能 `ctx.csBots = services`：Cordis ctx 禁止任意属性（实测报
   //    `cannot set property "csBots" without provide`）→ 走 WeakMap 注册表。
   setServices(ctx, services)
+  // ── 页面数据面：HTTP API（页面层靠它拿数据；没有它 UI 是空壳）──────────────
+  services.apiDispose = installApi(ctx, { warn })
+
   const toolNames = installTools(ctx, { warn })
   if (toolNames.length === 0) {
     warn('[cs-bots] 未注册任何工具（tools 服务不可用？）→ 模型将看不到平台能力')
@@ -110,6 +114,7 @@ export function apply(ctx, config = {}) {
   const dispose = () => {
     try {
       services.dispatcher?.dispose?.()
+      try { services.apiDispose?.() } catch { /* 已卸载 */ }
     } catch (error) {
       warn(`[cs-bots] dispatcher dispose 失败：${error?.message ?? error}`)
     }
