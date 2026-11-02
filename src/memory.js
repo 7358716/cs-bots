@@ -707,6 +707,16 @@ export function createMemory(ctx, config = {}) {
     }
   }
 
+  /**
+   * Bot 可见性：条目不带 `botId` = 全局可见；带了 = 只对该 Bot 可见。
+   * @param {object} entry
+   * @param {string | undefined} forBot
+   */
+  function visibleToBot(entry, forBot) {
+    if (!entry?.botId) return true
+    return entry.botId === forBot
+  }
+
   /** 分支可见性：`branches` 为空 = 全分支可见；否则要求包含目标分支。 */
   function branchVisible(entry, branch) {
     if (branch === undefined || branch === null) return true
@@ -729,7 +739,7 @@ export function createMemory(ctx, config = {}) {
    * @returns {object} Entry（含 id + rev）
    */
   function add(input = {}) {
-    const { layer, content, by, explicit, source, branch, tags, now } = input ?? {}
+    const { layer, content, by, explicit, source, branch, tags, botId, now } = input ?? {}
     const targetLayer = requireLayer(layer, 'add')
     assertNotPersonaLayer(targetLayer, 'add')
     const author = requireString(by, 'by', 'add')
@@ -745,6 +755,8 @@ export function createMemory(ctx, config = {}) {
       )
     }
     const branches = stringList(branch, 'branch', 'add')
+    // Bot 维度：不传 = 全局记忆；传了 = 只在那个 Bot 的 contextFor 里出现
+    const ownerBot = optionalString(botId, 'botId', 'add')
     const tagList = stringList(tags, 'tags', 'add')
     const at = normalizeNow(now, 'add')
 
@@ -770,6 +782,7 @@ export function createMemory(ctx, config = {}) {
         source: writer,
         explicit: explicit === true,
         branches,
+        ...(ownerBot !== undefined ? { botId: ownerBot } : {}),
         tags: tagList.slice(),
         createdAt: at,
         createdBy: author,
@@ -1755,7 +1768,7 @@ export function createMemory(ctx, config = {}) {
    * @returns {string}
    */
   function contextFor(options = {}) {
-    const { layers, branch, title } = options ?? {}
+    const { layers, branch, title, botId: forBot } = options ?? {}
     const want = layers === undefined || layers === null
       ? INJECTED_LAYERS.slice()
       : stringList(layers, 'layers', 'contextFor')
@@ -1776,7 +1789,7 @@ export function createMemory(ctx, config = {}) {
     const out = []
     out.push(`# cs-bots 分层记忆${title ? ` · ${title}` : ''}`)
     out.push(`# branch=${b ?? '(all)'} · layers=${want.join(',')} · entries=${entries.size}`
-      + ` · search=${diagnostics.searchBackend}`)
+      + ` · search=${diagnostics.searchBackend}${forBot ? ` · bot=${forBot}` : ''}`)
 
     for (const layer of want) {
       out.push('')
@@ -1787,7 +1800,7 @@ export function createMemory(ctx, config = {}) {
         continue
       }
       const rows = [...entries.values()]
-        .filter((e) => e.layer === layer && !e.archived && branchVisible(e, b))
+        .filter((e) => e.layer === layer && !e.archived && branchVisible(e, b) && visibleToBot(e, forBot))
         .sort((x, y) => (x.id < y.id ? -1 : 1))
       if (rows.length === 0) out.push('（空）')
       else for (const e of rows) out.push(renderLine(e))

@@ -58,6 +58,7 @@ import {
   writeJsonAtomic,
 } from './store.js'
 import * as kernel from './kernel.js'
+import { normalizeProfile, writeAgentsFile, readAgentsFile, writeSkill } from './botprofile.js'
 
 // ── 常量 ────────────────────────────────────────────────────────────────────
 
@@ -595,7 +596,7 @@ export function createRoster(ctx, config = {}) {
    * @throws {RosterError} 缺字段 / 非法 cwd / 重名 / 会话创建失败 / 事件落盘失败
    */
   async function create(input = {}) {
-    const { name, cwd, label, model, instructions, permission, byId, now } = input ?? {}
+    const { name, cwd, label, model, instructions, preset, permission, profile, byId, now } = input ?? {}
     const by = requireString(byId, 'byId', 'create')
     const displayName = requireString(name, 'name', 'create')
     const dir = assertBotCwd(cwd, 'create')
@@ -622,7 +623,11 @@ export function createRoster(ctx, config = {}) {
     const id = `bot-${randomUUID()}`
     let handle
     try {
-      handle = await kernel.createSession(ctx, { sessionId: id, cwd: dir })
+      handle = await kernel.createSession(ctx, {
+        sessionId: id,
+        cwd: dir,
+        ...(preset !== undefined && preset !== null && preset !== '' ? { agentPreset: String(preset) } : {}),
+      })
     } catch (error) {
       throw new RosterError(
         `roster.create：Bot「${displayName}」的会话创建失败（cwd=${dir}）→ ${error?.message ?? error}`
@@ -646,6 +651,7 @@ export function createRoster(ctx, config = {}) {
       sessionId,
       cwd: dir,
       permission: perm,
+      ...(preset !== undefined && preset !== null && preset !== '' ? { preset: String(preset) } : {}),
       state: 'idle',
       createdAt: at,
       createdBy: by,
@@ -653,6 +659,27 @@ export function createRoster(ctx, config = {}) {
     if (roleLabel !== undefined) bot.label = roleLabel
     if (mdl !== undefined) bot.model = mdl
     if (inst !== undefined) bot.instructions = inst
+    // ── 档案（身份/经验/技能/预制记忆）→ 落到官方机制上 ──────────────────
+    if (profile !== undefined) {
+      try {
+        bot.profile = normalizeProfile(profile)
+        const written = writeAgentsFile(bot.cwd, { ...bot.profile, botName: bot.name, preset: bot.preset })
+        bot.profilePath = written.path
+        // 技能：每个名字建一个 SKILL.md 骨架（已存在则不覆盖正文）
+        for (const skillName of bot.profile.skills ?? []) {
+          try {
+            writeSkill(bot.cwd, skillName, { body: `# ${skillName}\n\n（在此写技能说明）` })
+          } catch (error) {
+            warn(`[cs-bots/roster] 技能 ${skillName} 落盘失败（不影响注册）：${error?.message ?? error}`)
+          }
+        }
+      } catch (error) {
+        // 档案写失败不阻塞建 Bot（会话已建好），但要如实记在记录里
+        bot.profile = normalizeProfile(profile)
+        bot.profileError = String(error?.message ?? error)
+        warn(`[cs-bots/roster] 档案落盘失败：${error?.message ?? error}`)
+      }
+    }
 
     // 事件落盘失败 → 会话已建但注册表没有它：**不静默**，错误里带上 sessionId 供人工清理
     try {
@@ -756,6 +783,83 @@ export function createRoster(ctx, config = {}) {
    * @returns {object} Bot
    * @throws {RosterError} 非法 cwd / 已退役 / CAS 冲突
    */
+  /**
+   * 读一个 Bot 的档案（含从 AGENTS.md 读回的托管段）。
+   * @param {string} id
+   * @returns {{ bot: object, profilePath?: string, managedText?: string, hasOutside?: boolean, skills?: string[] }}
+   */
+  function getProfile(id) {
+    const bid = requireString(id, 'id', 'getProfile')
+    const bot = index.get(bid)
+    if (!bot) {
+      throw new RosterError(`roster.getProfile：Bot ${bid} 不存在`, 'ROSTER_BOT_NOT_FOUND', { id: bid })
+    }
+    const out = { bot, profile: bot.profile ?? {} }
+    try {
+      const md = readAgentsFile(bot.cwd)
+      out.profilePath = md.path
+      out.managedText = md.managed
+      out.hasOutside = Boolean(md.outside && md.outside.trim())
+    } catch (error) {
+      out.profileError = String(error?.message ?? error)
+    }
+    return out
+  }
+
+  /**
+   * 改一个 Bot 的档案（身份/经验/技能/预制记忆）→ 重写 AGENTS.md 托管段。
+   *
+   * **只动托管段**，用户在 AGENTS.md 段外写的内容原样保留。
+   * @param {{ id: string, profile: object, byId?: string, expectedRev?: number, now?: number }} input
+   */
+  function setProfile(input = {}) {
+    const { id, profile, byId, now } = input ?? {}
+    const current = loadForCas(input, 'setProfile')
+    const by = requireString(byId, 'byId', 'setProfile')
+    if (current.state === 'retired') {
+      throw new RosterError(
+        `roster.setProfile：Bot ${current.id} 已退役（名字 ${current.name}）——退役 Bot 不可改档案`,
+        'ROSTER_BOT_RETIRED',
+        { id: current.id },
+      )
+    }
+    const nextProfile = { ...(current.profile ?? {}), ...normalizeProfile(profile) }
+
+    // 先落盘，成功再记事件（避免"记录说改了但文件没变"）
+    let written
+    try {
+      written = writeAgentsFile(current.cwd, {
+        ...nextProfile,
+        botName: current.name,
+        preset: current.preset,
+      })
+      for (const skillName of nextProfile.skills ?? []) {
+        try {
+          writeSkill(current.cwd, skillName, { body: `# ${skillName}\n\n（在此写技能说明）` })
+        } catch (error) {
+          warn(`[cs-bots/roster] 技能 ${skillName} 落盘失败：${error?.message ?? error}`)
+        }
+      }
+    } catch (error) {
+      throw new RosterError(
+        `roster.setProfile：写 AGENTS.md 失败（cwd=${current.cwd}）→ ${error?.message ?? error}`,
+        'ROSTER_PROFILE_WRITE_FAILED',
+        { id: current.id, cwd: current.cwd, cause: String(error?.message ?? error) },
+      )
+    }
+
+    const at = normalizeNow(now, 'setProfile')
+    const before = clone(current)
+    const next = clone(current)
+    next.profile = nextProfile
+    next.profilePath = written.path
+    delete next.profileError
+    next.rev = current.rev + 1
+    next.updatedAt = at
+    next.updatedBy = by
+    return commit(current.id, 'profile_updated', by, at, before, next)
+  }
+
   function setCwd(input = {}) {
     const { cwd, byId, now } = input ?? {}
     const current = loadForCas(input, 'setCwd')
@@ -989,6 +1093,8 @@ export function createRoster(ctx, config = {}) {
     rename,
     retire,
     setCwd,
+    getProfile,
+    setProfile,
     claim,
     release,
     heartbeat,

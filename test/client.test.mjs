@@ -124,7 +124,15 @@ test('A3 apply() 注册 main 与 sidebar.panellist，且 **main 在前**', () =>
   const dispose = exports.apply(ctx)
 
   const names = registrations.map((r) => r.options.name)
-  assert.deepEqual(names, ['main', 'sidebar.panellist'], `注册顺序必须是 main→panellist，实际=${names}`)
+  // 顺序铁律：main 必须先于 panellist（selectPanel 校验 main 存在）
+  assert.ok(names.includes('main'), `必须注册 main，实际=${names}`)
+  assert.ok(names.includes('sidebar.panellist'), `必须注册 sidebar.panellist，实际=${names}`)
+  assert.ok(
+    names.indexOf('main') < names.indexOf('sidebar.panellist'),
+    `main 必须在 panellist 之前，实际=${names}`,
+  )
+  // 允许（并且应该有）额外的 settings.section 注册
+  assert.ok(names.includes('settings.section'), `应把设置页挂到官方 settings.section，实际=${names}`)
   assert.equal(typeof dispose, 'function', 'apply 应返回 disposer')
 })
 

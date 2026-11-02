@@ -12,7 +12,7 @@
  *   - **前缀路由**：`/cs-bots/api`（与包名一致，避免和其他插件撞路径）。
  */
 
-import { registerRoute } from './kernel.js'
+import { registerRoute, listPresets, defaultPreset } from './kernel.js'
 import { getServices } from './registry.js'
 
 /** 请求体上限（防大包打爆内存）。 */
@@ -73,6 +73,38 @@ async function withService(services, key, fn) {
     throw error
   }
   return fn(svc)
+}
+
+
+/**
+ * 把 Bot 档案里的「预制记忆」同步进记忆服务（带 botId）。
+ * 建 Bot 与改档案两处都要调用 —— 否则会出现"AGENTS.md 有、记忆库里没有"的不一致。
+ * @param {object} services
+ * @param {{ id: string, profile?: object }} bot
+ * @param {string} by
+ * @returns {{ added: number, failed: object[] } | undefined}
+ */
+function seedBotMemory(services, bot, by) {
+  const seed = Array.isArray(bot?.profile?.memory) ? bot.profile.memory : []
+  if (!services.memory || seed.length === 0) return undefined
+  const added = []
+  const failed = []
+  for (const content of seed) {
+    try {
+      const entry = services.memory.add({
+        layer: 'L2',
+        content: String(content).slice(0, 600),
+        by,
+        source: 'explicit',
+        botId: bot.id,
+      })
+      const id = Array.isArray(entry) ? entry[0]?.id : entry?.id
+      if (id) added.push(id)
+    } catch (error) {
+      failed.push({ content: String(content).slice(0, 40), reason: error?.message ?? String(error) })
+    }
+  }
+  return { added: added.length, failed }
 }
 
 /**
@@ -151,6 +183,32 @@ export function installApi(ctx, { warn } = {}) {
         return
       }
 
+      // ── agent 预设（建 Bot 时可选）─────────────────────────────────────────
+      if (request.method === 'GET' && path === '/presets') {
+        let presets = []
+        let defaultId
+        try {
+          presets = await listPresets(ctx)
+          defaultId = defaultPreset(ctx)
+        } catch (error) {
+          sendJson(response, 200, { ok: true, presets: [], defaultId: undefined, note: `预设服务不可用：${error?.message ?? error}` })
+          return
+        }
+        sendJson(response, 200, {
+          ok: true,
+          presets: presets.map((p) => ({
+            id: p.id,
+            name: p.name ?? p.id,
+            description: p.description,
+            order: p.order,
+            broken: p.broken,
+          })),
+          defaultId,
+          note: presets.length ? undefined : '宿主未提供 agentPresets 服务（Bot 将使用默认预设）',
+        })
+        return
+      }
+
       // ── Bot 注册表 ────────────────────────────────────────────────────────
       if (request.method === 'GET' && path === '/roster') {
         const includeRetired = qp(url, 'includeRetired') === '1'
@@ -167,7 +225,44 @@ export function installApi(ctx, { warn } = {}) {
         const bot = await withService(services, 'roster', (r) =>
           r.create({ ...body, byId: body.byId ?? 'ui' }),
         )
-        sendJson(response, 200, { ok: true, bot })
+        // 预制记忆同步（建 Bot 与改档案必须一致）
+        const memory = seedBotMemory(services, bot, body.byId ?? 'ui')
+        sendJson(response, 200, { ok: true, bot, ...(memory ? { memory } : {}) })
+        return
+      }
+
+      // ── Bot 档案（身份 / 经验 / 技能 / 预制记忆）──────────────────────────
+      if (request.method === 'GET' && path === '/roster/profile') {
+        const id = qp(url, 'id')
+        if (!id) {
+          sendJson(response, 400, { ok: false, reason: 'id 必填' })
+          return
+        }
+        const detail = await withService(services, 'roster', (r) => r.getProfile(id))
+        sendJson(response, 200, {
+          ok: true,
+          bot: detail.bot,
+          profile: detail.profile ?? {},
+          profilePath: detail.profilePath,
+          managedText: detail.managedText,
+          hasOutside: detail.hasOutside,
+          profileError: detail.profileError,
+        })
+        return
+      }
+
+      if (request.method === 'POST' && path === '/roster/profile') {
+        const body = (await readBody(request)) ?? {}
+        if (!body.id) {
+          sendJson(response, 400, { ok: false, reason: 'id 必填' })
+          return
+        }
+        const bot = await withService(services, 'roster', (r) =>
+          r.setProfile({ id: body.id, profile: body.profile ?? {}, byId: body.byId ?? 'ui', expectedRev: body.expectedRev }),
+        )
+        // 预制记忆同步（与建 Bot 共用同一段逻辑）
+        const memory = seedBotMemory(services, bot, body.byId ?? 'ui')
+        sendJson(response, 200, { ok: true, bot, ...(memory ? { memory } : {}) })
         return
       }
 

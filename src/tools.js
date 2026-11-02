@@ -200,6 +200,12 @@ const DEFS = [
         model: { type: 'string' },
         instructions: { type: 'string', description: '该 Bot 的职责说明' },
         permission: { type: 'string', enum: ['read-only', 'workspace-write', 'full'] },
+        preset: {
+          type: 'string',
+          description:
+            'agent 预设 id（决定该 Bot 的人格/系统提示/技能/工具面）。' +
+            '不传则用宿主默认预设。可用 bot_roster_list 的 presets 字段或 GET /cs-bots/api/presets 查可选项。',
+        },
       },
       required: ['name', 'cwd'],
       additionalProperties: false,

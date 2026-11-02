@@ -443,3 +443,38 @@ export function stateDir() {
   const home = process.env.DSH_HOME || `${process.env.HOME ?? '.'}/.dsh`
   return `${home}/cs-bots`
 }
+
+/**
+ * 列出可用 agent 预设（**缺服务返回空数组，不抛**）。
+ *
+ * 预设是什么：一组「模型 + 系统提示 + 技能 + 工具白名单」的声明式组合。
+ * 同一个 DSH 里可以有 dev-steward / 普通助手 / 记忆整理 等多个预设。
+ * Bot 建会话时把 preset 传进 `meta.agentPreset`，新会话就用那套人格与工具面。
+ *
+ * @param {object} ctx
+ * @returns {Promise<Array<{id:string,name?:string,description?:string,order?:number,broken?:string}>>}
+ */
+export async function listPresets(ctx) {
+  const registry = service(ctx, 'agentPresets')
+  if (!registry || typeof registry.list !== 'function') return []
+  try {
+    const rows = await registry.list()
+    return Array.isArray(rows) ? rows : []
+  } catch {
+    return []
+  }
+}
+
+/**
+ * 取默认预设 id（缺服务返回 undefined）。
+ * @param {object} ctx
+ * @returns {string | undefined}
+ */
+export function defaultPreset(ctx) {
+  const registry = service(ctx, 'agentPresets')
+  try {
+    return typeof registry?.defaultId === 'string' ? registry.defaultId : undefined
+  } catch {
+    return undefined
+  }
+}
