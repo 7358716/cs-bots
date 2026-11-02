@@ -86,6 +86,14 @@ window.__ModuleLoader__.load({
         '.csb-msg{padding:6px 8px;border-radius:6px;margin-bottom:4px}',
         '.csb-msg-user{background:rgba(59,130,246,.1)}',
         '.csb-label{color:var(--dsw-alias-label-tertiary,#999);font-size:11px;margin:6px 0 2px}',
+        '.csb-drawer{position:fixed;inset:0;background:rgba(0,0,0,.35);display:flex;justify-content:flex-end;z-index:60}',
+        '.csb-drawer-body{width:min(560px,100vw);height:100%;overflow:auto;background:var(--dsw-specific-menu,#fff);padding:16px;box-sizing:border-box}',
+        '.csb-drawer-head{display:flex;align-items:center;gap:8px;margin-bottom:10px}',
+        '.csb-kv{display:grid;grid-template-columns:120px 1fr;gap:4px 10px;font-size:12px;margin:8px 0}',
+        '.csb-k{color:var(--dsw-alias-label-tertiary,#999)}',
+        '.csb-sec{border-top:1px solid var(--dsw-alias-border-l2,#e5e5e5);margin-top:12px;padding-top:10px}',
+        '.csb-field{display:flex;gap:6px;align-items:center;margin-bottom:6px}',
+        '.csb-field label{width:130px;flex:none;font-size:12px;color:var(--dsw-alias-label-secondary,#666)}',
       ].join('')
       document.head.appendChild(style)
     }
@@ -167,12 +175,150 @@ window.__ModuleLoader__.load({
 
     // ── Tab 1：任务中心 ──────────────────────────────────────────────────────
 
+    // 任务详情抽屉（穿透）：看全量字段 + 审计流 + 管理动作
+    function TaskDrawer({ id, onClose, onChange, bots }) {
+      const { data, loading, error, reload } = useApi(`/tasks/detail?id=${encodeURIComponent(id)}`, [id])
+      const [err, setErr] = useState(null)
+      const task = data?.task
+      const history = data?.history ?? []
+
+      const act = async (fn, label) => {
+        setErr(null)
+        try {
+          await fn()
+          reload()
+          onChange?.()
+        } catch (e) {
+          setErr(`${label}失败：${e.message}`)
+        }
+      }
+
+      return h(
+        'div',
+        { className: 'csb-drawer', onClick: (e) => e.target === e.currentTarget && onClose() },
+        h(
+          'div',
+          { className: 'csb-drawer-body' },
+          h(
+            'div',
+            { className: 'csb-drawer-head' },
+            h('strong', { style: { flex: 1 } }, task?.subject ?? id),
+            h('button', { className: 'csb-btn', onClick: onClose }, '关闭'),
+          ),
+          loading ? h(Empty, { text: '加载中…' }) : null,
+          error ? h('div', { className: 'csb-err' }, error) : null,
+          err ? h('div', { className: 'csb-err' }, err) : null,
+          task
+            ? h(
+                'div',
+                null,
+                h(
+                  'div',
+                  { className: 'csb-kv' },
+                  h('span', { className: 'csb-k' }, 'ID'), h('span', null, task.id),
+                  h('span', { className: 'csb-k' }, '状态'), h('span', null, h(StatusBadge, { status: task.status })),
+                  h('span', { className: 'csb-k' }, 'rev'), h('span', null, String(task.rev)),
+                  h('span', { className: 'csb-k' }, '负责人'), h('span', null, task.ownerId ?? '—'),
+                  h('span', { className: 'csb-k' }, '租约至'), h('span', null, task.lease ? new Date(task.lease.expiresAt).toLocaleString() : '—'),
+                  h('span', { className: 'csb-k' }, '依赖'), h('span', null, (task.blockedBy ?? []).join(', ') || '—'),
+                  h('span', { className: 'csb-k' }, '写入范围'), h('span', null, (task.writeScopes ?? []).join(', ') || '—'),
+                  h('span', { className: 'csb-k' }, '交付物'), h('span', null, (task.artifacts ?? []).join(', ') || '—'),
+                  h('span', { className: 'csb-k' }, '验收'), h('span', null, task.acceptance ? `${task.acceptance.result} by ${task.acceptance.by}` : '—'),
+                  h('span', { className: 'csb-k' }, '终止原因'), h('span', null, task.blockedReason ?? '—'),
+                ),
+                task.description ? h('div', { className: 'csb-pre' }, task.description) : null,
+
+                h('div', { className: 'csb-sec' }, h('div', { className: 'csb-label' }, '管理动作')),
+                h(
+                  'div',
+                  { className: 'csb-bar', style: { flexWrap: 'wrap' } },
+                  // 指派：选一个已注册 Bot
+                  h(
+                    'select',
+                    {
+                      className: 'csb-select',
+                      style: { width: 180 },
+                      defaultValue: '',
+                      onChange: (e) => {
+                        const ownerId = e.target.value
+                        if (!ownerId) return
+                        act(
+                          () =>
+                            call('/tasks/assign', {
+                              method: 'POST',
+                              body: { id: task.id, expectedRev: task.rev, ownerId },
+                            }),
+                          '指派',
+                        )
+                        e.target.value = ''
+                      },
+                    },
+                    h('option', { value: '' }, '指派给 Bot…'),
+                    (bots ?? []).filter((b) => b.state !== 'retired').map((b) =>
+                      h('option', { key: b.id, value: b.sessionId }, `${b.name}（${b.state}）`),
+                    ),
+                  ),
+                  task.status === 'in_progress'
+                    ? h('button', { className: 'csb-btn', onClick: () => act(() => call('/tasks/update', { method: 'POST', body: { id: task.id, expectedRev: task.rev, action: 'complete', artifacts: (window.prompt('交付物路径（逗号分隔）') ?? '').split(',').map((x) => x.trim()).filter(Boolean) } }), '完成') }, '完成')
+                    : null,
+                  task.status === 'in_progress'
+                    ? h('button', { className: 'csb-btn', onClick: () => act(() => call('/tasks/update', { method: 'POST', body: { id: task.id, expectedRev: task.rev, action: 'heartbeat' } }), '续租') }, '续租')
+                    : null,
+                  h('button', {
+                    className: 'csb-btn',
+                    onClick: () => {
+                      const reason = window.prompt('终止原因', '用户终止')
+                      if (reason === null) return
+                      act(() => call('/tasks/abort', { method: 'POST', body: { id: task.id, expectedRev: task.rev, reason } }), '终止')
+                    },
+                  }, '终止'),
+                  task.status === 'blocked'
+                    ? h('button', { className: 'csb-btn', onClick: () => act(() => call('/tasks/update', { method: 'POST', body: { id: task.id, expectedRev: task.rev, action: 'reopen' } }), '重开') }, '重开')
+                    : null,
+                  h('button', {
+                    className: 'csb-btn',
+                    onClick: () => {
+                      const s2 = window.prompt('新标题', task.subject)
+                      if (!s2) return
+                      act(() => call('/tasks/edit', { method: 'POST', body: { id: task.id, expectedRev: task.rev, subject: s2 } }), '改标题')
+                    },
+                  }, '改标题'),
+                  task.status !== 'deleted'
+                    ? h('button', {
+                        className: 'csb-btn',
+                        onClick: () => {
+                          if (window.confirm('删除（tombstone，可审计不可恢复列表）？')) {
+                            act(() => call('/tasks/update', { method: 'POST', body: { id: task.id, expectedRev: task.rev, action: 'delete' } }), '删除')
+                          }
+                        },
+                      }, '删除')
+                    : null,
+                ),
+
+                h('div', { className: 'csb-sec' }, h('div', { className: 'csb-label' }, `审计流（${history.length} 条）`)),
+                history.slice(-30).reverse().map((ev, i) =>
+                  h('div', { key: i, className: 'csb-row', style: { fontSize: 11 } },
+                    h('div', { className: 'csb-grow' },
+                      h('div', null, `${ev.action} · rev ${ev.rev} · ${ev.byId ?? '?'}`),
+                      h('div', { className: 'csb-meta' }, ev.at ? new Date(ev.at).toLocaleString() : ''),
+                    ),
+                  ),
+                ),
+              )
+            : null,
+        ),
+      )
+    }
+
     function TasksTab() {
       const [filter, setFilter] = useState('')
       const { data, loading, error, reload } = useApi(`/tasks${filter ? `?status=${filter}` : ''}`, [filter])
       const [subject, setSubject] = useState('')
       const [busy, setBusy] = useState(false)
       const [actionError, setActionError] = useState(null)
+      const [openId, setOpenId] = useState(null)
+      const { data: rosterData } = useApi('/roster')
+      const bots = rosterData?.bots ?? []
 
       const doCreate = async () => {
         const s = subject.trim()
@@ -242,7 +388,12 @@ window.__ModuleLoader__.load({
             { key: t.id, className: 'csb-row' },
             h(
               'div',
-              { className: 'csb-grow' },
+              {
+                className: 'csb-grow',
+                style: { cursor: 'pointer' },
+                onClick: () => setOpenId(t.id),
+                title: '点击查看详情',
+              },
               h('div', { className: 'csb-title' }, t.subject),
               h(
                 'div',
@@ -295,6 +446,14 @@ window.__ModuleLoader__.load({
               : null,
           ),
         ),
+        openId
+          ? h(TaskDrawer, {
+              id: openId,
+              bots,
+              onClose: () => setOpenId(null),
+              onChange: reload,
+            })
+          : null,
       )
     }
 
@@ -307,6 +466,7 @@ window.__ModuleLoader__.load({
       const [text, setText] = useState('')
       const [actionError, setActionError] = useState(null)
       const [roomName, setRoomName] = useState('')
+      const [memberId, setMemberId] = useState('')
 
       const loadMsgs = useCallback((roomId) => {
         call(`/rooms/messages?roomId=${encodeURIComponent(roomId)}`)
@@ -381,6 +541,32 @@ window.__ModuleLoader__.load({
         active
           ? h(
               'div',
+              { className: 'csb-bar', style: { marginTop: 8 } },
+              h('input', {
+                className: 'csb-input',
+                placeholder: '成员 sessionId',
+                value: memberId,
+                onChange: (e) => setMemberId(e.target.value),
+              }),
+              h('button', {
+                className: 'csb-btn',
+                onClick: () =>
+                  call('/rooms/join', { method: 'POST', body: { roomId: active, sessionId: memberId.trim() } })
+                    .then(() => { setMemberId(''); reload() })
+                    .catch((e) => setActionError(e.message)),
+              }, '加入'),
+              h('button', {
+                className: 'csb-btn',
+                onClick: () =>
+                  call('/rooms/leave', { method: 'POST', body: { roomId: active, sessionId: memberId.trim() } })
+                    .then(() => { setMemberId(''); reload() })
+                    .catch((e) => setActionError(e.message)),
+              }, '移出'),
+            )
+          : null,
+        active
+          ? h(
+              'div',
               { style: { marginTop: 14 } },
               h('div', { className: 'csb-label' }, `消息（${active}）`),
               msgs.length === 0 ? h(Empty, { text: '还没有消息' }) : null,
@@ -415,7 +601,8 @@ window.__ModuleLoader__.load({
       const [layer, setLayer] = useState('')
       const [query, setQuery] = useState('')
       const path = `/memory${query ? `?query=${encodeURIComponent(query)}` : layer ? `?layer=${layer}` : ''}`
-      const { data, loading, error } = useApi(path, [layer, query])
+      const { data, loading, error, reload } = useApi(path, [layer, query])
+      const [err, setErr] = useState(null)
 
       const entries = data?.entries ?? []
 
@@ -441,6 +628,7 @@ window.__ModuleLoader__.load({
         loading ? h(Empty, { text: '加载中…' }) : null,
         error ? h('div', { className: 'csb-err' }, error) : null,
         !loading && entries.length === 0 ? h(Empty, { text: '没有记忆条目' }) : null,
+        err ? h('div', { className: 'csb-err' }, err) : null,
         entries.map((e) =>
           h(
             'div',
@@ -455,8 +643,27 @@ window.__ModuleLoader__.load({
                 `${e.layer} · ${e.id} · rev ${e.rev} · ${e.source ?? '?'}`,
                 e.explicit ? ' · explicit' : '',
                 e.conflict ? ' · [conflict]' : '',
+                e.archived ? ' · 已归档' : '',
               ),
             ),
+            e.archived
+              ? h('button', {
+                  className: 'csb-btn',
+                  onClick: () =>
+                    call('/memory/restore', { method: 'POST', body: { layer: e.layer, id: e.id } })
+                      .then(reload)
+                      .catch((x) => setErr(x.message)),
+                }, '恢复')
+              : h('button', {
+                  className: 'csb-btn',
+                  onClick: () => {
+                    const note = window.prompt('归档原因', '过时')
+                    if (note === null) return
+                    call('/memory/archive', { method: 'POST', body: { layer: e.layer, id: e.id, reason: note } })
+                      .then(reload)
+                      .catch((x) => setErr(x.message))
+                  },
+                }, '归档'),
           ),
         ),
       )
@@ -579,6 +786,101 @@ window.__ModuleLoader__.load({
       )
     }
 
+
+    // ── Tab 5：设置（真正生效：写入 settings.json，重启后内核参数改变）──────────
+
+    function SettingsTab() {
+      const { data, loading, error, reload } = useApi('/settings')
+      const { data: statusData } = useApi('/status')
+      const [draft, setDraft] = useState({})
+      const [msg, setMsg] = useState(null)
+      const [err, setErr] = useState(null)
+
+      const specs = data?.specs ?? {}
+      const values = data?.values ?? {}
+
+      const save = async () => {
+        setErr(null)
+        setMsg(null)
+        const patch = {}
+        for (const [k, v] of Object.entries(draft)) {
+          if (String(v) !== String(values[k])) patch[k] = v
+        }
+        if (Object.keys(patch).length === 0) {
+          setMsg('没有改动')
+          return
+        }
+        try {
+          const res = await call('/settings', { method: 'POST', body: patch })
+          setMsg(res.note ?? '已保存')
+          setDraft({})
+          reload()
+        } catch (e) {
+          setErr(e.message)
+        }
+      }
+
+      const svc = statusData?.services ?? {}
+
+      return h(
+        'div',
+        null,
+        h('div', { className: 'csb-label' }, '服务健康'),
+        h(
+          'div',
+          { className: 'csb-row', style: { flexWrap: 'wrap' } },
+          Object.keys(svc).map((k) =>
+            h('span', { key: k, className: 'csb-badge', style: { marginRight: 6 } },
+              `${k}: ${svc[k]?.available ? '就绪' : '未装'}`),
+          ),
+        ),
+        h('div', { className: 'csb-label' }, '状态目录'),
+        h('div', { className: 'csb-pre' }, data?.baseDir ?? '(未知)'),
+
+        h('div', { className: 'csb-sec' }, h('div', { className: 'csb-label' }, '可调参数（写入 settings.json，重启 DSH 后内核参数生效）')),
+        loading ? h(Empty, { text: '加载中…' }) : null,
+        error ? h('div', { className: 'csb-err' }, error) : null,
+        msg ? h('div', { className: 'csb-row', style: { color: '#15803d' } }, msg) : null,
+        err ? h('div', { className: 'csb-err' }, err) : null,
+        Object.keys(specs).map((key) => {
+          const spec = specs[key]
+          const current = key in draft ? draft[key] : values[key]
+          if (spec.bool) {
+            return h(
+              'div',
+              { key, className: 'csb-field' },
+              h('label', { title: key }, spec.label ?? key),
+              h('input', {
+                type: 'checkbox',
+                checked: current === true,
+                onChange: (e) => setDraft({ ...draft, [key]: e.target.checked }),
+              }),
+            )
+          }
+          return h(
+            'div',
+            { key, className: 'csb-field' },
+            h('label', { title: `${key}（${spec.min}~${spec.max}）` }, spec.label ?? key),
+            h('input', {
+              className: 'csb-input',
+              type: 'number',
+              min: spec.min,
+              max: spec.max,
+              value: current,
+              onChange: (e) => setDraft({ ...draft, [key]: Number(e.target.value) }),
+            }),
+          )
+        }),
+        h('div', { className: 'csb-bar', style: { marginTop: 10 } },
+          h('button', { className: 'csb-btn csb-btn-primary', onClick: save }, '保存'),
+          h('button', { className: 'csb-btn', onClick: () => { setDraft({}); setMsg(null); setErr(null); reload() } }, '重置'),
+        ),
+        data?.diagnostics?.badKeys?.length
+          ? h('div', { className: 'csb-err' }, `设置文件有无效项：${JSON.stringify(data.diagnostics.badKeys)}`)
+          : null,
+      )
+    }
+
     // ── 主面板 ──────────────────────────────────────────────────────────────
 
     const TABS = [
@@ -586,6 +888,7 @@ window.__ModuleLoader__.load({
       { id: 'rooms', label: '房间', Comp: RoomsTab },
       { id: 'memory', label: '记忆', Comp: MemoryTab },
       { id: 'bots', label: 'Bot', Comp: BotsTab },
+      { id: 'settings', label: '设置', Comp: SettingsTab },
     ]
 
     function Workbench() {
@@ -675,6 +978,7 @@ window.__ModuleLoader__.load({
     exports.RoomsTab = RoomsTab
     exports.MemoryTab = MemoryTab
     exports.BotsTab = BotsTab
+    exports.SettingsTab = SettingsTab
     exports.PANEL_ID = PANEL_ID
     exports.API = API
 

@@ -17,8 +17,9 @@ import { createRoom } from './room.js'
 import { createMemory } from './memory.js'
 import { installTools } from './tools.js'
 import { setServices } from './registry.js'
-import { service } from './kernel.js'
+import { service, stateDir as kernelStateDir } from './kernel.js'
 import { installApi } from './api.js'
+import { loadSettings } from './settings.js'
 
 export const name = 'cs-bots'
 
@@ -43,9 +44,20 @@ export function apply(ctx, config = {}) {
   //    日志一律用**字符串拼接**而非 `%s` 占位（避免形态差异导致格式串未插值）。
   const services = {}
 
+  // ── 设置：**先读，再拿去装配各域**（改设置才真的改变行为）────────────────
+  const settingsDir = config.stateDir ?? kernelStateDir()
+  const loaded = loadSettings(settingsDir)
+  const settings = loaded.values
+  if (loaded.diagnostics.badKeys.length) {
+    warn(`[cs-bots] 设置文件有 ${loaded.diagnostics.badKeys.length} 个无效项已忽略：${JSON.stringify(loaded.diagnostics.badKeys)}`)
+  }
+  services.settings = { ...settings }
+  services.settingsDiagnostics = loaded.diagnostics
+  log(`[cs-bots] 设置来源=${loaded.diagnostics.source}（${Object.keys(settings).length} 项）`)
+
   // RosterService 先装配：K1 闸门需要它判定「哪些会话是 Bot」。
   try {
-    services.roster = createRoster(ctx, { stateDir: config.stateDir })
+    services.roster = createRoster(ctx, { stateDir: config.stateDir, leaseMs: settings.defaultLeaseMs })
     log(`[cs-bots] RosterService 就绪（stateDir=${services.roster.paths?.stateDir ?? '?'}，durable=${services.roster.durable}）`)
   } catch (error) {
     warn(`[cs-bots] RosterService 装配失败 → 降级（Bot 注册表不可用，K1 保守放行）：${error?.message ?? error}`)
@@ -53,7 +65,7 @@ export function apply(ctx, config = {}) {
   }
 
   try {
-    services.board = createBoard(ctx, { stateDir: config.stateDir })
+    services.board = createBoard(ctx, { stateDir: config.stateDir, leaseMs: settings.defaultLeaseMs })
     log(`[cs-bots] BoardService 就绪（stateDir=${services.board.paths?.stateDir ?? '?'}）`)
   } catch (error) {
     warn(`[cs-bots] BoardService 装配失败 → 降级（无任务板）：${error?.message ?? error}`)
@@ -61,7 +73,7 @@ export function apply(ctx, config = {}) {
   }
 
   try {
-    services.dispatcher = createDispatcher(ctx, { stateDir: config.stateDir })
+    services.dispatcher = createDispatcher(ctx, { stateDir: config.stateDir, throttleMs: settings.throttleMs, maxPerTarget: settings.maxWakesPerTarget, queueTtlMs: settings.wakeTtlMs })
     if (services.dispatcher.durable === false) {
       warn(`[cs-bots] Dispatcher 状态目录不可写 → 唤醒记录不持久：${services.dispatcher.probeError ?? ''}`)
     }
@@ -80,15 +92,19 @@ export function apply(ctx, config = {}) {
   }
 
   try {
-    services.memory = createMemory(ctx, { stateDir: config.stateDir })
+    services.memory = createMemory(ctx, { stateDir: config.stateDir, entryMax: settings.memoryEntryMax, splitOnOverflow: settings.memorySplitOnOverflow })
     log(`[cs-bots] MemoryService 就绪（stateDir=${services.memory.paths?.stateDir ?? '?'}）`)
   } catch (error) {
     warn(`[cs-bots] MemoryService 装配失败 → 降级（无分层记忆）：${error?.message ?? error}`)
     services.memory = undefined
   }
 
-  installBlockingToolGate(ctx, { warn, roster: services.roster })
-  installBotToolTrimmer(ctx, { warn, roster: services.roster })
+  if (settings.k1Enabled) {
+    installBlockingToolGate(ctx, { warn, roster: services.roster })
+    installBotToolTrimmer(ctx, { warn, roster: services.roster })
+  } else {
+    warn('[cs-bots] K1 已按设置关闭 → Bot 会话可用 ask_user_question（有堵投递链风险）')
+  }
 
   // ── 模型面：注册全部工具（**没有这一层，新机器上装完插件模型看不到任何能力**）─
   // 必须在域服务就绪之后注册：工具执行时从 `ctx.csBots` 取服务。

@@ -273,6 +273,200 @@ export function installApi(ctx, { warn } = {}) {
         return
       }
 
+      // ── 任务：详情穿透 / 指派 / 终止 / 编辑 ──────────────────────────────
+      if (request.method === 'GET' && path === '/tasks/detail') {
+        const id = qp(url, 'id')
+        if (!id) {
+          sendJson(response, 400, { ok: false, reason: 'id 必填' })
+          return
+        }
+        const detail = await withService(services, 'board', (b) => ({
+          task: b.get(id),
+          history: typeof b.history === 'function' ? b.history(id) : [],
+        }))
+        if (!detail.task) {
+          sendJson(response, 404, { ok: false, reason: `任务 ${id} 不存在` })
+          return
+        }
+        sendJson(response, 200, { ok: true, ...detail })
+        return
+      }
+
+      if (request.method === 'POST' && path === '/tasks/assign') {
+        const body = (await readBody(request)) ?? {}
+        if (!body.id || !body.ownerId) {
+          sendJson(response, 400, { ok: false, reason: 'id 与 ownerId 必填' })
+          return
+        }
+        // 指派 = 用 ownerId 作为 claim 的 byId（board 的 claim 把 by 记为 owner）
+        const task = await withService(services, 'board', (b) =>
+          b.update({
+            id: body.id,
+            expectedRev: body.expectedRev,
+            action: 'claim',
+            byId: body.ownerId,
+            ...(body.leaseMs ? { leaseMs: body.leaseMs } : {}),
+          }),
+        )
+        // 指派后立刻定向唤醒（dedupKey 幂等：同任务同原因只唤一次）
+        let wake
+        if (services.dispatcher && body.wake !== false) {
+          wake = services.dispatcher.notify({
+            target: body.ownerId,
+            reason: 'task-assigned',
+            dedupKey: `task-assigned:${task.id}:${task.rev}`,
+            text: `新任务 ${task.id}：${task.subject}\n${task.description ?? ''}`.trim(),
+          })
+        }
+        sendJson(response, 200, { ok: true, task, wake })
+        return
+      }
+
+      if (request.method === 'POST' && path === '/tasks/abort') {
+        const body = (await readBody(request)) ?? {}
+        if (!body.id) {
+          sendJson(response, 400, { ok: false, reason: 'id 必填' })
+          return
+        }
+        // 终止 = block + 原因（board 的 block 会置 blocked 并留 reason；可 reopen）
+        const task = await withService(services, 'board', (b) =>
+          b.update({
+            id: body.id,
+            expectedRev: body.expectedRev,
+            action: 'block',
+            note: body.reason ?? '用户终止',
+            byId: body.byId ?? 'ui',
+          }),
+        )
+        sendJson(response, 200, { ok: true, task })
+        return
+      }
+
+      if (request.method === 'POST' && path === '/tasks/edit') {
+        const body = (await readBody(request)) ?? {}
+        if (!body.id) {
+          sendJson(response, 400, { ok: false, reason: 'id 必填' })
+          return
+        }
+        const task = await withService(services, 'board', (b) =>
+          b.update({ ...body, action: 'edit', byId: body.byId ?? 'ui' }),
+        )
+        sendJson(response, 200, { ok: true, task })
+        return
+      }
+
+      if (request.method === 'GET' && path === '/tasks/history') {
+        const id = qp(url, 'id')
+        const history = await withService(services, 'board', (b) =>
+          typeof b.history === 'function' ? b.history(id) : [],
+        )
+        sendJson(response, 200, { ok: true, history })
+        return
+      }
+
+      // ── 房间：成员管理 / 转发 ─────────────────────────────────────────────
+      if (request.method === 'POST' && path === '/rooms/join') {
+        const body = (await readBody(request)) ?? {}
+        const room = await withService(services, 'room', (r) =>
+          r.join({ roomId: body.roomId, sessionId: body.sessionId, byId: body.byId ?? 'ui' }),
+        )
+        sendJson(response, 200, { ok: true, room })
+        return
+      }
+
+      if (request.method === 'POST' && path === '/rooms/leave') {
+        const body = (await readBody(request)) ?? {}
+        const room = await withService(services, 'room', (r) =>
+          r.leave({ roomId: body.roomId, sessionId: body.sessionId, byId: body.byId ?? 'ui' }),
+        )
+        sendJson(response, 200, { ok: true, room })
+        return
+      }
+
+      if (request.method === 'POST' && path === '/rooms/relay') {
+        const body = (await readBody(request)) ?? {}
+        const result = await withService(services, 'room', (r) =>
+          r.relay({ roomId: body.roomId, messageId: body.messageId, targets: body.targets }),
+        )
+        sendJson(response, 200, { ok: true, ...result })
+        return
+      }
+
+      // ── 记忆：改 / 归档 / 恢复 ────────────────────────────────────────────
+      if (request.method === 'POST' && path === '/memory/update') {
+        const body = (await readBody(request)) ?? {}
+        const entry = await withService(services, 'memory', (m) =>
+          m.update({ ...body, by: body.by ?? 'ui' }),
+        )
+        sendJson(response, 200, { ok: true, entry })
+        return
+      }
+
+      if (request.method === 'POST' && path === '/memory/remove') {
+        const body = (await readBody(request)) ?? {}
+        const entry = await withService(services, 'memory', (m) =>
+          m.remove({ ...body, by: body.by ?? 'ui' }),
+        )
+        sendJson(response, 200, { ok: true, entry })
+        return
+      }
+
+      if (request.method === 'POST' && path === '/memory/archive') {
+        const body = (await readBody(request)) ?? {}
+        const entry = await withService(services, 'memory', (m) =>
+          m.archive({ ...body, by: body.by ?? 'ui' }),
+        )
+        sendJson(response, 200, { ok: true, entry })
+        return
+      }
+
+      if (request.method === 'POST' && path === '/memory/restore') {
+        const body = (await readBody(request)) ?? {}
+        const entry = await withService(services, 'memory', (m) =>
+          m.restore({ ...body, by: body.by ?? 'ui' }),
+        )
+        sendJson(response, 200, { ok: true, entry })
+        return
+      }
+
+      // ── 设置 ──────────────────────────────────────────────────────────────
+      if (request.method === 'GET' && path === '/settings') {
+        const { SETTING_SPECS } = await import('./settings.js')
+        sendJson(response, 200, {
+          ok: true,
+          values: services.settings ?? {},
+          specs: SETTING_SPECS,
+          diagnostics: services.settingsDiagnostics,
+          baseDir: services.board?.paths?.stateDir ?? services.roster?.paths?.stateDir,
+        })
+        return
+      }
+
+      if (request.method === 'POST' && path === '/settings') {
+        const body = (await readBody(request)) ?? {}
+        const { saveSettings } = await import('./settings.js')
+        const dir = services.board?.paths?.stateDir ?? services.roster?.paths?.stateDir
+        const saved = saveSettings(dir, body)
+        if (!saved.ok) {
+          sendJson(response, 400, { ok: false, reason: saved.reason })
+          return
+        }
+        sendJson(response, 200, {
+          ok: true,
+          values: saved.values,
+          note: '已写入 settings.json；内核级参数需重启 DSH 生效',
+        })
+        return
+      }
+
+      // ── 手动唤醒 ──────────────────────────────────────────────────────────
+      if (request.method === 'POST' && path === '/wakes/notify') {
+        const body = (await readBody(request)) ?? {}
+        const result = await withService(services, 'dispatcher', (d) => d.notify(body))
+        sendJson(response, 200, { ok: true, result })
+        return
+      }
+
       // ── 唤醒审计 ──────────────────────────────────────────────────────────
       if (request.method === 'GET' && path === '/wakes') {
         const wakes = await withService(services, 'dispatcher', (d) =>
