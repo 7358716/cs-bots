@@ -1,6 +1,6 @@
 {
   "name": "cs-bots",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "description": "cs-bots — DSH 多智能体协作平台：跨会话任务板 / 房间群聊 / 分层记忆 / Bot 注册表（独立工作目录），零第三方运行时依赖",
   "main": "src/index.js",
@@ -51,5 +51,9 @@
   "bugs": {
     "url": "https://github.com/7358716/cs-bots/issues"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org"
+  }
 }
