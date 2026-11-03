@@ -43,6 +43,7 @@ export const LIMITS = Object.freeze({
   memoryEach: 600,
   memoryCount: 50,
   skillsCount: 50,
+  workflowsCount: 50,
   skillBody: 20000,
 })
 
@@ -113,6 +114,8 @@ export function normalizeProfile(input) {
   if (experience !== undefined) out.experience = experience
   const skills = takeList(src.skills, 'skills', LIMITS.skillsCount, 64)
   if (skills !== undefined) out.skills = skills
+  const workflows = takeList(src.workflows, 'workflows', LIMITS.workflowsCount, 64)
+  if (workflows !== undefined) out.workflows = workflows
   const memory = takeList(src.memory, 'memory', LIMITS.memoryCount, LIMITS.memoryEach)
   if (memory !== undefined) out.memory = memory
   return out
@@ -163,6 +166,12 @@ export function renderManagedSection(profile) {
     lines.push('', '## 可用技能', '')
     for (const s of p.skills) lines.push(`- \`${s}\``)
     lines.push('', `技能文件位于本工作目录的 \`${SKILLS_DIR}/<技能名>/SKILL.md\`，用 skill 工具加载。`)
+  }
+
+  if (Array.isArray(p.workflows) && p.workflows.length) {
+    lines.push('', '## 该遵循的工作流', '')
+    for (const w of p.workflows) lines.push(`- \`${w}\``)
+    lines.push('', '执行相关任务时，按以上工作流库里的步骤走（工作流库在协作平台的「工作流库」页）。')
   }
 
   if (Array.isArray(p.memory) && p.memory.length) {

@@ -134,6 +134,19 @@ case "$overlay" in
     ;;
 esac
 
+
+echo "== 检查 5：客户端禁止 window.prompt / window.confirm（沙箱里被静默屏蔽）=="
+# 依据（2026-11-03 实测）：官方 DSH 客户端包全量 grep 0 处使用 prompt/confirm，
+# 且存在 sandboxed 渲染路径 —— 在这些视图里两者被静默屏蔽（返回 null/false，不报错），
+# 表现就是「按钮点了没反应」。所以必须机械禁止，全部改用内联表单与站内弹窗。
+banned="$(grep -nE "window\.(prompt|confirm|alert)\(" src/client.js || true)"
+if [ -z "$banned" ]; then
+  echo "  OK: 客户端零 prompt/confirm/alert"
+else
+  echo "$banned" | sed 's/^/  违规: /'
+  fail=1
+fi
+
 echo "== 结果 =="
 if [ "$fail" -eq 0 ]; then
   echo "CI PASS"

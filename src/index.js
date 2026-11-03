@@ -19,6 +19,8 @@ import { installTools } from './tools.js'
 import { setServices } from './registry.js'
 import { service, stateDir as kernelStateDir } from './kernel.js'
 import { installApi } from './api.js'
+import { createLibrary } from './library.js'
+import { createDirBrowser } from './dirbrowse.js'
 import { loadSettings } from './settings.js'
 import { probeHost, formatReport } from './compat.js'
 
@@ -155,6 +157,25 @@ function applyInner(ctx, config, { log, warn }) {
   // ⚠️ 不能 `ctx.csBots = services`：Cordis ctx 禁止任意属性（实测报
   //    `cannot set property "csBots" without provide`）→ 走 WeakMap 注册表。
   setServices(ctx, services)
+  // ── 目录浏览（自建，弥补原生选择器在 Linux/沙箱里不可用）────────────────
+  try {
+    services.dirbrowse = createDirBrowser({
+      stateDir: config.stateDir ?? kernelStateDir(),
+      dshHome: process.env.DSH_HOME,
+    })
+    log('[cs-bots] dirbrowse 就绪')
+  } catch (error) {
+    warn(`[cs-bots] dirbrowse 装配失败（目录浏览不可用）：${error?.message ?? error}`)
+  }
+
+  // ── 技能库 / 工作流库（全局可复用资产，Bot 与任务可关联）──────────────
+  try {
+    services.library = createLibrary(ctx, { stateDir: config.stateDir ?? kernelStateDir() })
+    log('[cs-bots] library 就绪')
+  } catch (error) {
+    warn(`[cs-bots] library 装配失败（技能库/工作流库不可用）：${error?.message ?? error}`)
+  }
+
   // ── 页面数据面：HTTP API（页面层靠它拿数据；没有它 UI 是空壳）──────────────
   services.apiDispose = installApi(ctx, { warn })
 

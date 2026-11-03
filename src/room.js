@@ -121,6 +121,9 @@ const EVENTS = [
   'members_joined',
   'members_left',
   'admin_transferred',
+  'room_renamed',
+  'notice_changed',
+  'mode_changed',
   'relay',
   'relay_result',
 ]
@@ -816,6 +819,105 @@ export function createRoom(ctx, config = {}) {
    * @returns {object} 变更后的 Room
    * @throws {RoomError} 房间不存在 / 已是成员 / CAS 冲突
    */
+  /**
+   * 改房间设置（改名 / 公告 / 模式 / 管理员）。
+   *
+   * 为什么要这个：原来只能建房间、不能改，建错名字只能废弃重来。
+   * 权限：`admin` 模式下仅管理员可改；`everyone` 模式下任一成员可改。
+   *
+   * @param {{ roomId: string, name?: string, notice?: string, mode?: string, adminId?: string,
+   *           expectedRev?: number, byId: string, now?: number }} input
+   * @returns {object} 变更后的 Room
+   * @throws {RoomError} 房间不存在 / 非成员 / 无权限 / 重名 / CAS 冲突 / 字段非法
+   */
+  function update(input = {}) {
+    const { roomId, name, notice, mode, adminId, expectedRev, byId, now } = input ?? {}
+    const room = requireRoom(roomId, 'update')
+    const actor = requireString(byId, 'byId', 'update')
+    assertRev(room, expectedRev, 'update')
+    if (room.mode === 'admin' && room.adminId && actor !== room.adminId && actor !== USER) {
+      throw new RoomError(
+        `room.update：房间 ${room.id} 是 admin 模式，只有管理员（${room.adminId}）能改设置，调用者为 ${actor}`,
+        'ROOM_FORBIDDEN',
+        { roomId: room.id, adminId: room.adminId, actor },
+      )
+    }
+
+    const at = normalizeNow(now, 'update')
+    const before = clone(room)
+    const next = clone(room)
+    const changed = []
+
+    if (name !== undefined && name !== null) {
+      const displayName = requireString(name, 'name', 'update')
+      const key = nameKey(displayName)
+      if (key !== nameKey(room.name)) {
+        if (nameIndex.has(key)) {
+          const existingId = nameIndex.get(key)
+          throw new RoomError(
+            `room.update：房间名 ${JSON.stringify(displayName)} 已被占用（归一后冲突）→ 现存房间 ${existingId}`,
+            'ROOM_NAME_TAKEN',
+            { name: displayName, existingId },
+          )
+        }
+        // 释放旧名索引
+        if (nameIndex.get(nameKey(room.name)) === room.id) nameIndex.delete(nameKey(room.name))
+        next.name = displayName
+        changed.push('name')
+      }
+    }
+
+    if (notice !== undefined) {
+      next.notice = normalizeNotice(notice)
+      changed.push('notice')
+    }
+
+    if (mode !== undefined && mode !== null) {
+      const m = normalizeMode(mode, 'update')
+      if (m !== room.mode) {
+        next.mode = m
+        // admin 模式但没有管理员 → 由操作者接管（不留「有模式无管理员」的死局）
+        if (m === 'admin' && !next.adminId) next.adminId = actor
+        if (m === 'everyone') delete next.adminId
+        changed.push('mode')
+      }
+    }
+
+    if (adminId !== undefined) {
+      const target = optionalString(adminId, 'adminId', 'update')
+      if (target === undefined || target === '') {
+        delete next.adminId
+        changed.push('adminId')
+      } else {
+        if (!next.members.includes(target)) {
+          throw new RoomError(
+            `room.update：管理员必须是房间成员，${target} 不在 ${room.id} 的成员表里`,
+            'ROOM_NOT_MEMBER',
+            { roomId: room.id, sessionId: target },
+          )
+        }
+        next.adminId = target
+        changed.push('adminId')
+      }
+    }
+
+    if (changed.length === 0) {
+      // 没有任何变化 → 不写事件（避免污染审计流）
+      return clone(room)
+    }
+
+    next.rev = room.rev + 1
+    const type = changed.includes('name')
+      ? 'room_renamed'
+      : changed.includes('notice')
+        ? 'notice_changed'
+        : changed.includes('mode')
+          ? 'mode_changed'
+          : 'admin_transferred'
+    const committed = commit(room.id, type, actor, at, before, next)
+    return { ...committed, changed }
+  }
+
   function join(input = {}) {
     const { roomId, sessionId, byId, expectedRev, now } = input ?? {}
     const room = requireRoom(roomId, 'join')
@@ -1418,6 +1520,7 @@ export function createRoom(ctx, config = {}) {
     create: createRoom_,
     get,
     list,
+    update,
     join,
     leave,
     post,

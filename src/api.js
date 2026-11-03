@@ -13,6 +13,8 @@
  */
 
 import { registerRoute, listPresets, defaultPreset } from './kernel.js'
+import { createLibrary } from './library.js'
+import { createDirBrowser } from './dirbrowse.js'
 import { getServices } from './registry.js'
 
 /** 请求体上限（防大包打爆内存）。 */
@@ -227,7 +229,29 @@ export function installApi(ctx, { warn } = {}) {
         )
         // 预制记忆同步（建 Bot 与改档案必须一致）
         const memory = seedBotMemory(services, bot, body.byId ?? 'ui')
-        sendJson(response, 200, { ok: true, bot, ...(memory ? { memory } : {}) })
+        // 同目录共享检测：**允许**，但必须告知（两个 Bot 在同一目录会互相覆盖文件）
+        let sharedWith = []
+        try {
+          const all = services.roster?.list?.() ?? []
+          sharedWith = all
+            .filter((b) => b.id !== bot.id && b.state !== 'retired' && String(b.cwd) === String(bot.cwd))
+            .map((b) => ({ id: b.id, name: b.name }))
+        } catch {
+          /* 检测失败不影响创建 */
+        }
+        sendJson(response, 200, {
+          ok: true,
+          bot,
+          ...(memory ? { memory } : {}),
+          ...(sharedWith.length
+            ? {
+                warnings: [
+                  `目录 ${bot.cwd} 已被 ${sharedWith.map((b) => b.name).join('、')} 使用 —— 两个 Bot 会互相覆盖文件`,
+                ],
+                sharedWith,
+              }
+            : {}),
+        })
         return
       }
 
@@ -460,6 +484,15 @@ export function installApi(ctx, { warn } = {}) {
       }
 
       // ── 房间：成员管理 / 转发 ─────────────────────────────────────────────
+      if (request.method === 'POST' && path === '/rooms/update') {
+        const body = (await readBody(request)) ?? {}
+        const room = await withService(services, 'room', (r) =>
+          r.update({ ...body, byId: body.byId ?? 'ui' }),
+        )
+        sendJson(response, 200, { ok: true, room })
+        return
+      }
+
       if (request.method === 'POST' && path === '/rooms/join') {
         const body = (await readBody(request)) ?? {}
         const room = await withService(services, 'room', (r) =>
@@ -521,6 +554,88 @@ export function installApi(ctx, { warn } = {}) {
           m.restore({ ...body, by: body.by ?? 'ui' }),
         )
         sendJson(response, 200, { ok: true, entry })
+        return
+      }
+
+      // ── 目录浏览（宿主原生选择器不可用时的兜底，也是唯一能「新建/重命名」的路径）──
+      if (request.method === 'GET' && path === '/fs/roots') {
+        const r = await withService(services, 'dirbrowse', (d) => d.roots())
+        sendJson(response, 200, { ok: true, ...r })
+        return
+      }
+      if (request.method === 'GET' && path === '/fs/list') {
+        const dir = qp(url, 'path')
+        const showHidden = qp(url, 'showHidden') === '1'
+        const listing = await withService(services, 'dirbrowse', (d) =>
+          d.list({ ...(dir ? { path: dir } : {}), showHidden }),
+        )
+        sendJson(response, 200, { ok: true, ...listing })
+        return
+      }
+      if (request.method === 'POST' && path === '/fs/mkdir') {
+        const body = (await readBody(request)) ?? {}
+        const created = await withService(services, 'dirbrowse', (d) => d.mkdir(body))
+        sendJson(response, 200, { ok: true, ...created })
+        return
+      }
+      if (request.method === 'POST' && path === '/fs/rename') {
+        const body = (await readBody(request)) ?? {}
+        const renamed = await withService(services, 'dirbrowse', (d) => d.rename(body))
+        sendJson(response, 200, { ok: true, ...renamed })
+        return
+      }
+      if (request.method === 'POST' && path === '/fs/validate') {
+        const body = (await readBody(request)) ?? {}
+        const verdict = await withService(services, 'dirbrowse', (d) => d.validateAsBotCwd({ path: body.path }))
+        sendJson(response, 200, { ok: true, verdict })
+        return
+      }
+
+      // ── 技能库 / 工作流库 ─────────────────────────────────────────────────
+      if (request.method === 'GET' && path === '/library/skills') {
+        const rows = await withService(services, 'library', (l) => l.listSkills({ tag: qp(url, 'tag') }))
+        sendJson(response, 200, { ok: true, skills: rows })
+        return
+      }
+      if (request.method === 'POST' && path === '/library/skills') {
+        const body = (await readBody(request)) ?? {}
+        const skill = await withService(services, 'library', (l) => l.createSkill({ ...body, by: body.by ?? 'ui' }))
+        sendJson(response, 200, { ok: true, skill })
+        return
+      }
+      if (request.method === 'POST' && path === '/library/skills/update') {
+        const body = (await readBody(request)) ?? {}
+        const skill = await withService(services, 'library', (l) => l.updateSkill({ ...body, by: body.by ?? 'ui' }))
+        sendJson(response, 200, { ok: true, skill })
+        return
+      }
+      if (request.method === 'POST' && path === '/library/skills/remove') {
+        const body = (await readBody(request)) ?? {}
+        const result = await withService(services, 'library', (l) => l.removeSkill({ id: body.id, by: body.by ?? 'ui' }))
+        sendJson(response, 200, { ok: true, result })
+        return
+      }
+      if (request.method === 'GET' && path === '/library/workflows') {
+        const rows = await withService(services, 'library', (l) => l.listWorkflows({ tag: qp(url, 'tag') }))
+        sendJson(response, 200, { ok: true, workflows: rows })
+        return
+      }
+      if (request.method === 'POST' && path === '/library/workflows') {
+        const body = (await readBody(request)) ?? {}
+        const workflow = await withService(services, 'library', (l) => l.createWorkflow({ ...body, by: body.by ?? 'ui' }))
+        sendJson(response, 200, { ok: true, workflow })
+        return
+      }
+      if (request.method === 'POST' && path === '/library/workflows/update') {
+        const body = (await readBody(request)) ?? {}
+        const workflow = await withService(services, 'library', (l) => l.updateWorkflow({ ...body, by: body.by ?? 'ui' }))
+        sendJson(response, 200, { ok: true, workflow })
+        return
+      }
+      if (request.method === 'POST' && path === '/library/workflows/remove') {
+        const body = (await readBody(request)) ?? {}
+        const result = await withService(services, 'library', (l) => l.removeWorkflow({ id: body.id, by: body.by ?? 'ui' }))
+        sendJson(response, 200, { ok: true, result })
         return
       }
 
