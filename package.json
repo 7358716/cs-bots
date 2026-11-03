@@ -2,7 +2,7 @@
   "name": "cs-bots",
   "version": "0.1.1",
   "type": "module",
-  "description": "cs-bots — DSH 多智能体协作平台：跨会话任务板 / 房间群聊 / 分层记忆 / Bot 注册表（独立工作目录），零第三方运行时依赖",
+  "description": "多智能体协作：任务板、房间群聊、分层记忆、Bot 注册。",
   "main": "src/index.js",
   "exports": {
     ".": "./src/index.js",
