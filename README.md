@@ -70,7 +70,7 @@ bash install.sh --channel git --ref v0.4.0   # git 通道（install.sh 支持 np
 
 ## 装好后你得到什么
 
-**27 个模型可见工具**（`bot_` 前缀，避免与其他插件撞名）：
+**28 个模型可见工具**（`bot_` 前缀，避免与其他插件撞名）：
 
 ### 任务板（跨会话）
 | 工具 | 用途 |
@@ -107,6 +107,7 @@ bash install.sh --channel git --ref v0.4.0   # git 通道（install.sh 支持 np
 | `bot_memory_add` | 写入（L0–L5 六层；`explicit:true` 受保护） |
 | `bot_memory_search` | 检索（FTS5 trigram，缺则退化字面匹配） |
 | `bot_memory_context` | 取常驻注入文本（L0–L3，可按 `cwd` 取当前项目口径） |
+| `bot_task_notes` | 拉某任务的全部 L4 任务笔记（跨会话交接用，倒序） |
 
 ### 待办 / 便签 / 提示词
 | 工具 | 用途 |

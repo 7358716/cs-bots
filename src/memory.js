@@ -970,7 +970,7 @@ export function createMemory(ctx, config = {}) {
    * @returns {object} Entry（含 id + rev）
    */
   function add(input = {}) {
-    const { layer, content, by, explicit, source, branch, tags, botId, now, cwd } = input ?? {}
+    const { layer, content, by, explicit, source, branch, tags, botId, now, cwd, taskId, phase } = input ?? {}
     const targetLayer = requireLayer(layer, 'add')
     assertNotPersonaLayer(targetLayer, 'add')
     const author = requireString(by, 'by', 'add')
@@ -1023,6 +1023,11 @@ export function createMemory(ctx, config = {}) {
         explicit: explicit === true,
         branches,
         ...(ownerBot !== undefined ? { botId: ownerBot } : {}),
+        // 任务笔记绑定（长期记忆方案 §2.1）：taskId 把这条 L4 笔记挂到某个 board 任务上，
+        // notesForTask(taskId) 据此拉取该任务的全部历史笔记 —— 跨会话交接靠它，不依赖旧消息。
+        ...(typeof taskId === 'string' && taskId !== '' ? { taskId } : {}),
+        // 任务笔记阶段（§2.2）：plan / doing / block / done，便于筛选与归档优先级
+        ...(typeof phase === 'string' && phase !== '' ? { phase } : {}),
         // cwd 必须写进**条目本身**（随 commit → 事件流 → 落盘）；
         // 只挂在返回克隆上会重演 split 标记的老坑：读回来就丢（P1-2 教训）。
         ...(ownerCwd !== undefined ? { cwd: ownerCwd } : {}),
@@ -2106,6 +2111,29 @@ export function createMemory(ctx, config = {}) {
     return clone(hits)
   }
 
+  /**
+   * 拉取某个 board 任务的全部 L4 任务笔记（倒序，最新在前）。
+   *
+   * 为什么需要：长期记忆方案 §2.3 —— 任务细节不进常驻注入（L4 按需 recall），
+   * 跨会话交接时先 `bot_task_get` 看任务，再 `notesForTask(taskId)` 看历史笔记，
+   * 就能恢复上下文，不依赖旧会话消息。
+   *
+   * @param {{ taskId: string, cwd?: string, limit?: number }} input
+   * @returns {object[]} 该任务的 L4 笔记（倒序）
+   */
+  function notesForTask(input = {}) {
+    const { taskId, cwd, limit } = input ?? {}
+    const id = requireString(taskId, 'taskId', 'notesForTask')
+    const targetCwd = normalizeCwdFilter(cwd, 'notesForTask')
+    const lim = optionalLimit(limit, 'notesForTask')
+    const rows = [...entries.values()]
+      .filter((e) => e.layer === 'L4' && e.taskId === id)
+      .filter((e) => cwdVisible(e, targetCwd))
+      .sort((x, y) => (x.createdAt > y.createdAt ? -1 : x.createdAt < y.createdAt ? 1 : (x.id < y.id ? -1 : 1)))
+    const out = rows.slice(0, lim ?? rows.length)
+    return clone(out)
+  }
+
   // ── API：常驻注入 ──────────────────────────────────────────────────────────
 
   /** 渲染一行：`[id:xxxxxxxx] [rev:N] [conflict] 内容`。 */
@@ -2445,6 +2473,7 @@ export function createMemory(ctx, config = {}) {
     contextFor,
     migrateCwd,
     history,
+    notesForTask,
     replay,
     stats,
     dispose,

@@ -18,7 +18,7 @@
 ## 1. 四层结构（严格分层，禁止跨层调用）
 
 ```
-┌─ L4 模型面   src/tools.js        27 个 bot_* 工具（模型能调什么）
+┌─ L4 模型面   src/tools.js        28 个 bot_* 工具（模型能调什么）
 ├─ L3 页面面   src/client.js       Web UI（7 页签 / 人话文案）
 │              src/api.js          93 个 HTTP 端点（页面数据面）
 ├─ L2 领域面   board/roster/room/memory/discipline/todo/scratch/
@@ -228,7 +228,7 @@ commit(id, action, by, at, before, after) {
 | 层 | 数量 | 说明 |
 |---|---|---|
 | HTTP 端点 | **93** | `src/api.js`，全部经围栏 |
-| 模型工具 | **27** | 前缀 `bot_`，避免与其他插件撞名 |
+| 模型工具 | **28** | 前缀 `bot_`，避免与其他插件撞名 |
 | 域服务 | **12** | 见 §3 |
 | 源文件 | **24** | `src/*.js`，合计 **24,736** 行 |
 | 测试文件 | **30** | **656 用例全绿**，`ci-zero-dep.sh` CI PASS |

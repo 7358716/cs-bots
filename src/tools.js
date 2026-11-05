@@ -450,6 +450,8 @@ const DEFS = [
         explicit: { type: 'boolean' },
         branch: { type: 'string', description: 'L3 用：限定 git 分支' },
         tags: { type: 'array', items: { type: 'string' } },
+        taskId: { type: 'string', description: 'L4 任务笔记用：关联 board 任务 id，notesForTask 据此拉取' },
+        phase: { type: 'string', description: 'L4 任务笔记用：plan / doing / block / done' },
       },
       required: ['layer', 'content'],
       additionalProperties: false,
@@ -497,6 +499,30 @@ const DEFS = [
     run: (s, a) => {
       if (!s.memory) return failure('memory-unavailable')
       return success({ text: s.memory.contextFor(a ?? {}) })
+    },
+  },
+  {
+    name: 'bot_task_notes',
+    description:
+      '拉取某个 board 任务的全部 L4 任务笔记（倒序，最新在前）。接手任务时先看任务详情，再调本工具读历史笔记恢复上下文，' +
+      '不依赖旧会话消息。笔记由 bot_memory_add(layer=L4, taskId) 写入。',
+    parameters: {
+      type: 'object',
+      properties: {
+        taskId: { type: 'string', description: 'board 任务 id' },
+        cwd: { type: 'string', description: '按项目裁剪' },
+        limit: { type: 'number', description: '最多返回条数（缺省全部）' },
+      },
+      required: ['taskId'],
+      additionalProperties: false,
+    },
+    run: (s, a) => {
+      if (!s.memory) return failure('memory-unavailable')
+      try {
+        return success({ notes: s.memory.notesForTask(a ?? {}) })
+      } catch (error) {
+        return failure(error?.code ?? 'task-notes-failed', { message: error?.message ?? String(error) })
+      }
     },
   },
 
