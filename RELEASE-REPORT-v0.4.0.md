@@ -12,7 +12,7 @@
 | 版本号 | **0.4.0**（远端 `v0.3.0` 已被占用，按规则递增） |
 | 发布提交 | **`8dd22ffcc8137d6c8708f65f3ee2852df40c9eaf`**（`8dd22ff`） |
 | tag `v0.4.0` | **已推到远端**，SHA 与发布提交一致 |
-| `origin/main` | 指向同一提交 `8dd22ff` |
+| `origin/main` | 发布时指向 `8dd22ff`；本报告作为 docs 提交入库后 main 再前进一提交，**tag 不移动** |
 | 离线包 | `cs-bots-0.4.0.tgz`，**341230 字节** |
 | tarball sha256 | **`c9ed3e9ab510c8fad3bac5dfa5637f64a57825907082f810eb419ee913b7945f`** |
 | 测试 | **656 / 656 通过，0 失败**；零依赖 CI **PASS（5/5）** |
@@ -214,7 +214,7 @@ PUSH_TAG_EXIT=0
 > 按手册「SSH 失败最多重试 1 次」执行；本次失败与 SSH 无关，仍只重试一次，第二次成功。
 > 全程**未** force push、**未**删 tag、**未**改写历史。
 
-### 3.4 远端验证（真实输出）
+### 3.4 远端验证（发布提交推送后、本报告入库前，真实输出）
 
 ```
 $ git ls-remote --tags origin | grep 'refs/tags/v0.4.0$'
@@ -233,6 +233,10 @@ $ git status --porcelain | wc -l
 ```
 
 三条 SHA（本地 tag / 远端 tag / 远端 main / 发布提交）**完全一致**。
+
+> 本报告随后作为独立 docs 提交入库并推送，`origin/main` 因此再前进一个提交
+> （仅新增本报告，不动代码）。**tag `v0.4.0` 不随之移动**，始终指向 `8dd22ff`；
+> 发布位点由 tag 决定，不由 main 的最新提交决定。最终 `ls-remote` 输出见交付消息。
 
 ---
 
@@ -289,7 +293,7 @@ package/cordis.patch.yml
 | # | 检查 | 命令 | 结果 |
 |---|---|---|---|
 | V1 | 远端 tag 存在且 SHA 正确 | `git ls-remote --tags origin \| grep 'refs/tags/v0.4.0$'` | **PASS**：`8dd22ff...` = 本地 `git rev-parse v0.4.0` |
-| V2 | 远端 main 指向发布提交 | `git ls-remote origin refs/heads/main` | **PASS**：`8dd22ff...` |
+| V2 | 远端 main 指向发布提交 | `git ls-remote origin refs/heads/main` | **PASS（发布时刻）**：`8dd22ff...`；报告文档提交后 main 前进，tag 不变 |
 | V3 | 工作区干净 | `git status --short` | **PASS**：无输出；porcelain 行数 0 |
 | V4 | tarball 哈希登记 | `sha256sum` | **PASS**：`c9ed3e9a…7945f`，341230 字节 |
 | V5 | 包内 src 全量 | `tar -tzf ... \| grep -c '^package/src/.*\.js$'` | **PASS**：26 = 26 |
