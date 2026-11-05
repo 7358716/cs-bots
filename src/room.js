@@ -62,6 +62,30 @@
  *   管理员退房 → 管理权**移交给最早加入的剩余成员**（写 `admin_transferred` 事件，可见）；
  *   房间空了则清空 `adminId`。⇒ 不留「管理员已走、房间被锁死」这种隐形死局。
  *
+ * ── 房间配置与超级管理员（DESIGN-v2 特性 ①，2026-11-04）──
+ *   `purpose`    用途/话题，缺省 `''`（**不是 undefined**：回放后形状必须与内存态逐字段一致）。
+ *   `roles`      `{ sessionId: 'admin'|'member'|'observer' }`，缺省按成员全 `'member'`，
+ *                admin 模式的 `adminId` 记 `'admin'`。**roles 只描述、不参与权限判定**
+ *                （权限仍只看 `adminId` —— 避免「改个角色就隐式夺权」）。
+ *   `settings`   `{ allowBotAutoPost, maxBotsPerRound, relayEnabled }`，缺省见 `DEFAULT_SETTINGS`；
+ *                未知键**抛错**（拒绝写入会被静默忽略的配置）。
+ *   `archivedAt` 归档时间（软删）。**归档房缺省不出现在 `list()`**，
+ *                `list({includeArchived:true})` 才含；`get()` 仍可读（否则归档后无法恢复）。
+ *   `withBody`   `listMessages({withBody:true})` 把长正文全文内联进每条 `body`，
+ *                避免页面为每条消息再发一次 `/rooms/body` 请求。
+ *
+ *   **超级管理员 = `USER`（'user'）**：所有新老操作一律放行（DESIGN 权限行）。
+ *   非 USER 仍按原规则：
+ *     - `update`：admin 模式看 `adminId`、everyone 模式看成员资格（既有行为，未改）；
+ *     - `archive/unarchiveRoom`：同上，另加**创建者恒可**——`members` 允许不显式包含创建者
+ *       （见上文「成员语义」），不给创建者留门会导致「房间归档后再没人能恢复」；
+ *     - `removeRoom`：仅 owner（=`createdBy`）或 USER（硬删不可恢复，权限必须收紧）；
+ *     - `setMemberRole/kickMember`：「管理员级」操作 —— USER / 创建者 / admin 模式的管理员；
+ *       everyone 模式下的**普通成员一律拒绝**（DESIGN 原文「成员角色（super admin 专用）」）。
+ *
+ *   CAS 沿用本模块既有的**可选 CAS**（见上文「CAS 取舍」）：新函数签名里 DESIGN 没列
+ *   `expectedRev` 的（`setMemberRole`/`kickMember`）也接受它 —— 传了就严格比对，不传不拦。
+ *
  * 依赖面：node 内置（`node:crypto` / `node:fs` / `node:path`）+ `./store.js` + `./kernel.js`。
  * **不 import 任何 `@deepseek-ai/*`**（`test/ci-zero-dep.sh` 检查 1 机械强制）。
  *
@@ -124,9 +148,30 @@ const EVENTS = [
   'room_renamed',
   'notice_changed',
   'mode_changed',
+  'purpose_changed',
+  'settings_changed',
+  'room_archived',
+  'room_unarchived',
+  'room_removed',
+  'member_role_changed',
+  'member_kicked',
   'relay',
   'relay_result',
 ]
+/** `purpose` 上限：与公告同口径（2000）—— 用途/话题是「一段短说明」，不是正文（正文走旁路）。 */
+const MAX_PURPOSE = 2000
+/** 合法成员角色（DESIGN-v2 ①）。 */
+const MEMBER_ROLES = ['admin', 'member', 'observer']
+/**
+ * 房间级开关缺省值（DESIGN-v2 ①）。
+ * **必须是建房间、update 合并、回放补全三处共用的唯一口径** ——
+ * 各写一份常量就会出现「新建房间缺省 true、回放后变成 false」这类分叉。
+ */
+const DEFAULT_SETTINGS = Object.freeze({
+  allowBotAutoPost: true,
+  maxBotsPerRound: 3,
+  relayEnabled: true,
+})
 /** `bodyRef` 的合法形态（防路径穿越：只允许 `bodies/<安全文件名>.txt`）。 */
 const BODY_REF_RE = /^bodies\/[A-Za-z0-9._-]+\.txt$/
 
@@ -281,6 +326,126 @@ function normalizeNotice(value, where = 'createRoom') {
       `room.${where}：notice 超长（${value.length} > ${MAX_NOTICE} 字符上限）——请把长正文落旁路文件，公告只存摘要`,
       'ROOM_NOTICE_TOO_LONG',
       { length: value.length, max: MAX_NOTICE },
+    )
+  }
+  return value
+}
+
+/**
+ * `purpose` 校验（DESIGN-v2 ①，≤2000）。
+ *
+ * 与 `optionalString` 的区别：**空串是合法值**（表示「清空用途」），
+ * 所以不能把 `''` 归成「未提供」；但纯空白仍归一成 `''`（避免不可见的伪内容）。
+ */
+function normalizePurpose(value, where = 'createRoom') {
+  if (value === undefined || value === null) return undefined
+  if (typeof value !== 'string') {
+    throw new RoomError(
+      `room.${where}：purpose 必须是字符串，收到 ${JSON.stringify(value)}`,
+      'ROOM_BAD_FIELD',
+      { field: 'purpose', where },
+    )
+  }
+  if (value.length > MAX_PURPOSE) {
+    throw new RoomError(
+      `room.${where}：purpose 超长（${value.length} > ${MAX_PURPOSE} 字符上限）——用途/话题只写一段短说明`,
+      'ROOM_PURPOSE_TOO_LONG',
+      { length: value.length, max: MAX_PURPOSE },
+    )
+  }
+  return value.trim()
+}
+
+/** `settings` 单个开关校验（按键分派；未知键抛错 —— 拒绝写入「怎么写都不会生效」的配置）。 */
+function normalizeSettingValue(key, value, where) {
+  if (key === 'allowBotAutoPost' || key === 'relayEnabled') {
+    if (typeof value !== 'boolean') {
+      throw new RoomError(
+        `room.${where}：settings.${key} 必须是布尔值，收到 ${JSON.stringify(value)}`,
+        'ROOM_BAD_SETTING',
+        { field: `settings.${key}`, where },
+      )
+    }
+    return value
+  }
+  if (key === 'maxBotsPerRound') {
+    if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
+      throw new RoomError(
+        `room.${where}：settings.maxBotsPerRound 必须是非负整数，收到 ${JSON.stringify(value)}`,
+        'ROOM_BAD_SETTING',
+        { field: 'settings.maxBotsPerRound', where },
+      )
+    }
+    return value
+  }
+  throw new RoomError(
+    `room.${where}：未知设置项 ${JSON.stringify(key)}（支持 ${Object.keys(DEFAULT_SETTINGS).join(' / ')}）`
+    + ' —— 拒绝写入会被静默忽略的配置',
+    'ROOM_BAD_SETTING',
+    { field: `settings.${key}`, where },
+  )
+}
+
+/**
+ * `settings` 入参校验（**增量**：只校验调用方显式给出的键）。
+ * @returns {object|undefined} 校验后的增量；`undefined` 表示未提供
+ */
+function normalizeSettingsPatch(value, where = 'createRoom') {
+  if (value === undefined || value === null) return undefined
+  if (typeof value !== 'object' || Array.isArray(value)) {
+    throw new RoomError(
+      `room.${where}：settings 必须是对象，收到 ${JSON.stringify(value)}`,
+      'ROOM_BAD_FIELD',
+      { field: 'settings', where },
+    )
+  }
+  const out = {}
+  for (const [key, raw] of Object.entries(value)) {
+    out[key] = normalizeSettingValue(key, raw, where)
+  }
+  return out
+}
+
+/**
+ * 回放用的 `settings` **宽松补全**：缺省键补齐、非法值忽略。
+ *
+ * 为什么回放不能像入参那样抛错：磁盘上的老数据/手改快照是**既成事实**，
+ * 回放期抛错会让整个房间甚至整个服务起不来（一个坏字段炸掉全部房间）。
+ * 非法值不被静默采信（回落到缺省），并在 `diagnostics` 层面可由 `get()` 侧看出差异。
+ * @returns {{ allowBotAutoPost: boolean, maxBotsPerRound: number, relayEnabled: boolean }}
+ */
+function settingsFromState(value) {
+  const out = { ...DEFAULT_SETTINGS }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return out
+  for (const key of Object.keys(DEFAULT_SETTINGS)) {
+    const v = value[key]
+    if (key === 'maxBotsPerRound') {
+      if (typeof v === 'number' && Number.isInteger(v) && v >= 0) out[key] = v
+    } else if (typeof v === 'boolean') {
+      out[key] = v
+    }
+  }
+  return out
+}
+
+/**
+ * 成员的初始角色表（建房间用）。
+ * admin 模式的 `adminId` 记 `'admin'`；其余成员 `'member'`。
+ * **注意**：`adminId` 允许不是成员（既有 `createRoom` 行为），此时它不出现在 roles 里。
+ */
+function initialRoles(members, adminId) {
+  const roles = {}
+  for (const m of members) roles[m] = m === adminId ? 'admin' : 'member'
+  return roles
+}
+
+/** 角色值校验（DESIGN-v2 ①）。 */
+function normalizeMemberRole(value, where = 'setMemberRole') {
+  if (!MEMBER_ROLES.includes(value)) {
+    throw new RoomError(
+      `room.${where}：role 必须是 ${MEMBER_ROLES.join(' | ')}，收到 ${JSON.stringify(value)}`,
+      'ROOM_BAD_ROLE',
+      { role: value, allowed: [...MEMBER_ROLES] },
     )
   }
   return value
@@ -490,6 +655,50 @@ export function createRoom(ctx, config = {}) {
     }
   }
 
+  /**
+   * 「管理类」操作权限（归档 / 恢复）：USER 超级管理员恒放行；
+   * 非 USER 按原规则 —— admin 模式看 `adminId`，everyone 模式看成员资格；
+   * **另加创建者**：`members` 语义允许创建者不在成员表里，不给创建者留门
+   * 会导致「房间归档后再没人能恢复」（DESIGN 权限行的必要补丁，已写进文件头）。
+   */
+  function assertManage(room, actor, action) {
+    if (actor === USER) return
+    if (room.createdBy === actor) return
+    if (room.mode === 'admin') {
+      if (room.adminId === actor) return
+      throw new RoomError(
+        `room.${action}：房间 ${room.id} 是 admin 模式，只有管理员（${room.adminId ?? '未设置'}）`
+        + `或创建者（${room.createdBy}）能执行该操作，调用者为 ${actor}`,
+        'ROOM_FORBIDDEN',
+        { roomId: room.id, adminId: room.adminId ?? null, createdBy: room.createdBy, actor },
+      )
+    }
+    if (room.members.includes(actor)) return
+    throw new RoomError(
+      `room.${action}：${actor} 不是房间 ${room.id} 的成员（everyone 模式按成员资格判定）——无权操作`,
+      'ROOM_NOT_MEMBER',
+      { roomId: room.id, actor, members: room.members },
+    )
+  }
+
+  /**
+   * 「管理员级」操作权限（改成员角色 / 踢人）。
+   * DESIGN 对这两项标注「super admin 专用」，故 everyone 模式下的**普通成员一律拒绝**；
+   * 非 USER 的合法操作者只有：房间创建者、admin 模式的 `adminId`。
+   */
+  function assertAdminPrivilege(room, actor, action) {
+    if (actor === USER) return
+    if (room.createdBy === actor) return
+    if (room.mode === 'admin' && room.adminId === actor) return
+    throw new RoomError(
+      `room.${action}：${actor} 无权执行管理员操作（需要超级管理员 ${JSON.stringify(USER)}、`
+      + `房间创建者 ${room.createdBy}${room.mode === 'admin' ? ` 或管理员 ${room.adminId ?? '未设置'}` : ''}）`
+      + ' —— 成员角色/踢人属管理员级操作，普通成员被拒',
+      'ROOM_FORBIDDEN',
+      { roomId: room.id, actor, createdBy: room.createdBy, adminId: room.adminId ?? null, mode: room.mode },
+    )
+  }
+
   // ── 持久化 ────────────────────────────────────────────────────────────────
 
   /** 索引快照内容（落盘形态）。 */
@@ -555,7 +764,7 @@ export function createRoom(ctx, config = {}) {
     }
     appendRoomEvent(roomId, event)
     rooms.set(roomId, clone(after))
-    // 名字索引随房间状态一起维护（改名不在本期 API 内，但保持单一维护点）
+    // 名字索引随房间状态一起维护（改名/归档都走这里 —— 保持单一维护点，避免索引漂移）
     if (after?.name) nameIndex.set(nameKey(after.name), roomId)
     snapshotIndex()
     return clone(after)
@@ -651,6 +860,21 @@ export function createRoom(ctx, config = {}) {
       if (!MODES.includes(state.mode)) state.mode = DEFAULT_MODE
       if (!Number.isFinite(state.relayLimit)) state.relayLimit = relayLimitForMembers(state.members)
       if (!Number.isFinite(state.rev)) state.rev = 1
+
+      // ── DESIGN-v2 ① 新字段归一（老数据/手改过的快照也要能安全消费）────────────
+      // 目的：让「内存态形状 == 回放后形状」逐字段成立（既有 replay 测试就靠这条）。
+      if (typeof state.purpose !== 'string') state.purpose = ''
+      if (!state.roles || typeof state.roles !== 'object' || Array.isArray(state.roles)) {
+        state.roles = {}
+      } else {
+        // 非法角色值不采信，回落到 'member'；键保留（键存在说明该 session 曾登记为成员角色，
+        // 删键会静默丢掉「这里原本有个人」这一事实，回放期只纠正值、不删证据）
+        for (const [sid, role] of Object.entries(state.roles)) {
+          if (!MEMBER_ROLES.includes(role)) state.roles[sid] = 'member'
+        }
+      }
+      state.settings = settingsFromState(state.settings)
+      if (state.archivedAt !== null && !Number.isFinite(state.archivedAt)) state.archivedAt = null
       rooms.set(id, state)
       if (state.name) nameIndex.set(nameKey(state.name), id)
 
@@ -730,7 +954,7 @@ export function createRoom(ctx, config = {}) {
    * @throws {RoomError} 缺字段 / 重名 / notice 超长 / 非法 mode
    */
   function createRoom_(input = {}) {
-    const { name, members, mode, adminId, notice, cwd, byId, now } = input ?? {}
+    const { name, members, mode, adminId, notice, cwd, purpose, settings, byId, now } = input ?? {}
     const displayName = requireString(name, 'name', 'createRoom')
     const creator = requireString(byId, 'byId', 'createRoom')
     const key = nameKey(displayName)
@@ -752,6 +976,8 @@ export function createRoom(ctx, config = {}) {
     const advisory = optionalString(adminId, 'adminId', 'createRoom')
     const noticeValue = normalizeNotice(notice, 'createRoom')
     const cwdValue = optionalString(cwd, 'cwd', 'createRoom')
+    const purposeValue = normalizePurpose(purpose, 'createRoom')
+    const settingsPatch = normalizeSettingsPatch(settings, 'createRoom')
     const at = normalizeNow(now, 'createRoom')
 
     const roomId = `room-${randomUUID().slice(0, 8)}`
@@ -793,6 +1019,12 @@ export function createRoom(ctx, config = {}) {
     }
     if (noticeValue !== undefined) room.notice = noticeValue
     if (cwdValue !== undefined) room.cwd = cwdValue
+    // DESIGN-v2 ① 新字段：**建房间时就把缺省值写进模型**（而不是读到 undefined 时临时兜底）——
+    // 这样事件流/快照里的形状与内存态一致，回放后逐字段相等才是可验证的。
+    room.purpose = purposeValue ?? ''
+    room.roles = initialRoles(room.members, room.adminId)
+    room.settings = { ...DEFAULT_SETTINGS, ...(settingsPatch ?? {}) }
+    room.archivedAt = null
 
     return commit(roomId, 'room_created', creator, at, null, room)
   }
@@ -805,11 +1037,27 @@ export function createRoom(ctx, config = {}) {
   }
 
   /**
-   * 列出全部房间（**创建序**）。
+   * 列出房间（**创建序**）。
+   *
+   * DESIGN-v2 ①：归档房（`archivedAt` 非 null）**缺省不出现**；
+   * 需要看归档区时传 `{includeArchived:true}`。`get()` 不受影响（归档房仍可读、可恢复）。
+   *
+   * @param {{ includeArchived?: boolean }} [options]
    * @returns {object[]}
+   * @throws {RoomError} includeArchived 类型非法
    */
-  function list() {
-    return [...rooms.values()].map(clone)
+  function list(options = {}) {
+    const { includeArchived } = options ?? {}
+    if (includeArchived !== undefined && typeof includeArchived !== 'boolean') {
+      throw new RoomError(
+        `room.list：includeArchived 必须是布尔值，收到 ${JSON.stringify(includeArchived)}`,
+        'ROOM_BAD_FIELD',
+        { field: 'includeArchived' },
+      )
+    }
+    const rows = [...rooms.values()]
+    const visible = includeArchived === true ? rows : rows.filter((r) => (r.archivedAt ?? null) === null)
+    return visible.map(clone)
   }
 
   /**
@@ -820,18 +1068,22 @@ export function createRoom(ctx, config = {}) {
    * @throws {RoomError} 房间不存在 / 已是成员 / CAS 冲突
    */
   /**
-   * 改房间设置（改名 / 公告 / 模式 / 管理员）。
+   * 改房间设置（改名 / 公告 / 模式 / 管理员 / 用途 / 房间开关）。
    *
    * 为什么要这个：原来只能建房间、不能改，建错名字只能废弃重来。
    * 权限：`admin` 模式下仅管理员可改；`everyone` 模式下任一成员可改。
    *
+   * DESIGN-v2 ① 扩展：新增 `purpose`（用途/话题，空串=清空）与 `settings`（**增量**合并）。
+   * `settings` 的未知键/类型错误一律抛错 —— 拒绝「写了但永远不会生效」的配置。
+   *
    * @param {{ roomId: string, name?: string, notice?: string, mode?: string, adminId?: string,
+   *           purpose?: string, settings?: object,
    *           expectedRev?: number, byId: string, now?: number }} input
-   * @returns {object} 变更后的 Room
+   * @returns {object} 变更后的 Room（有变化时多带 `changed` 字段；无变化时原样返回）
    * @throws {RoomError} 房间不存在 / 非成员 / 无权限 / 重名 / CAS 冲突 / 字段非法
    */
   function update(input = {}) {
-    const { roomId, name, notice, mode, adminId, expectedRev, byId, now } = input ?? {}
+    const { roomId, name, notice, mode, adminId, purpose, settings, expectedRev, byId, now } = input ?? {}
     const room = requireRoom(roomId, 'update')
     const actor = requireString(byId, 'byId', 'update')
     assertRev(room, expectedRev, 'update')
@@ -840,6 +1092,17 @@ export function createRoom(ctx, config = {}) {
         `room.update：房间 ${room.id} 是 admin 模式，只有管理员（${room.adminId}）能改设置，调用者为 ${actor}`,
         'ROOM_FORBIDDEN',
         { roomId: room.id, adminId: room.adminId, actor },
+      )
+    }
+    // ⚠️ 修复（2026-11-04 测试，P1-5）：原实现只在 admin 模式校验管理员，
+    //   mode='everyone' 时**完全不校验调用者是否成员** ⇒ 任意人可改房间名/公告
+    //   （实测 `byId:'attacker-not-a-member'` 改名成功）。现在与 post() 口径一致：
+    //   非 USER 的调用者必须是房间成员。
+    if (actor !== USER && !room.members.includes(actor)) {
+      throw new RoomError(
+        `room.update：${actor} 不是房间 ${room.id} 的成员 —— 无权修改房间设置`,
+        'ROOM_NOT_MEMBER',
+        { roomId: room.id, actor, members: room.members },
       )
     }
 
@@ -877,7 +1140,11 @@ export function createRoom(ctx, config = {}) {
       if (m !== room.mode) {
         next.mode = m
         // admin 模式但没有管理员 → 由操作者接管（不留「有模式无管理员」的死局）
-        if (m === 'admin' && !next.adminId) next.adminId = actor
+        if (m === 'admin' && !next.adminId) {
+          next.adminId = actor
+          // 角色表跟着描述实际管理员（roles 不参与权限判定，只为人看）
+          next.roles = { ...(next.roles ?? {}), [actor]: 'admin' }
+        }
         if (m === 'everyone') delete next.adminId
         changed.push('mode')
       }
@@ -897,7 +1164,27 @@ export function createRoom(ctx, config = {}) {
           )
         }
         next.adminId = target
+        // 管理员变更同步到角色表（roles 只是描述，但描述与实际管理员不一致会误导 UI）
+        next.roles = { ...(next.roles ?? {}), [target]: 'admin' }
         changed.push('adminId')
+      }
+    }
+
+    if (purpose !== undefined) {
+      // 空串是合法值（清空用途）→ 不能走「空串视为未提供」的 optionalString
+      const value = normalizePurpose(purpose, 'update')
+      if (value !== (room.purpose ?? '')) {
+        next.purpose = value
+        changed.push('purpose')
+      }
+    }
+
+    if (settings !== undefined) {
+      const patch = normalizeSettingsPatch(settings, 'update')
+      const merged = { ...(room.settings ?? DEFAULT_SETTINGS), ...patch }
+      if (Object.keys(patch).some((k) => merged[k] !== (room.settings ?? DEFAULT_SETTINGS)[k])) {
+        next.settings = merged
+        changed.push('settings')
       }
     }
 
@@ -907,13 +1194,19 @@ export function createRoom(ctx, config = {}) {
     }
 
     next.rev = room.rev + 1
+    // 事件类型只作审计标签：多字段同时变更时按固定优先级取一个（before/after 里是完整快照）。
+    // 顺序与改造前保持一致（name > notice > mode > adminId），新字段接在后面。
     const type = changed.includes('name')
       ? 'room_renamed'
       : changed.includes('notice')
         ? 'notice_changed'
         : changed.includes('mode')
           ? 'mode_changed'
-          : 'admin_transferred'
+          : changed.includes('adminId')
+            ? 'admin_transferred'
+            : changed.includes('purpose')
+              ? 'purpose_changed'
+              : 'settings_changed'
     const committed = commit(room.id, type, actor, at, before, next)
     return { ...committed, changed }
   }
@@ -972,12 +1265,16 @@ export function createRoom(ctx, config = {}) {
     const next = clone(room)
     next.members = room.members.filter((m) => m !== sid)
     next.relayLimit = relayLimitForMembers(next.members)
+    // 角色表只描述成员：退房后残留的角色条目会误导 UI（回放看老数据也一样）
+    if (next.roles && Object.prototype.hasOwnProperty.call(next.roles, sid)) delete next.roles[sid]
     next.rev = room.rev + 1
 
     let type = 'members_left'
     if (room.adminId === sid) {
       if (next.members.length > 0) {
         next.adminId = next.members[0]
+        // 角色表跟着实际管理员走（描述性字段，但「管理员」标签必须真）
+        next.roles = { ...(next.roles ?? {}), [next.members[0]]: 'admin' }
         type = 'admin_transferred'
         info(`[cs-bots/room] 房间 ${room.id} 管理权移交：${sid} → ${next.adminId}（最早加入的剩余成员）`)
       } else {
@@ -985,6 +1282,254 @@ export function createRoom(ctx, config = {}) {
       }
     }
     return commit(room.id, type, actor, at, before, next)
+  }
+
+  // ── API：房间归档 / 硬删（DESIGN-v2 ①）──────────────────────────────────────
+
+  /**
+   * 归档房间（**软删**）：只打 `archivedAt` 时间戳，消息与事件**一条不删**。
+   *
+   * DESIGN：归档房缺省不出现在 `list()`；`get()` 仍可读（否则归档后无法恢复）。
+   * 重复归档**抛错**（不静默成功 —— 否则归档时间会被悄悄改写，审计不可信）。
+   *
+   * @param {{ roomId: string, expectedRev?: number, byId: string, now?: number }} input
+   * @returns {object} 变更后的 Room（archivedAt=now）
+   * @throws {RoomError} 房间不存在 / 无权限 / 已归档 / CAS 冲突
+   */
+  function archiveRoom(input = {}) {
+    const { roomId, expectedRev, byId, now } = input ?? {}
+    const room = requireRoom(roomId, 'archiveRoom')
+    const actor = requireString(byId, 'byId', 'archiveRoom')
+    assertRev(room, expectedRev, 'archiveRoom')
+    assertManage(room, actor, 'archiveRoom')
+    if (room.archivedAt !== null && room.archivedAt !== undefined) {
+      throw new RoomError(
+        `room.archiveRoom：房间 ${room.id} 已归档（archivedAt=${room.archivedAt}）——拒绝静默重复归档`,
+        'ROOM_ALREADY_ARCHIVED',
+        { roomId: room.id, archivedAt: room.archivedAt },
+      )
+    }
+    const at = normalizeNow(now, 'archiveRoom')
+    const before = clone(room)
+    const next = clone(room)
+    next.archivedAt = at
+    next.rev = room.rev + 1
+    return commit(room.id, 'room_archived', actor, at, before, next)
+  }
+
+  /**
+   * 恢复归档房间（`archivedAt=null`）。未归档的房间**抛错**（不静默无操作）。
+   *
+   * @param {{ roomId: string, expectedRev?: number, byId: string, now?: number }} input
+   * @returns {object} 变更后的 Room（archivedAt=null）
+   * @throws {RoomError} 房间不存在 / 无权限 / 未归档 / CAS 冲突
+   */
+  function unarchiveRoom(input = {}) {
+    const { roomId, expectedRev, byId, now } = input ?? {}
+    const room = requireRoom(roomId, 'unarchiveRoom')
+    const actor = requireString(byId, 'byId', 'unarchiveRoom')
+    assertRev(room, expectedRev, 'unarchiveRoom')
+    assertManage(room, actor, 'unarchiveRoom')
+    if (room.archivedAt === null || room.archivedAt === undefined) {
+      throw new RoomError(
+        `room.unarchiveRoom：房间 ${room.id} 未归档（archivedAt=null）——拒绝静默无操作`,
+        'ROOM_NOT_ARCHIVED',
+        { roomId: room.id },
+      )
+    }
+    const at = normalizeNow(now, 'unarchiveRoom')
+    const before = clone(room)
+    const next = clone(room)
+    next.archivedAt = null
+    next.rev = room.rev + 1
+    return commit(room.id, 'room_unarchived', actor, at, before, next)
+  }
+
+  /**
+   * 硬删除房间（**不可恢复**）：删目录（事件流 + 消息日志 + 旁路正文）并从内存/索引摘除。
+   *
+   * 闸门（DESIGN）：「仅 owner 且 force，或无消息」：
+   *   - 权限：`USER` 或房间创建者（owner）——硬删不可恢复，不放开给普通成员；
+   *   - 有消息时必须显式 `force:true`（防误删整段讨论）。
+   *
+   * 顺序：**先落「删除意图」事件 → 再删目录 → 最后改内存**。
+   * 若 `rmSync` 失败：抛 `ROOM_DELETE_FAILED`，内存与索引**保持原样**（房间还在，可重试）；
+   * 那条 `room_removed` 事件没有 `after`，回放时不会把房间状态改掉（最多留一条痕迹）。
+   *
+   * @param {{ roomId: string, expectedRev?: number, byId: string, force?: boolean, now?: number }} input
+   * @returns {{ removed: string, messages: number }}
+   * @throws {RoomError} 房间不存在 / 无权限 / 有消息且未 force / 删除失败 / CAS 冲突
+   */
+  function removeRoom(input = {}) {
+    const { roomId, expectedRev, byId, force, now } = input ?? {}
+    const room = requireRoom(roomId, 'removeRoom')
+    const actor = requireString(byId, 'byId', 'removeRoom')
+    assertRev(room, expectedRev, 'removeRoom')
+    if (force !== undefined && typeof force !== 'boolean') {
+      throw new RoomError(
+        `room.removeRoom：force 必须是布尔值，收到 ${JSON.stringify(force)}`,
+        'ROOM_BAD_FIELD',
+        { field: 'force' },
+      )
+    }
+    const owned = actor === USER || room.createdBy === actor
+    if (!owned) {
+      throw new RoomError(
+        `room.removeRoom：只有超级管理员 ${JSON.stringify(USER)} 或房间创建者（${room.createdBy}）`
+        + `能硬删房间 ${room.id}，调用者为 ${actor} —— 硬删不可恢复，权限必须收紧`,
+        'ROOM_FORBIDDEN',
+        { roomId: room.id, actor, createdBy: room.createdBy },
+      )
+    }
+    const messages = messagesByRoom.get(room.id) ?? []
+    if (messages.length > 0 && force !== true) {
+      throw new RoomError(
+        `room.removeRoom：房间 ${room.id} 有 ${messages.length} 条消息，硬删必须显式 force:true`
+        + '（消息日志 append-only 且无回收站，删了就没了）',
+        'ROOM_NOT_EMPTY',
+        { roomId: room.id, messages: messages.length },
+      )
+    }
+
+    const at = normalizeNow(now, 'removeRoom')
+    // 先落意图：删除失败时内存保持原样，但这次尝试在事件流里可见（不静默）
+    appendRoomEvent(room.id, {
+      type: 'room_removed',
+      roomId: room.id,
+      rev: room.rev,
+      byId: actor,
+      at,
+      messages: messages.length,
+      force: force === true,
+    })
+
+    try {
+      rmSync(roomDir(room.id), { recursive: true, force: false })
+    } catch (error) {
+      throw new RoomError(
+        `room.removeRoom：房间目录删除失败（${roomDir(room.id)}）：${error?.message ?? error}`
+        + ' —— 内存与索引保持不变，请核对文件权限后重试',
+        'ROOM_DELETE_FAILED',
+        { roomId: room.id, dir: roomDir(room.id) },
+      )
+    }
+
+    // 目录已删 → 内存/索引同步摘除（内存清理**不可能失败**，放在落盘之后）
+    const messageCount = messages.length
+    rooms.delete(room.id)
+    messagesByRoom.delete(room.id)
+    eventsByRoom.delete(room.id)
+    if (room.name && nameIndex.get(nameKey(room.name)) === room.id) nameIndex.delete(nameKey(room.name))
+    for (const key of [...dedupIndex.keys()]) {
+      if (key.startsWith(`${room.id}::`)) dedupIndex.delete(key)
+    }
+    for (const key of [...relayCounts.keys()]) {
+      if (key.startsWith(`${room.id}::`)) relayCounts.delete(key)
+    }
+    for (const key of [...idem.keys]) {
+      if (key.startsWith(`${room.id}::`)) idem.keys.delete(key)
+    }
+    snapshotIndex()
+    info(`[cs-bots/room] 房间 ${room.id} 已硬删（${messageCount} 条消息随之删除，审计事件在删除前落盘）`)
+    return { removed: room.id, messages: messageCount }
+  }
+
+  // ── API：成员角色 / 踢人（DESIGN-v2 ①）──────────────────────────────────────
+
+  /**
+   * 设置成员角色（`'admin'|'member'|'observer'`）。
+   *
+   * **roles 只描述、不参与权限判定**（权限仍只看 `adminId`）——见文件头说明。
+   * 目标必须是房间成员；`USER` 不可被改角色；无变化不写事件（与 `update` 同口径）。
+   *
+   * @param {{ roomId: string, sessionId: string, role: string, byId: string,
+   *           expectedRev?: number, now?: number }} input
+   * @returns {object} 变更后的 Room
+   * @throws {RoomError} 房间/成员不存在 / 无权限 / 非法角色 / 改 USER 角色 / CAS 冲突
+   */
+  function setMemberRole(input = {}) {
+    const { roomId, sessionId, role, expectedRev, byId, now } = input ?? {}
+    const room = requireRoom(roomId, 'setMemberRole')
+    const actor = requireString(byId, 'byId', 'setMemberRole')
+    const sid = requireString(sessionId, 'sessionId', 'setMemberRole')
+    // DESIGN 的签名没列 expectedRev，但传了就严格比（可选 CAS，与全模块同口径）
+    assertRev(room, expectedRev, 'setMemberRole')
+    assertAdminPrivilege(room, actor, 'setMemberRole')
+    if (sid === USER) {
+      throw new RoomError(
+        `room.setMemberRole：不能修改超级管理员（${JSON.stringify(USER)}）的角色 —— 人类入口不可被降权`,
+        'ROOM_CANNOT_MODIFY_USER',
+        { roomId: room.id, sessionId: sid },
+      )
+    }
+    if (!room.members.includes(sid)) {
+      throw new RoomError(
+        `room.setMemberRole：${sid} 不是房间 ${room.id} 的成员 —— 角色只能挂在成员身上`,
+        'ROOM_NOT_MEMBER',
+        { roomId: room.id, sessionId: sid, members: room.members },
+      )
+    }
+    const r = normalizeMemberRole(role, 'setMemberRole')
+    if ((room.roles?.[sid] ?? 'member') === r) return clone(room)
+
+    const at = normalizeNow(now, 'setMemberRole')
+    const before = clone(room)
+    const next = clone(room)
+    next.roles = { ...(room.roles ?? {}), [sid]: r }
+    next.rev = room.rev + 1
+    return commit(room.id, 'member_role_changed', actor, at, before, next)
+  }
+
+  /**
+   * 踢出成员（**管理员级操作**，DESIGN「super admin 专用」）。
+   *
+   * 不能踢 `USER`（人类入口）；目标必须是成员。被踢者若是 admin 模式的管理员，
+   * 管理权按「最早加入的剩余成员」移交（与 `leave()` 同款，不留锁死房间）。
+   *
+   * @param {{ roomId: string, sessionId: string, byId: string,
+   *           expectedRev?: number, now?: number }} input
+   * @returns {object} 变更后的 Room
+   * @throws {RoomError} 房间/成员不存在 / 无权限 / 踢 USER / CAS 冲突
+   */
+  function kickMember(input = {}) {
+    const { roomId, sessionId, expectedRev, byId, now } = input ?? {}
+    const room = requireRoom(roomId, 'kickMember')
+    const actor = requireString(byId, 'byId', 'kickMember')
+    const sid = requireString(sessionId, 'sessionId', 'kickMember')
+    assertRev(room, expectedRev, 'kickMember')
+    assertAdminPrivilege(room, actor, 'kickMember')
+    if (sid === USER) {
+      throw new RoomError(
+        `room.kickMember：不能踢出超级管理员（${JSON.stringify(USER)}）—— 人类入口不可被移除`,
+        'ROOM_CANNOT_KICK_USER',
+        { roomId: room.id, sessionId: sid },
+      )
+    }
+    if (!room.members.includes(sid)) {
+      throw new RoomError(
+        `room.kickMember：${sid} 不是房间 ${room.id} 的成员（拒绝静默无操作）`,
+        'ROOM_NOT_MEMBER',
+        { roomId: room.id, sessionId: sid, members: room.members },
+      )
+    }
+
+    const at = normalizeNow(now, 'kickMember')
+    const before = clone(room)
+    const next = clone(room)
+    next.members = room.members.filter((m) => m !== sid)
+    next.relayLimit = relayLimitForMembers(next.members)
+    if (next.roles && Object.prototype.hasOwnProperty.call(next.roles, sid)) delete next.roles[sid]
+    next.rev = room.rev + 1
+    if (room.adminId === sid) {
+      if (next.members.length > 0) {
+        next.adminId = next.members[0]
+        next.roles = { ...(next.roles ?? {}), [next.members[0]]: 'admin' }
+        info(`[cs-bots/room] 房间 ${room.id} 管理员被踢（${sid}）→ 管理权移交 ${next.adminId}`)
+      } else {
+        delete next.adminId
+      }
+    }
+    return commit(room.id, 'member_kicked', actor, at, before, next)
   }
 
   // ── API：消息 ──────────────────────────────────────────────────────────────
@@ -1152,22 +1697,49 @@ export function createRoom(ctx, config = {}) {
   /**
    * 列出消息（**按 seq 升序**）。
    *
-   * @param {{ roomId: string, limit?: number, sinceSeq?: number }} input
+   * @param {{ roomId: string, limit?: number, sinceSeq?: number, withBody?: boolean }} input
    *        - `sinceSeq`：只要 `seq > sinceSeq` 的（断点续传用）
    *        - `limit`：取**最新** N 条（不是最早 N 条）；缺省不限（**永不截断**）
+   *        - `withBody`（DESIGN-v2 ①）：true 时每条内联 `body` = 正文**全文**
+   *          （长正文从 `bodies/<msgId>.txt` 读回，页面不用再逐条发 `/rooms/body`）
    * @returns {object[]}
    * @throws {RoomError} 房间不存在 / 参数非法
    */
   function listMessages(input = {}) {
-    const { roomId, limit, sinceSeq } = input ?? {}
+    const { roomId, limit, sinceSeq, withBody } = input ?? {}
     const room = requireRoom(roomId, 'listMessages')
     const since = optionalInteger(sinceSeq, 'sinceSeq', 'listMessages')
     const cap = optionalInteger(limit, 'limit', 'listMessages')
+    if (withBody !== undefined && typeof withBody !== 'boolean') {
+      throw new RoomError(
+        `room.listMessages：withBody 必须是布尔值，收到 ${JSON.stringify(withBody)}`,
+        'ROOM_BAD_FIELD',
+        { field: 'withBody' },
+      )
+    }
 
     let rows = messagesByRoom.get(room.id) ?? []
     if (since !== undefined) rows = rows.filter((m) => m.seq > since)
     if (cap !== undefined && cap > 0 && rows.length > cap) rows = rows.slice(-cap)
-    return rows.map(clone)
+    const out = rows.map(clone)
+    if (withBody !== true) return out
+
+    // 单条正文读失败（旁路文件被清理/损坏）**不能让整页 500**，但也绝不静默：
+    //   `body` 回落到日志里的头（与不带 withBody 时一致）+ 显式 `bodyError`，
+    //   调用方据此决定「提示用户」还是「重试」——「看着像全文其实只有头」才是不可接受的。
+    return out.map((message) => {
+      try {
+        message.body = readBody({ roomId: room.id, messageId: message.id })
+      } catch (error) {
+        message.body = message.text
+        message.bodyError = {
+          code: error?.code ?? 'ROOM_BODY_UNREADABLE',
+          message: error?.message ?? String(error),
+        }
+        warn(`[cs-bots/room] listMessages(withBody) 正文读回失败 ${room.id}/${message.id}：${message.bodyError.code}`)
+      }
+      return message
+    })
   }
 
   /**
@@ -1481,10 +2053,17 @@ export function createRoom(ctx, config = {}) {
     }
 
     let members = 0
-    for (const room of rooms.values()) members += room.members.length
+    let archived = 0
+    for (const room of rooms.values()) {
+      members += room.members.length
+      if (room.archivedAt !== null && room.archivedAt !== undefined) archived += 1
+    }
 
     return {
+      // ⚠️ 修复（2026-11-04 测试，P2-2）：UI 概览读 `stats.total`，此处之前没有 ⇒ 恒显示 `—`
+      total: rooms.size,
       rooms: rooms.size,
+      archived,
       messages,
       bodies,
       members,
@@ -1527,6 +2106,12 @@ export function createRoom(ctx, config = {}) {
     relay,
     readBody,
     listMessages,
+    // DESIGN-v2 ①：房间配置 / 归档 / 硬删 / 成员角色（签名见 DESIGN 契约，勿改名）
+    archiveRoom,
+    unarchiveRoom,
+    removeRoom,
+    setMemberRole,
+    kickMember,
     replay,
     stats,
     history,
@@ -1538,11 +2123,18 @@ export function createRoom(ctx, config = {}) {
 /** 对外暴露的关键口径（测试与调用方算 relayLimit/阈值时用，避免各处硬编码漂移）。 */
 export const ROOM_LIMITS = Object.freeze({
   MAX_NOTICE,
+  MAX_PURPOSE,
   BODY_THRESHOLD,
   BODY_HEAD_CHARS,
   RELAY_MULTIPLIER,
   RELAY_FLOOR,
 })
+
+/** 合法成员角色（DESIGN-v2 ①；UI 下拉框直接用，避免前后端各写一份）。 */
+export const ROOM_MEMBER_ROLES = Object.freeze([...MEMBER_ROLES])
+
+/** 房间级开关缺省值（DESIGN-v2 ①；UI/API 侧做表单缺省用）。 */
+export const ROOM_DEFAULT_SETTINGS = Object.freeze({ ...DEFAULT_SETTINGS })
 
 /** 用户（人类）发送者 id（`from` 允许的特殊值）。 */
 export const ROOM_USER = USER

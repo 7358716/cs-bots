@@ -14,6 +14,7 @@
 
 import { registerTool } from './kernel.js'
 import { getServices } from './registry.js'
+import { applyTaskHint } from './routing/hints.js'
 
 /** 统一的失败构造（所有工具都返回它，绝不抛出去让宿主崩）。 */
 function failure(reason, extra = {}) {
@@ -28,7 +29,8 @@ function success(payload) {
 /**
  * 从宿主上下文取本平台的域服务。
  * @param {object} ctx
- * @returns {{ board?: object, roster?: object, room?: object, memory?: object, dispatcher?: object }}
+ * @returns {{ board?: object, roster?: object, room?: object, memory?: object, dispatcher?: object,
+ *   todo?: object, scratch?: object, prompts?: object, discipline?: object, suggest?: object }}
  */
 function servicesOf(ctx) {
   return getServices(ctx)
@@ -37,6 +39,33 @@ function servicesOf(ctx) {
 /** 取调用者标识（审计流必填字段用）。 */
 function callerOf(exec) {
   return exec?.agent?.id ?? exec?.agent?.session?.id ?? 'unknown'
+}
+
+/** 从唤醒去重键反推任务 id：`task-assigned:t-3` / `task-unblocked:t-3` / `tasks-assigned:t-3`。 */
+function taskIdFromDedup(dedupKey) {
+  if (typeof dedupKey !== 'string') return undefined
+  const m = /^tasks?-(?:assigned|unblocked):(t-\d+)$/.exec(dedupKey.trim())
+  return m ? m[1] : undefined
+}
+
+/**
+ * 用任务字段给某个会话写路由 hint（缺任务/缺会话/缺 cs-myfree 都返回 `undefined`，
+ * 唤醒本身**照样要发出去** —— hint 只是优化）。
+ *
+ * @param {object|undefined} board
+ * @param {string} taskId
+ * @param {string} sessionId
+ * @returns {{ ok: boolean, hint?: object, reason?: string } | undefined}
+ */
+function hintForTask(board, taskId, sessionId) {
+  if (!board || typeof board.get !== 'function') return undefined
+  try {
+    const task = board.get(taskId)
+    if (!task) return undefined
+    return applyTaskHint(task, sessionId, { role: 'subagent' })
+  } catch {
+    return undefined
+  }
 }
 
 // ── 工具定义表 ───────────────────────────────────────────────────────────────
@@ -49,7 +78,11 @@ const DEFS = [
   {
     name: 'bot_task_create',
     description:
-      '在 cs-bots 跨会话任务板上创建一个任务。返回任务 id 与 rev；后续用 bot_task_update 推进状态（CAS 需带 expectedRev）。',
+      '在 cs-bots 跨会话任务板上创建一个任务。返回任务 id 与 rev；后续用 bot_task_update 推进状态（CAS 需带 expectedRev）。' +
+      '【复杂度路由】规划 Agent 拆解任务时**必须**给每个子任务显式标注 expectedComplexity（即 expected_complexity，' +
+      'T0 简单 / T1 常规 / T2 较难 / T3 很难）：子智能体默认 free_only（只走免费渠道），**只有** requiresPaid=true ' +
+      '（即 requires_paid:true）的子任务才获 paid_allowed。拿不准就给低档 + 不标 requiresPaid —— ' +
+      '误判为免费只是慢，误判为付费是浪费钱。',
     parameters: {
       type: 'object',
       properties: {
@@ -60,13 +93,26 @@ const DEFS = [
         priority: { type: 'number', description: '优先级（数值越大越先）' },
         dueAt: { type: 'number', description: '截止时间（epoch ms）' },
         sourceSeq: { type: 'string', description: '幂等键：同键重复创建只产生一条' },
+        expectedComplexity: {
+          type: 'string',
+          enum: ['T0', 'T1', 'T2', 'T3'],
+          description: '该子任务的复杂度档位（路由用）：T0 一句话问答 / T1 常规改动 / T2 跨文件或多步 / T3 架构级',
+        },
+        requiresPaid: {
+          type: 'boolean',
+          description: '该子任务是否值得用付费渠道（默认 false ⇒ free_only）；只有确实需要强模型时才置 true',
+        },
       },
       required: ['subject'],
       additionalProperties: false,
     },
     run: (s, a, exec) => {
       if (!s.board) return failure('board-unavailable', { hint: '任务板未装配（状态目录不可写？）' })
-      return success({ task: s.board.create({ ...a, byId: callerOf(exec) }) })
+      try {
+        return success({ task: s.board.create({ ...a, byId: callerOf(exec) }) })
+      } catch (error) {
+        return failure(error?.code ?? 'create-failed', { message: error?.message ?? String(error) })
+      }
     },
   },
   {
@@ -121,14 +167,28 @@ const DEFS = [
         dueAt: { type: 'number' },
         writeScopes: { type: 'array', items: { type: 'string' } },
         blockedBy: { type: 'array', items: { type: 'string' } },
+        expectedComplexity: {
+          type: 'string',
+          enum: ['T0', 'T1', 'T2', 'T3'],
+          description: '复杂度档位标注（claim 时可补/改；null = 清除）',
+        },
+        requiresPaid: {
+          type: 'boolean',
+          description: '是否值得付费渠道（claim 时可补/改；null = 清除；缺省 ⇒ free_only）',
+        },
       },
       required: ['id', 'expectedRev', 'action'],
       additionalProperties: false,
     },
     run: (s, a, exec) => {
       if (!s.board) return failure('board-unavailable')
+      const byId = callerOf(exec)
       try {
-        return success({ task: s.board.update({ ...a, byId: callerOf(exec) }) })
+        const task = s.board.update({ ...a, byId })
+        // 契约 §6：子任务被 claim 时，用任务字段给 owner 会话写 hint（付费用「任务标注」说了算）。
+        // hint 写失败只是少了优化，**不影响** claim 结果 ⇒ 只作为附加字段回报。
+        const hint = a.action === 'claim' ? applyTaskHint(task, byId) : undefined
+        return hint ? success({ task, hint }) : success({ task })
       } catch (error) {
         // CAS 冲突等业务失败**返回**给模型（而不是抛崩），模型可重读 rev 后重试
         return failure(error?.code ?? 'update-failed', { message: error?.message ?? String(error) })
@@ -175,13 +235,23 @@ const DEFS = [
         dedupKey: { type: 'string', description: '去重键（强烈建议：如 "task-assigned:<taskId>"）' },
         text: { type: 'string', description: '唤醒正文；缺省按 reason 生成' },
         delayMs: { type: 'number', description: '延后投递（ms）' },
+        taskId: {
+          type: 'string',
+          description: '关联任务 id（可选）：给了就用该任务的 expectedComplexity/requiresPaid 给目标会话写路由 hint',
+        },
       },
       required: ['target', 'reason'],
       additionalProperties: false,
     },
     run: (s, a) => {
       if (!s.dispatcher) return failure('dispatcher-unavailable')
-      return s.dispatcher.notify(a)
+      const { taskId, ...request } = a ?? {}
+      const res = s.dispatcher.notify(request)
+      // 契约 §6：唤醒时同样用任务字段写 hint。taskId 显式优先，否则从
+      // dedupKey（"task-assigned:t-3"）反推 —— 平台内部唤醒本来就是这么编键的。
+      const hintTaskId = taskId ?? taskIdFromDedup(request.dedupKey)
+      const hint = hintTaskId ? hintForTask(s.board, hintTaskId, request.target) : undefined
+      return hint ? { ...res, hint } : res
     },
   },
 
@@ -414,10 +484,14 @@ const DEFS = [
   },
   {
     name: 'bot_memory_context',
-    description: '取常驻注入用的记忆文本（L0–L3 冻结快照）。用于拼自己的上下文。',
+    description: '取常驻注入用的记忆文本（L0–L3 冻结快照）。用于拼自己的上下文。可传 tokenBudget 按模型窗口裁剪。',
     parameters: {
       type: 'object',
-      properties: { branch: { type: 'string' } },
+      properties: {
+        branch: { type: 'string' },
+        cwd: { type: 'string', description: '按项目裁剪：只注入「全局 + 该项目」的 L3（不传＝全局口径）' },
+        tokenBudget: { type: 'number', description: '注入 token 预算（0/缺省=不裁剪）' },
+      },
       additionalProperties: false,
     },
     run: (s, a) => {
@@ -425,7 +499,241 @@ const DEFS = [
       return success({ text: s.memory.contextFor(a ?? {}) })
     },
   },
+
+  // ── 待办（TodoService）──────────────────────────────────────────────────────
+  {
+    name: 'bot_todo_add',
+    description: '记一件待办。track: life 生活 / work 工作 / project 本项目 / daily 每日（截止=今天）。'
+      + 'quadrant: q1 重要且紧急 / q2 重要不紧急 / q3 紧急不重要 / q4 都不。',
+    parameters: {
+      type: 'object',
+      properties: {
+        track: { type: 'string', enum: ['life', 'work', 'project', 'daily'] },
+        content: { type: 'string' },
+        quadrant: { type: 'string', enum: ['q1', 'q2', 'q3', 'q4'] },
+        due: { type: 'string', description: 'YYYY-MM-DD' },
+        cat: { type: 'string' },
+        cwd: { type: 'string', description: 'project 轨用：项目工作目录' },
+        date: { type: 'string', description: 'daily 轨用：YYYY-MM-DD（缺省=今天）' },
+      },
+      required: ['content'],
+      additionalProperties: false,
+    },
+    run: (s, a, exec) => {
+      if (!s.todo) return failure('todo-unavailable')
+      try {
+        return success({ todo: s.todo.createTodo({ ...a, by: callerOf(exec) }) })
+      } catch (error) {
+        return failure(error?.code ?? 'todo-add-failed', { message: error?.message ?? String(error) })
+      }
+    },
+  },
+  {
+    name: 'bot_todo_list',
+    description: '查待办。缺省只返回需要关注的（逾期/今日到期/当前项目），要全部请传 all=true。'
+      + '查过往每日待办请同时传 past=true 与 expired=true。',
+    parameters: {
+      type: 'object',
+      properties: {
+        track: { type: 'string', enum: ['life', 'work', 'project', 'daily'] },
+        cwd: { type: 'string' },
+        date: { type: 'string' },
+        status: { type: 'string', enum: ['pending', 'doing', 'done', 'blocked', 'cancelled'] },
+        query: { type: 'string' },
+        all: { type: 'boolean' },
+        past: { type: 'boolean' },
+        expired: { type: 'boolean' },
+        limit: { type: 'number' },
+      },
+      additionalProperties: false,
+    },
+    run: (s, a) => {
+      if (!s.todo) return failure('todo-unavailable')
+      return success({ todos: s.todo.listTodos(a ?? {}) })
+    },
+  },
+  {
+    name: 'bot_todo_update',
+    description: '改待办（必须带 expectedRev 防覆盖）。可改 content/quadrant/due/cat/status。',
+    parameters: {
+      type: 'object',
+      properties: {
+        id: { type: 'string' },
+        expectedRev: { type: 'number' },
+        content: { type: 'string' },
+        quadrant: { type: 'string', enum: ['q1', 'q2', 'q3', 'q4'] },
+        due: { type: 'string' },
+        cat: { type: 'string' },
+        status: { type: 'string', enum: ['pending', 'doing', 'done', 'blocked', 'cancelled'] },
+      },
+      required: ['id', 'expectedRev'],
+      additionalProperties: false,
+    },
+    run: (s, a, exec) => {
+      if (!s.todo) return failure('todo-unavailable')
+      try {
+        return success({ todo: s.todo.updateTodo({ ...a, by: callerOf(exec) }) })
+      } catch (error) {
+        return failure(error?.code ?? 'todo-update-failed', { message: error?.message ?? String(error) })
+      }
+    },
+  },
+
+  // ── 便签（ScratchService）──────────────────────────────────────────────────
+  {
+    name: 'bot_scratch_read',
+    description: '读便签（scope 缺省 global）。便签是随手记的地方，不参与任何自动整理。',
+    parameters: {
+      type: 'object',
+      properties: { scope: { type: 'string' } },
+      additionalProperties: false,
+    },
+    run: (s, a) => {
+      if (!s.scratch) return failure('scratch-unavailable')
+      return success(s.scratch.read(a ?? {}))
+    },
+  },
+  {
+    name: 'bot_scratch_write',
+    description: '整篇覆盖写便签（不是追加）。要保留原文请先 read 再写回。上限 512 KB。',
+    parameters: {
+      type: 'object',
+      properties: { scope: { type: 'string' }, text: { type: 'string' } },
+      required: ['text'],
+      additionalProperties: false,
+    },
+    run: (s, a, exec) => {
+      if (!s.scratch) return failure('scratch-unavailable')
+      try {
+        return success(s.scratch.write({ ...a, by: callerOf(exec) }))
+      } catch (error) {
+        return failure(error?.code ?? 'scratch-write-failed', { message: error?.message ?? String(error) })
+      }
+    },
+  },
+
+  // ── 提示词库（PromptService）──────────────────────────────────────────────
+  {
+    name: 'bot_prompt_list',
+    description: '列出提示词模板（可按分类/标签/关键词过滤）。缺省只列启用中的。',
+    parameters: {
+      type: 'object',
+      properties: {
+        category: { type: 'string' },
+        tag: { type: 'string' },
+        query: { type: 'string' },
+        enabled: { type: 'boolean' },
+        limit: { type: 'number' },
+      },
+      additionalProperties: false,
+    },
+    run: (s, a) => {
+      if (!s.prompts) return failure('prompts-unavailable')
+      return success({ prompts: s.prompts.listPrompts(a ?? {}) })
+    },
+  },
+  {
+    name: 'bot_prompt_get',
+    description: '取一条提示词的完整正文（含 {{date}}/{{time}} 展开前的原文）。',
+    parameters: {
+      type: 'object',
+      properties: { id: { type: 'string' } },
+      required: ['id'],
+      additionalProperties: false,
+    },
+    run: (s, a) => {
+      if (!s.prompts) return failure('prompts-unavailable')
+      const p = s.prompts.getPrompt({ id: a?.id })
+      return p ? success({ prompt: p }) : failure('prompt-not-found')
+    },
+  },
+
+  // ── 纪律（DisciplineService，分级）────────────────────────────────────────
+  {
+    name: 'bot_discipline_list',
+    description: '查分级纪律（global 全局 / workspace 工作区 / room 房间 / bot 单个 Bot）。'
+      + '可按 scope/scopeId 过滤。',
+    parameters: {
+      type: 'object',
+      properties: {
+        scope: { type: 'string', enum: ['global', 'workspace', 'room', 'bot'] },
+        scopeId: { type: 'string' },
+        kind: { type: 'string', enum: ['rule', 'requirement', 'principle', 'style'] },
+      },
+      additionalProperties: false,
+    },
+    run: (s, a) => {
+      if (!s.discipline) return failure('discipline-unavailable')
+      return success({ disciplines: s.discipline.listDisciplines(a ?? {}) })
+    },
+  },
+  {
+    name: 'bot_discipline_resolve',
+    description: '取「我实际要遵守哪些纪律」的合并结果（按层合并、同名去重、优先级排序、预算裁剪）。',
+    parameters: {
+      type: 'object',
+      properties: {
+        botId: { type: 'string' },
+        cwd: { type: 'string' },
+        roomId: { type: 'string' },
+        tokenBudget: { type: 'number' },
+      },
+      additionalProperties: false,
+    },
+    run: (s, a) => {
+      if (!s.discipline) return failure('discipline-unavailable')
+      return success(s.discipline.resolveDisciplines(a ?? {}))
+    },
+  },
+
+  // ── 建议确认（SuggestService）─────────────────────────────────────────────
+  {
+    name: 'bot_suggestion_propose',
+    description: '提议一条要长期记住的东西（记忆/技能/纪律）。**不会直接生效** —— '
+      + '进入待确认队列，人点了采纳才落库。这是模型改长期记忆的唯一合法途径。',
+    parameters: {
+      type: 'object',
+      properties: {
+        kind: { type: 'string', enum: ['memory', 'skill', 'discipline'] },
+        layer: { type: 'string', enum: ['L1', 'L2', 'L3', 'L4', 'L5'] },
+        payload: { type: 'object', description: 'memory: {content,tags}；skill: {name,description,body}；discipline: {scope,scopeId,title,content,disciplineKind,priority}' },
+        reason: { type: 'string', description: '为什么建议记这条' },
+        confidence: { type: 'number' },
+      },
+      required: ['kind', 'payload'],
+      additionalProperties: false,
+    },
+    run: (s, a, exec) => {
+      if (!s.suggest) return failure('suggest-unavailable')
+      try {
+        // memory 类建议必须带 layer —— 模型漏传时补 L4（任务笔记），而不是让它抛错后丢失
+        const payload = { ...a, source: 'model', by: callerOf(exec) }
+        if (payload.kind === 'memory' && !payload.layer) payload.layer = 'L4'
+        return success({ suggestion: s.suggest.suggest(payload) })
+      } catch (error) {
+        return failure(error?.code ?? 'suggest-propose-failed', { message: error?.message ?? String(error) })
+      }
+    },
+  },
+  {
+    name: 'bot_suggestion_list',
+    description: '查建议确认队列（缺省 pending）。',
+    parameters: {
+      type: 'object',
+      properties: {
+        kind: { type: 'string', enum: ['memory', 'skill', 'discipline'] },
+        status: { type: 'string', enum: ['pending', 'accepted', 'rejected'] },
+        limit: { type: 'number' },
+      },
+      additionalProperties: false,
+    },
+    run: (s, a) => {
+      if (!s.suggest) return failure('suggest-unavailable')
+      return success({ suggestions: s.suggest.listSuggestions(a ?? {}) })
+    },
+  },
 ]
+
 
 /**
  * 注册全部工具。缺 `tools` 服务时**只 warn 不抛**（降级：模型看不到工具，

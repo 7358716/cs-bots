@@ -75,7 +75,8 @@ test('工具全部注册成功，且数量与 TOOL_NAMES 一致', () => {
       TOOL_NAMES.length,
       `应注册 ${TOOL_NAMES.length} 个，实际 ${h.registered.length}；warnings=${JSON.stringify(h.warnings)}`,
     )
-    assert.equal(TOOL_NAMES.length, 16, '工具总数应为 16（README 曾误写 17）')
+    // v2 新增：待办 3 + 便签 2 + 提示词 2 + 纪律 2 + 建议 2 = 11 个（16 → 27）
+    assert.equal(TOOL_NAMES.length, 27, `工具总数应为 27，实际 ${TOOL_NAMES.length}`)
   } finally {
     h.cleanup()
   }

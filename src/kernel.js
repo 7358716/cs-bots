@@ -433,6 +433,100 @@ export function restrictTools(agent, names) {
   }
 }
 
+// ── LLM 请求拦截（复杂度路由唯一需要的宿主触点）──────────────────────────────
+
+/**
+ * 注册一条 `llm/stream` 瀑布拦截（**接口 v1，2026-11-04 新增**）。
+ *
+ * 官方语义一手依据：
+ *   - 调用点：`dsh-llm/lib/index.js:2397`
+ *     `this.ctx.waterfall(this, 'llm/stream', options, () => this.adapterStream(...))`
+ *   - 签名：`'llm/stream'(this: LlmRuntime, options: GenerateOptions,
+ *     next: () => AsyncIterable<StreamChunk>): AsyncIterable<StreamChunk>`
+ *   - 官方插件用法样板：`dsh-session-checkpoint-policy/lib/index.js:61`
+ *     `ctx.on('llm/stream', (options, next) => { ... return next() })`
+ *
+ * ⚠️ `options` 是**冻结的**（`dsh-agent-loop/lib/index.js:1286` 处 `Object.freeze`）：
+ *    处理函数只能读、不能写；想让下游知道点什么，必须走旁路通道
+ *    （本平台用 `globalThis[Symbol.for('cs-myfree.routing.hints.v1')]`）。
+ *
+ * ⚠️ handler 必须**同步返回 `next()`**（那是 AsyncIterable，不是 Promise），
+ *    所以本函数不做任何 await，也不包 async。
+ *
+ * 缺 `ctx.on`（测试替身/更老宿主）时返回 `false`，调用方按降级处理，**不抛**。
+ *
+ * @param {object} ctx
+ * @param {(options: object, next: Function) => any} handler
+ * @returns {boolean} 是否注册成功
+ */
+export function onLlmStream(ctx, handler) {
+  if (!ctx || typeof ctx.on !== 'function') return false
+  if (typeof handler !== 'function') return false
+  try {
+    ctx.on('llm/stream', handler)
+    return true
+  } catch {
+    return false
+  }
+}
+
+// ── 会话元数据（谱系）──────────────────────────────────────────────────────
+
+/**
+ * 读一个会话的**谱系元数据**（接口 v1，2026-11-04 新增）。
+ *
+ * 为什么需要（授权泄漏修复）：官方 `spawn_teammate` 生成的子会话**不在 cs-bots 的
+ * roster 注册表里**，但宿主 session header 带谱系字段。没有这条信息，平台只能把
+ * 「不是 Bot 的会话」当成主对话 ⇒ 官方子智能体反而拿到 `paid_allowed`（越权付费）。
+ *
+ * 一手依据（宿主源码，已核验）：
+ *   - `dsh-session/lib/index.js:1340` `Session.header`（公开属性，deep-frozen）；
+ *   - `dsh-session/lib/index.js:1823-1827` header 由 `meta` 组装，含
+ *     `parentSession` / `origin`（子代理为 `'subagent'`）/ `delegationDepth` / `agentPreset`；
+ *   - `dsh-session/lib/index.js:1980` `sessions.get(id)` ⇒ Session。
+ *
+ * 纪律：
+ *   - **只取白名单四个字段**并转成纯数据（绝不把宿主对象/header 引用漏给业务层）；
+ *   - 服务缺失、无此会话、任何抛错 ⇒ `null`（调用方据此 fail-closed，**本函数绝不抛**）；
+ *   - 返回 `{}` 表示「会话存在但没有任何谱系字段」= 可确认是顶层会话（主对话）。
+ *
+ * @param {object} ctx
+ * @param {string} sessionId
+ * @returns {{ origin?: string, parentSession?: string, delegationDepth?: number,
+ *             agentPreset?: string } | null}
+ */
+export function sessionMeta(ctx, sessionId) {
+  if (typeof sessionId !== 'string' || sessionId === '') return null
+  const sessions = service(ctx, 'sessions')
+  if (!sessions || typeof sessions.get !== 'function') return null
+  let header
+  try {
+    header = sessions.get(sessionId)?.header
+  } catch {
+    return null
+  }
+  if (!header || typeof header !== 'object') return null
+
+  /** @type {{ origin?: string, parentSession?: string, delegationDepth?: number, agentPreset?: string }} */
+  const meta = {}
+  try {
+    if (typeof header.origin === 'string' && header.origin !== '') meta.origin = header.origin
+    if (typeof header.parentSession === 'string' && header.parentSession !== '') {
+      meta.parentSession = header.parentSession
+    }
+    if (typeof header.delegationDepth === 'number' && Number.isFinite(header.delegationDepth)) {
+      meta.delegationDepth = header.delegationDepth
+    }
+    if (typeof header.agentPreset === 'string' && header.agentPreset !== '') {
+      meta.agentPreset = header.agentPreset
+    }
+  } catch {
+    // 代理陷阱/只读失败等 ⇒ 视为拿不到元数据（调用方 fail-closed）
+    return null
+  }
+  return meta
+}
+
 // ── 状态目录 ────────────────────────────────────────────────────────────────
 
 /**

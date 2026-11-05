@@ -666,3 +666,30 @@ test('replay：坏行不静默丢弃（计入 bad 并保留原始数据）', (t)
   // 坏行**未被删除**：原文件仍在（可人工核对，不是「悄悄修好」）
   assert.ok(readFileSync(logFile, 'utf8').includes('这不是 JSON'))
 })
+
+// ── 2026-11-04 测试回归 ─────────────────────────────────────────────────────
+// 🔴 P1-5：update() 之前只在 admin 模式校验管理员，mode='everyone' 时**完全不校验
+//   调用者是否成员** ⇒ 任意人可改房间名/公告（实测 byId:'attacker-not-a-member' 改名成功）。
+
+test('2026-11-04 P1-5：非成员不能改 everyone 模式房间的设置', (t) => {
+  const { rooms } = setup(t)
+  const room = seed(rooms) // mode 默认 everyone，成员 s-a/s-b/s-c
+  assert.throws(
+    () => rooms.update({ roomId: room.id, expectedRev: room.rev, byId: 'attacker-not-a-member', name: 'hijacked' }),
+    (e) => e instanceof RoomError && e.code === 'ROOM_NOT_MEMBER',
+  )
+})
+
+test('2026-11-04 P1-5：成员可以改 everyone 模式房间的设置', (t) => {
+  const { rooms } = setup(t)
+  const room = seed(rooms)
+  const updated = rooms.update({ roomId: room.id, expectedRev: room.rev, byId: 's-a', name: 'renamed-ok' })
+  assert.equal(updated.name, 'renamed-ok')
+})
+
+test('2026-11-04 P1-5：user（主管本人）可改房间设置（不被成员校验挡）', (t) => {
+  const { rooms } = setup(t)
+  const room = seed(rooms)
+  const updated = rooms.update({ roomId: room.id, expectedRev: room.rev, byId: 'user', name: 'by-user' })
+  assert.equal(updated.name, 'by-user')
+})

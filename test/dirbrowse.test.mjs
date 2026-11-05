@@ -583,3 +583,65 @@ test('零依赖：src/dirbrowse.js 不引用任何宿主/第三方包', () => {
   }
   assert.deepEqual(new Set(specs), new Set(['node:fs', 'node:path', 'node:os']))
 })
+
+// ── 2026-11-04 安全回归：受保护区写闸门（P0-2）────────────────────────────
+// 🔴 漏洞：原来 `validateAsBotCwd` 拒的受保护区（DSH 家目录 / ~/.agents /
+//   cs-bots 状态目录）在 mkdir/rename 的写闸门里**不生效** ⇒ 校验说不行、写入说可以，
+//   任何能访问公网端口的人都能写进 ~/.dsh/cs-bots（篡改持久配置）。
+// 测试设定：受保护目录放在**允许根目录内**，以区分 DIR_OUTSIDE_ROOTS 与 DIR_PROTECTED。
+
+test('2026-11-04 P0-2：mkdir 拒绝写入 DSH 家目录（DIR_PROTECTED）', () => {
+  const base = tmp()
+  const dshHome = join(base, 'fake-dsh-home')
+  mkdirSync(dshHome, { recursive: true })
+  const b = createDirBrowser({ stateDir: join(base, 'cs-bots-state'), roots: [base], dshHome })
+  try {
+    assert.equal(codeOf(() => b.mkdir({ path: dshHome, name: 'x' })), 'DIR_PROTECTED')
+  } finally {
+    cleanup(base)
+  }
+})
+
+test('2026-11-04 P0-2：mkdir 拒绝写入 cs-bots 状态目录', () => {
+  const base = tmp()
+  const state = join(base, 'cs-bots-state')
+  mkdirSync(state, { recursive: true })
+  const b = createDirBrowser({ stateDir: state, roots: [base] })
+  try {
+    assert.equal(codeOf(() => b.mkdir({ path: state, name: 'x' })), 'DIR_PROTECTED')
+  } finally {
+    cleanup(base)
+  }
+})
+
+test('2026-11-04 P0-2：rename 拒绝写受保护区（目标父目录在受保护区内）', () => {
+  const base = tmp()
+  const dshHome = join(base, 'fake-dsh-home')
+  mkdirSync(dshHome, { recursive: true })
+  const victim = join(dshHome, 'victim')
+  mkdirSync(victim)
+  const b = createDirBrowser({ stateDir: join(base, 'cs-bots-state'), roots: [base], dshHome })
+  try {
+    // rename 的写闸门判 parentPath（victim 的父目录 = dshHome）
+    assert.equal(codeOf(() => b.rename({ path: victim, name: 'renamed' })), 'DIR_PROTECTED')
+  } finally {
+    cleanup(base)
+  }
+})
+
+test('2026-11-04 P0-2：受保护区在允许根内时 validate 与写入口径一致', () => {
+  const base = tmp()
+  const dshHome = join(base, 'fake-dsh-home')
+  mkdirSync(dshHome, { recursive: true })
+  const b = createDirBrowser({ stateDir: join(base, 'cs-bots-state'), roots: [base], dshHome })
+  try {
+    // validateAsBotCwd 拒绝
+    const v = b.validateAsBotCwd({ path: dshHome })
+    assert.equal(v.ok, false)
+    assert.ok(v.errors.length > 0)
+    // 写入口径必须同样拒绝（修复前这里会放行）
+    assert.equal(codeOf(() => b.mkdir({ path: dshHome, name: 'x' })), 'DIR_PROTECTED')
+  } finally {
+    cleanup(base)
+  }
+})

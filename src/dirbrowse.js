@@ -293,6 +293,26 @@ export function createDirBrowser(config) {
         { label, path: dir, real: realOrSelf(dir), roots: allowedRoots() },
       )
     }
+    // ⚠️ 修复（2026-11-04 安全测试，P0）：原来只判 `withinAllowedForWrite`（家目录 ∪
+    //   进程 cwd ∪ config.roots），而 `validateAsBotCwd` 里的受保护区（DSH 家目录 /
+    //   ~/.agents / cs-bots 状态目录）**只在那一个校验函数里生效** ⇒ 校验说"不行"、
+    //   写入却说"可以"。现在两处口径统一：写闸门也遵守同一组受保护区。
+    const real = realOrSelf(dir)
+    const guarded = [
+      { dir: dshHome, label: 'DSH 家目录' },
+      { dir: agentsDir, label: '~/.agents（宿主技能目录）' },
+      { dir: stateDir, label: 'cs-bots 状态目录' },
+    ]
+    for (const { dir: gdir, label: glabel } of guarded) {
+      const root = realOrSelf(gdir)
+      if (isInside(real, root) || isInside(dir, gdir)) {
+        throw fail(
+          `拒绝在受保护区写入：${dir}（${glabel}）—— 该区域属宿主/插件自身，不接受外部写入`,
+          'DIR_PROTECTED',
+          { label, path: dir, real, protected: glabel },
+        )
+      }
+    }
   }
 
   /**

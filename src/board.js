@@ -13,6 +13,10 @@
  *                     但未规定落点；落在 Task 上便于查询，事件流里也有一份）。
  *   `createdAt` / `createdBy` / `completedAt` —— 便于 `list()` 消费方直接展示。
  *   `blockedReason` —— `block({ note })` 时记录阻塞原因。
+ *   `expectedComplexity` / `requiresPaid` —— **复杂度路由标签**（契约 §6）：规划 Agent
+ *     拆解时显式给出该子任务的复杂度档位（T0–T3）与「是否值得付费」的诉求；
+ *     子任务被 claim/wake 时平台据此给 owner 会话写 hint（见 `src/routing/hints.js`）。
+ *     两者都是**可选字段**：缺省 ⇒ 平台按 `free_only` 处理（fail-closed，省成本）。
  *
  * ── 三条不变量（全模块机械保证）──
  *   1. **CAS 优先**：任何变更都要带 `expectedRev`；不匹配即抛错，绝不静默覆盖。
@@ -67,10 +71,16 @@ const STATUSES = ['pending', 'in_progress', 'completed', 'blocked', 'deleted']
 const ACCEPT_RESULTS = ['pass', 'reject']
 /** 租约缺省 TTL（ms）。 */
 const DEFAULT_LEASE_MS = 300_000
+/** 复杂度档位（契约 §6 冻结；路由侧 `src/routing/complexity.js` 用同一套字面量）。 */
+const COMPLEXITY_TIERS = ['T0', 'T1', 'T2', 'T3']
 /** 字段补丁允许改的字段（**不含 status**，见文件头不变量 3）。 */
-const PATCH_FIELDS = ['subject', 'description', 'blockedBy', 'writeScopes', 'priority', 'dueAt']
+const PATCH_FIELDS = [
+  'subject', 'description', 'blockedBy', 'writeScopes', 'priority', 'dueAt',
+  // 复杂度路由标注（2026-11-04 新增，契约 §6）—— 见文件头「路由标签」说明
+  'expectedComplexity', 'requiresPaid',
+]
 /** 事件动作集合。 */
-const ACTIONS = ['create', 'edit', 'claim', 'release', 'heartbeat', 'complete', 'reopen', 'block', 'delete', 'accept', 'lease_expired']
+const ACTIONS = ['create', 'edit', 'claim', 'release', 'heartbeat', 'complete', 'reopen', 'block', 'unblock', 'set', 'delete', 'accept', 'lease_expired']
 
 // ── 错误 ────────────────────────────────────────────────────────────────────
 
@@ -189,8 +199,47 @@ function normalizeDescription(value, where = 'create') {
   return value
 }
 
-/** `complete` 的产出物证据归一：非空字符串或非空数组（元素为字符串/对象）。 */
-function normalizeArtifacts(value, taskId) {
+/**
+ * `expectedComplexity` 归一：`T0`–`T3`（大小写不敏感）。
+ *
+ * 非法值**抛可读错误**、绝不悄悄改成默认档 —— 否则「这个子任务为什么走了免费渠道」
+ * 就无从追溯（契约 §6 明确要求「非法值给可读错误码」）。`undefined/null` ⇒ 未标注。
+ */
+function normalizeComplexity(value, where) {
+  if (value === undefined || value === null) return undefined
+  if (typeof value !== 'string') {
+    throw new BoardError(
+      `board.${where}：字段 expectedComplexity 类型错误（要求 ${COMPLEXITY_TIERS.join(' | ')} 字符串，`
+      + `收到 ${JSON.stringify(value)}）`,
+      'BOARD_BAD_COMPLEXITY',
+      { field: 'expectedComplexity', where, accepted: [...COMPLEXITY_TIERS] },
+    )
+  }
+  const v = value.trim().toUpperCase()
+  if (!COMPLEXITY_TIERS.includes(v)) {
+    throw new BoardError(
+      `board.${where}：expectedComplexity=${JSON.stringify(value)} 非法（合法值：${COMPLEXITY_TIERS.join(' | ')}）`,
+      'BOARD_BAD_COMPLEXITY',
+      { field: 'expectedComplexity', where, value },
+    )
+  }
+  return v
+}
+
+/** `requiresPaid` 归一：严格布尔（**不做字符串强转**，`'true'` 也算非法）。 */
+function normalizeRequiresPaid(value, where) {
+  if (value === undefined || value === null) return undefined
+  if (typeof value !== 'boolean') {
+    throw new BoardError(
+      `board.${where}：字段 requiresPaid 类型错误（要求 true|false 布尔，收到 ${JSON.stringify(value)}）`,
+      'BOARD_BAD_FIELD',
+      { field: 'requiresPaid', where },
+    )
+  }
+  return value
+}
+
+/** `complete` 的产出物证据归一：非空字符串或非空数组（元素为字符串/对象）。 */function normalizeArtifacts(value, taskId) {
   let list
   if (typeof value === 'string') list = [value]
   else if (Array.isArray(value)) list = value
@@ -574,7 +623,10 @@ export function createBoard(ctx, config = {}) {
    * @returns {object} Task
    */
   function create(input = {}) {
-    const { subject, description, blockedBy, writeScopes, priority, dueAt, byId, sourceSeq, now } = input ?? {}
+    const {
+      subject, description, blockedBy, writeScopes, priority, dueAt, byId, sourceSeq, now,
+      expectedComplexity, requiresPaid,
+    } = input ?? {}
     const by = requireString(byId, 'byId', 'create')
     const subj = requireString(subject, 'subject', 'create')
     const desc = normalizeDescription(description, 'create')
@@ -582,6 +634,9 @@ export function createBoard(ctx, config = {}) {
     const scopes = stringList(writeScopes, 'writeScopes', 'create')
     const prio = optionalNumber(priority, 'priority', 'create')
     const due = optionalNumber(dueAt, 'dueAt', 'create')
+    // 复杂度路由标签（可选；非法值在这里就抛，不进事件流）
+    const complexity = normalizeComplexity(expectedComplexity, 'create')
+    const paid = normalizeRequiresPaid(requiresPaid, 'create')
     const seq = sourceSeq === undefined || sourceSeq === null
       ? undefined
       : requireString(sourceSeq, 'sourceSeq', 'create')
@@ -624,6 +679,8 @@ export function createBoard(ctx, config = {}) {
     if (prio !== undefined) task.priority = prio
     if (due !== undefined) task.dueAt = due
     if (seq !== undefined) task.sourceSeq = seq
+    if (complexity !== undefined) task.expectedComplexity = complexity
+    if (paid !== undefined) task.requiresPaid = paid
 
     idCounter = nextCounter
     try {
@@ -648,7 +705,7 @@ export function createBoard(ctx, config = {}) {
   function update(input = {}) {
     const {
       id, expectedRev, action = 'edit', byId, now,
-      artifacts, note, leaseMs, force, ...fields
+      artifacts, note, reason, leaseMs, force, ...fields
     } = input ?? {}
     const taskId = requireString(id, 'id', 'update')
     const by = requireString(byId, 'byId', 'update')
@@ -690,6 +747,22 @@ export function createBoard(ctx, config = {}) {
 
     const isDead = (st) => st === 'deleted'
     const ownerName = (lease) => (lease?.ownerId ? String(lease.ownerId) : '?')
+
+    // 复杂度路由标签（契约 §6）：**任何 action 下**非法值都直接拒 ——
+    // 不给「脏输入被静默忽略」的口子（那样路由就不可追溯了）。
+    const patchComplexity = normalizeComplexity(fields.expectedComplexity, `update/${action}`)
+    const patchRequiresPaid = normalizeRequiresPaid(fields.requiresPaid, `update/${action}`)
+    /** 把（可选）路由标签落到 next 上；`null` = 清除该标注。@param {object} nextTask */
+    const applyRoutingLabels = (nextTask) => {
+      if (fields.expectedComplexity !== undefined) {
+        if (fields.expectedComplexity === null) delete nextTask.expectedComplexity
+        else nextTask.expectedComplexity = patchComplexity
+      }
+      if (fields.requiresPaid !== undefined) {
+        if (fields.requiresPaid === null) delete nextTask.requiresPaid
+        else nextTask.requiresPaid = patchRequiresPaid
+      }
+    }
 
     switch (action) {
       // ── 字段补丁（内容类）────────────────────────────────────────────────
@@ -734,6 +807,7 @@ export function createBoard(ctx, config = {}) {
           if (fields.dueAt === null) delete next.dueAt
           else next.dueAt = optionalNumber(fields.dueAt, 'dueAt', 'update')
         }
+        applyRoutingLabels(next)
         break
       }
 
@@ -780,6 +854,8 @@ export function createBoard(ctx, config = {}) {
         next.status = 'in_progress'
         next.ownerId = by
         next.lease = { ownerId: by, expiresAt: at + ttl, heartbeatAt: at }
+        // claim 也可顺带纠正路由标注（规划 Agent 领活时补/改 expectedComplexity 的路径）
+        applyRoutingLabels(next)
         break
       }
 
@@ -893,7 +969,77 @@ export function createBoard(ctx, config = {}) {
         }
         next.status = 'blocked'
         delete next.lease
-        if (note !== undefined && note !== null) next.blockedReason = String(note)
+        // ⚠️ 修复（2026-11-04 测试）：tools.js 的 schema 与 UI 传的是 `reason`，
+        //   实现却只读 `note` ⇒ 「终止/阻塞原因」被静默丢弃。现在两个字段都认。
+        const blockReason = note !== undefined && note !== null ? note : reason
+        if (blockReason !== undefined && blockReason !== null && String(blockReason) !== '') {
+          next.blockedReason = String(blockReason)
+        }
+        break
+      }
+
+      // ── 解除阻塞（2026-11-04 新增：tools.js schema 与 README 早已承诺，实现缺失）──
+      case 'unblock': {
+        if (isDead(current.status)) {
+          throw new BoardError(`board.unblock：任务 ${taskId} 已删除，不能 unblock`, 'BOARD_TASK_DELETED', { id: taskId })
+        }
+        if (current.status !== 'blocked') {
+          throw new BoardError(
+            `board.unblock：任务 ${taskId} 当前状态是 ${current.status}，只有 blocked 才能 unblock`,
+            'BOARD_BAD_STATE',
+            { id: taskId, status: current.status },
+          )
+        }
+        // 依赖未完成的仍保持 blocked（依赖是数据约束，不是状态约束）
+        const unmet = (current.blockedBy ?? []).filter((d) => {
+          const dep = tasks.get(d)
+          return dep ? dep.status !== 'completed' && dep.status !== 'deleted' : true
+        })
+        next.status = unmet.length === 0 ? 'pending' : 'blocked'
+        delete next.blockedReason
+        break
+      }
+
+      // ── 直接改字段/状态（2026-11-04 新增：tools.js schema 早承诺、实现缺失）──
+      case 'set': {
+        if (isDead(current.status)) {
+          throw new BoardError(`board.set：任务 ${taskId} 已删除，不能 set`, 'BOARD_TASK_DELETED', { id: taskId })
+        }
+        const fieldsGiven = Object.keys(fields).filter((k) => fields[k] !== undefined)
+        if (fieldsGiven.length === 0) {
+          throw new BoardError(
+            `board.set：未提供任何字段（可改：${PATCH_FIELDS.join(' | ')} | status | priority | dueAt）`,
+            'BOARD_BAD_FIELD',
+            { id: taskId, patchable: PATCH_FIELDS },
+          )
+        }
+        for (const k of fieldsGiven) {
+          if (k === 'status') {
+            if (!['pending', 'blocked', 'in_progress'].includes(fields.status)) {
+              throw new BoardError(
+                `board.set：status 只允许 pending | blocked | in_progress（completed 走 complete/accept，deleted 走 delete）`,
+                'BOARD_BAD_FIELD',
+                { field: 'status', value: fields.status },
+              )
+            }
+            next.status = fields.status
+            if (fields.status !== 'in_progress') delete next.lease
+          } else if (k === 'expectedComplexity') {
+            if (fields[k] === null) delete next.expectedComplexity
+            else next.expectedComplexity = normalizeComplexity(fields[k], 'set')
+          } else if (k === 'requiresPaid') {
+            if (fields[k] === null) delete next.requiresPaid
+            else next.requiresPaid = normalizeRequiresPaid(fields[k], 'set')
+          } else if (PATCH_FIELDS.includes(k)) {
+            next[k] = fields[k]
+          } else {
+            throw new BoardError(
+              `board.set：字段 ${JSON.stringify(k)} 不可直接设置（可改：${PATCH_FIELDS.join(' | ')} | status）`,
+              'BOARD_BAD_FIELD',
+              { field: k, patchable: PATCH_FIELDS },
+            )
+          }
+        }
         break
       }
 
@@ -997,6 +1143,48 @@ export function createBoard(ctx, config = {}) {
     if (current.status === 'deleted') {
       throw new BoardError(`board.accept：任务 ${taskId} 已删除（tombstone），不能验收`, 'BOARD_TASK_DELETED', { id: taskId })
     }
+    // ⚠️ 修复（2026-11-04 测试，P1-1）：原来 accept 不检查任务状态，任何状态的
+    //   任务都能直接被 accept('pass') 置 completed —— 绕过 complete() 的
+    //   blockedBy/lease/artifacts 校验，依赖图收敛逻辑形同虚设。
+    //   现在：pass 要求任务已经是 completed（由 owner 完成且带 artifacts 后才验收），
+    //   reject 则允许从 completed 打回 pending。
+    if (result === 'pass') {
+      if (current.status !== 'completed') {
+        throw new BoardError(
+          `board.accept/pass：任务 ${taskId} 当前状态是 ${current.status}，只有 completed 才能验收通过`,
+          'BOARD_BAD_STATE',
+          { id: taskId, status: current.status, expected: 'completed' },
+        )
+      }
+      if (current.blockedBy?.length) {
+        const unmet = current.blockedBy.filter((d) => {
+          const dep = tasks.get(d)
+          return dep ? dep.status !== 'completed' && dep.status !== 'deleted' : true
+        })
+        if (unmet.length > 0) {
+          throw new BoardError(
+            `board.accept/pass：任务 ${taskId} 的依赖未全部完成（未完成：${unmet.join(', ')}）`,
+            'BOARD_BLOCKED_BY_UNMET',
+            { id: taskId, unmet },
+          )
+        }
+      }
+      if (!current.artifacts || Object.keys(current.artifacts).length === 0) {
+        throw new BoardError(
+          `board.accept/pass：任务 ${taskId} 没有产出物（artifacts）—— complete() 的不变量未满足`,
+          'BOARD_NO_ARTIFACTS',
+          { id: taskId },
+        )
+      }
+    } else if (result === 'reject') {
+      if (current.status !== 'completed') {
+        throw new BoardError(
+          `board.accept/reject：任务 ${taskId} 当前状态是 ${current.status}，只有 completed 才能打回`,
+          'BOARD_BAD_STATE',
+          { id: taskId, status: current.status, expected: 'completed' },
+        )
+      }
+    }
     const at = normalizeNow(now, 'accept')
     const before = clone(current)
     const next = clone(current)
@@ -1036,11 +1224,32 @@ export function createBoard(ctx, config = {}) {
   /** 首次构造即回放，保证 `list()` 在重启后马上可用。 */
   hydrate()
 
+  /**
+   * 统计（给 /status 与 UI 概览用）。
+   * ⚠️ 修复（2026-11-04 测试，P2-2）：board 之前没有 `stats()`，`/status` 与
+   *   UI 概览里任务数恒显示 `—`。
+   */
+  function stats() {
+    const byStatus = {}
+    let total = 0, ready = 0, blocked = 0, inProgress = 0, completed = 0, deleted = 0
+    for (const t of tasks.values()) {
+      total += 1
+      byStatus[t.status] = (byStatus[t.status] ?? 0) + 1
+      if (t.status === 'in_progress') inProgress += 1
+      else if (t.status === 'blocked') blocked += 1
+      else if (t.status === 'completed') completed += 1
+      else if (t.status === 'deleted') deleted += 1
+      else if (t.status === 'pending' && unfinishedDeps(t).length === 0) ready += 1
+    }
+    return { total, ready, blocked, inProgress, completed, deleted, byStatus, events: events.length }
+  }
+
   const board = {
     name: config.name ?? 'board',
     paths: Object.freeze({ stateDir, jsonl: jsonlPath, snapshot: snapPath }),
     create,
     get,
+    stats,
     list,
     update,
     ready,

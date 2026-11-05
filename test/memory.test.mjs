@@ -426,3 +426,163 @@ test('stats 按层统计 active/archived/conflict', () => {
     h.cleanup()
   }
 })
+
+// ── 2026-11-04 增强（调研驱动）：注入 token 预算 + token 计量 ──────────────
+// 依据：MemOS/Mem0 的"分级预算"实践 —— 小窗模型（8k–32k 免费池）上
+// L0–L3 全量注入会挤占工具/用户空间。cs-myfree 已上报 contextWindow，
+// 本服务按 tokenBudget 裁剪，并在输出尾部**可见地**标注被丢弃的层。
+
+test('2026-11-04 contextFor 无预算时注入全部 L0–L3（行为不变）', () => {
+  const h = harness()
+  try {
+    h.mem.add({ layer: 'L1', content: '用户偏好A', by: 'user' })
+    h.mem.add({ layer: 'L3', content: '项目keyB', by: 'dev' })
+    const s = h.mem.contextFor()
+    assert.match(s, /## L1/)
+    assert.match(s, /## L3/)
+    assert.ok(!s.includes('tokenBudget 生效'), '无预算不应裁剪')
+  } finally {
+    h.cleanup()
+  }
+})
+
+test('2026-11-04 contextFor 小预算触发裁剪且可见标记', () => {
+  const h = harness()
+  try {
+    for (const i of [1, 2, 3]) h.mem.add({ layer: 'L1', content: `偏好条目${i} ${'x'.repeat(80)}`, by: 'user' })
+    for (const i of [1, 2, 3]) h.mem.add({ layer: 'L3', content: `项目条目${i} ${'y'.repeat(80)}`, by: 'dev' })
+    const full = h.mem.contextFor()
+    const trimmed = h.mem.contextFor({ tokenBudget: 40 })
+    assert.ok(trimmed.length < full.length, '小预算应产出更短的注入文本')
+    assert.match(trimmed, /tokenBudget 生效/, '裁剪必须可见（不静默）')
+  } finally {
+    h.cleanup()
+  }
+})
+
+test('2026-11-04 contextFor 预算极小时 L3（最高优先级）优先保留，L1 被丢弃', () => {
+  const h = harness({ persona: ['人格P'] })
+  try {
+    h.mem.add({ layer: 'L1', content: '用户偏好 ' + 'a'.repeat(200), by: 'user' })
+    h.mem.add({ layer: 'L3', content: '项目key ' + 'b'.repeat(200), by: 'dev' })
+    const s = h.mem.contextFor({ tokenBudget: 120 })
+    assert.ok(s.includes('L3'), '必须保留最高优先级的 L3')
+    assert.ok(!s.includes('用户偏好'), '低优先级的 L1 应被丢弃')
+    assert.match(s, /tokenBudget 生效/)
+  } finally {
+    h.cleanup()
+  }
+})
+
+test('2026-11-04 contextFor 预算极小时 L0 人格永不丢弃', () => {
+  const h = harness({ persona: ['人格必留'] })
+  try {
+    h.mem.add({ layer: 'L1', content: '偏好 ' + 'x'.repeat(200), by: 'user' })
+    h.mem.add({ layer: 'L2', content: '全局 ' + 'y'.repeat(200), by: 'user' })
+    h.mem.add({ layer: 'L3', content: '项目 ' + 'z'.repeat(200), by: 'user' })
+    const s = h.mem.contextFor({ tokenBudget: 80 })
+    assert.ok(s.includes('人格必留'), 'L0 人格永不丢弃（即使优先级最低）')
+  } finally {
+    h.cleanup()
+  }
+})
+
+test('2026-11-04 stats 提供按层 token 估算（token 计量）', () => {
+  const h = harness()
+  try {
+    h.mem.add({ layer: 'L1', content: '用户偏好：中文交流', by: 'user' })
+    h.mem.add({ layer: 'L3', content: '项目：零依赖插件', by: 'dev' })
+    const st = h.mem.stats()
+    assert.ok(st.tokens, 'stats 应含 tokens 段')
+    assert.ok(st.tokens.byLayer, '应有按层 token 估算')
+    assert.ok(st.tokens.byLayer.L1 > 0, 'L1 应有 token 估算')
+    assert.ok(st.tokens.injectedEstimate >= 0, '应给出注入总量估算')
+  } finally {
+    h.cleanup()
+  }
+})
+
+// ── 2026-11-04 测试回归 ─────────────────────────────────────────────────────
+// 🔴 P1-3：list/search 之前不按 botId 过滤 ⇒ Bot 私有记忆对任何 API 调用者可见
+//   （与「只在那个 Bot 的 contextFor 里出现」的注释自相矛盾）。
+
+test('2026-11-04 P1-3：list 默认不含 Bot 私有记忆', () => {
+  const h = harness()
+  try {
+    h.mem.add({ layer: 'L1', content: '全局记忆', by: 'user' })
+    h.mem.add({ layer: 'L1', content: 'Bot私有记忆', by: 'user', botId: 'bot-x' })
+    const rows = h.mem.list()
+    assert.ok(rows.some((r) => r.content === '全局记忆'))
+    assert.ok(!rows.some((r) => r.content === 'Bot私有记忆'), '默认 list 不应泄露 bot 私有记忆')
+  } finally {
+    h.cleanup()
+  }
+})
+
+test('2026-11-04 P1-3：list 传 botId 才返回该 Bot 的私有记忆', () => {
+  const h = harness()
+  try {
+    h.mem.add({ layer: 'L1', content: '全局记忆', by: 'user' })
+    h.mem.add({ layer: 'L1', content: 'Bot私有记忆', by: 'user', botId: 'bot-x' })
+    const rows = h.mem.list({ botId: 'bot-x' })
+    assert.ok(rows.some((r) => r.content === 'Bot私有记忆'))
+    assert.ok(!rows.some((r) => r.content === '全局记忆'), '指定 botId 时只返回该 Bot 的记忆')
+  } finally {
+    h.cleanup()
+  }
+})
+
+test('2026-11-04 P1-3：search 同样按 botId 过滤（不泄露）', () => {
+  const h = harness()
+  try {
+    h.mem.add({ layer: 'L1', content: 'pnpm 是包管理器', by: 'user' })
+    h.mem.add({ layer: 'L1', content: 'pnpm 私有偏好', by: 'user', botId: 'bot-y' })
+    const hits = h.mem.search({ query: 'pnpm' })
+    assert.ok(!hits.some((r) => r.content === 'pnpm 私有偏好'), 'search 不应泄露 bot 私有记忆')
+    const owned = h.mem.search({ query: 'pnpm', botId: 'bot-y' })
+    assert.ok(owned.some((r) => r.content === 'pnpm 私有偏好'))
+  } finally {
+    h.cleanup()
+  }
+})
+
+// ── 2026-11-04 测试回归 ─────────────────────────────────────────────────────
+// 🔴 P1-2：split 标记之前只挂在返回克隆上，读回来（list/search/replay）就丢失，
+//   切分状态"不可持久、不可审计"。现在 splitGroup/splitIndex/splitTotal 写进每条 entry。
+
+test('2026-11-04 P1-2：超长记忆切分标记读回不丢失且可无损还原', () => {
+  const h = harness({ entryMax: 100, splitOnOverflow: true })
+  try {
+    const big = '一'.repeat(250) // 250 码点 > 100 ⇒ 切分
+    const added = h.mem.add({ layer: 'L4', content: big, by: 'user' })
+    assert.equal(added.split, true)
+    const rows = h.mem.list({ layer: 'L4' })
+    assert.ok(rows.length >= 2, `应切分为多条，实际 ${rows.length}`)
+    // split 元数据必须持久化
+    for (const r of rows) {
+      assert.ok(r.splitGroup, `splitGroup 应持久化（id=${r.id}）`)
+      assert.equal(r.splitTotal, rows.length)
+    }
+    // 无损还原
+    const joined = rows.sort((a, b) => a.splitIndex - b.splitIndex).map((r) => r.content).join('')
+    assert.equal(joined, big, '切分后必须无损还原原文')
+  } finally {
+    h.cleanup()
+  }
+})
+
+test('2026-11-04 P1-2：replay 后 split 标记仍可读', () => {
+  const h = harness({ entryMax: 100, splitOnOverflow: true })
+  try {
+    h.mem.add({ layer: 'L4', content: '二'.repeat(250), by: 'user' })
+    const created = h.mem.list({ layer: 'L4' })
+    // 重新构造一个实例（模拟重启）
+    const mem2 = createMemory({}, { stateDir: h.stateDir, entryMax: 100, splitOnOverflow: true })
+    const replayed = mem2.list({ layer: 'L4' })
+    assert.equal(replayed.length, created.length)
+    assert.ok(replayed.some((r) => r.splitGroup), 'replay 后 splitGroup 应仍在')
+    mem2.dispose?.()
+  } finally {
+    h.cleanup()
+  }
+})

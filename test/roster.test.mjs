@@ -587,3 +587,23 @@ test('装配：状态目录不可写 → durable=false 降级（不阻塞），�
   assert.deepEqual(roster.constants.PERMISSIONS, ['read-only', 'workspace-write', 'full'])
   assert.equal(roster.constants.DEFAULT_PERMISSION, 'workspace-write')
 })
+
+// ── 2026-11-04 测试回归 ─────────────────────────────────────────────────────
+// 🔴 P0-1：getProfile 引用了不存在的 `index` 变量 ⇒ 每次调用必然 ReferenceError
+//   （HTTP 400 `API_ERROR: index is not defined`），Bot 档案抽屉打开即报错。
+
+test('2026-11-04 P0-1：getProfile 不崩溃且返回档案（修复 index is not defined）', async (t) => {
+  const h = setup(t)
+  const bot = await seed(h.roster, h.ws)
+  const got = h.roster.getProfile(bot.id)
+  assert.equal(got.bot.id, bot.id)
+  assert.equal(typeof got, 'object')
+})
+
+test('2026-11-04 P0-1：getProfile 对不存在的 Bot 抛 ROSTER_BOT_NOT_FOUND', (t) => {
+  const h = setup(t)
+  assert.throws(
+    () => h.roster.getProfile('bot-does-not-exist'),
+    (e) => e instanceof RosterError && e.code === 'ROSTER_BOT_NOT_FOUND',
+  )
+})

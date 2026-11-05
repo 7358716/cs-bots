@@ -58,7 +58,14 @@ import {
   writeJsonAtomic,
 } from './store.js'
 import * as kernel from './kernel.js'
-import { normalizeProfile, writeAgentsFile, readAgentsFile, writeSkill } from './botprofile.js'
+import {
+  normalizeProfile,
+  writeAgentsFile,
+  readAgentsFile,
+  writeSkill,
+  listSkills,
+  importMemoryToProfile,
+} from './botprofile.js'
 
 // ── 常量 ────────────────────────────────────────────────────────────────────
 
@@ -75,7 +82,21 @@ const MAX_LABEL = 24
 /** 租约缺省 TTL（ms），与 board 的 300s 对齐。 */
 const DEFAULT_LEASE_MS = 300_000
 /** 事件动作集合（审计流可枚举）。 */
-const ACTIONS = ['create', 'rename', 'retire', 'set_cwd', 'claim', 'release', 'heartbeat', 'lease_expired']
+const ACTIONS = [
+  'create',
+  'rename',
+  'retire',
+  'set_cwd',
+  'claim',
+  'release',
+  'heartbeat',
+  'lease_expired',
+  // v2 档案增强：三种「改档案」的入口各自留痕，避免审计流里只能看到一条笼统的 profile_updated
+  // （排查「这条记忆谁加进来的」「技能怎么关联上的」时，动作名是第一手证据）。
+  'profile_updated',
+  'profile_memory_added',
+  'profile_skills_linked',
+]
 
 // ── 错误 ────────────────────────────────────────────────────────────────────
 
@@ -552,6 +573,33 @@ export function createRoster(ctx, config = {}) {
   }
 
   /**
+   * 按**会话 id** 判定「这个会话是不是本平台注册的 Bot」（含已退役）。
+   *
+   * 为什么需要（2026-11-04，复杂度路由 P3-fix）：宿主 `llm/stream` 请求里**只有
+   * `sessionId`**，而注册表的主键是 `botId`。路由要区分「主对话」（人类会话 ⇒ 平台层
+   * 注入 paid_allowed）与「Bot 会话」（子智能体 ⇒ 默认 free_only），就必须有这条查询。
+   *
+   * 为什么按 `sessionId` **字段**匹配而不是 `bots.get(id)`：`create()` 里宿主可能把
+   * 请求的 sessionId 改写成别的值（`pickSessionId` 已按「以宿主返回为准」处理并留档），
+   * 拿 botId 当键查会在这种情形下漏判。
+   *
+   * 为什么包含退役 Bot：退役只释放名字与槽位，**会话本身还在宿主编排里把手上的活干完**，
+   * 这段时间它仍是子智能体 —— 按主对话给付费授权属于越权。
+   *
+   * 纯读、**不抛**（非法入参返回 false）。
+   *
+   * @param {string} sessionId
+   * @returns {boolean}
+   */
+  function hasSession(sessionId) {
+    if (typeof sessionId !== 'string' || sessionId === '') return false
+    for (const b of bots.values()) {
+      if (b?.sessionId === sessionId) return true
+    }
+    return false
+  }
+
+  /**
    * 注册表统计。
    * 口径说明：`total` = **含 retired 的全部 Bot**；`byState` 是全部状态的分布；
    * `retired` 单独给一份便于「还活着几个」直接取用（= `total - retired`）。
@@ -790,7 +838,10 @@ export function createRoster(ctx, config = {}) {
    */
   function getProfile(id) {
     const bid = requireString(id, 'id', 'getProfile')
-    const bot = index.get(bid)
+    // ⚠️ 修复（2026-11-04 测试）：原为 `index.get(bid)` —— 本函数作用域内只有
+    //   `bots` Map，没有 `index` ⇒ 每次调用必然 ReferenceError（HTTP 400
+    //   `API_ERROR: index is not defined`），Bot 档案抽屉打开即报错。
+    const bot = bots.get(bid)
     if (!bot) {
       throw new RosterError(`roster.getProfile：Bot ${bid} 不存在`, 'ROSTER_BOT_NOT_FOUND', { id: bid })
     }
@@ -807,57 +858,231 @@ export function createRoster(ctx, config = {}) {
   }
 
   /**
-   * 改一个 Bot 的档案（身份/经验/技能/预制记忆）→ 重写 AGENTS.md 托管段。
+   * 退役 Bot 不可改档案 —— 三个改档案入口（setProfile / addProfileMemory / linkSkills）
+   * 共用同一守卫：**同一语义只有一处判定**，否则日后加新入口时漏一个就会给退役 Bot 改档案。
    *
-   * **只动托管段**，用户在 AGENTS.md 段外写的内容原样保留。
-   * @param {{ id: string, profile: object, byId?: string, expectedRev?: number, now?: number }} input
+   * 错误码沿用 setProfile 既有的 `ROSTER_BOT_RETIRED`（不是 assertNotRetired 的
+   * `ROSTER_RETIRED`）：API 层与 UI 已按前者识别「退役导致不可改档案」，改码会让提示退化成通用错误。
+   *
+   * @param {object} current
+   * @param {string} action
    */
-  function setProfile(input = {}) {
-    const { id, profile, byId, now } = input ?? {}
-    const current = loadForCas(input, 'setProfile')
-    const by = requireString(byId, 'byId', 'setProfile')
+  function assertProfileEditable(current, action) {
     if (current.state === 'retired') {
       throw new RosterError(
-        `roster.setProfile：Bot ${current.id} 已退役（名字 ${current.name}）——退役 Bot 不可改档案`,
+        `roster.${action}：Bot ${current.id} 已退役（名字 ${current.name}）——退役 Bot 不可改档案`,
         'ROSTER_BOT_RETIRED',
         { id: current.id },
       )
     }
-    const nextProfile = { ...(current.profile ?? {}), ...normalizeProfile(profile) }
+  }
 
-    // 先落盘，成功再记事件（避免"记录说改了但文件没变"）
+  /**
+   * 把档案写进 AGENTS.md（受管区块），并给**缺失的**技能补一个骨架 SKILL.md。
+   *
+   * 为什么抽成一个函数：setProfile / addProfileMemory / linkSkills 三条入口必须**同一套落盘口径**。
+   * 复制三份的下场是「同一种档案，三个入口写出三种 AGENTS.md」——历史上已经吃过一次
+   * （getProfile 引用了不存在的 index 变量，单点 bug 让整个抽屉打不开）。
+   *
+   * 为什么技能骨架只在文件缺失时补：已存在的 SKILL.md 里可能是用户/模型写好的正文，
+   * 旧实现无条件覆盖成骨架，等于每次存档案就静默删掉一次技能内容（数据损失且无提示）。
+   *
+   * @param {object} current Bot 记录（只读 cwd / name / preset）
+   * @param {object} profile 归一后的档案
+   * @param {string} where 错误信息里的动作名
+   * @param {{ strictSkills?: boolean }} [options] strictSkills=true → 技能落盘失败即抛错
+   * @returns {{ path: string }} writeAgentsFile 的返回
+   */
+  function writeProfileFiles(current, profile, where, options = {}) {
     let written
     try {
       written = writeAgentsFile(current.cwd, {
-        ...nextProfile,
+        ...profile,
         botName: current.name,
         preset: current.preset,
       })
-      for (const skillName of nextProfile.skills ?? []) {
-        try {
-          writeSkill(current.cwd, skillName, { body: `# ${skillName}\n\n（在此写技能说明）` })
-        } catch (error) {
-          warn(`[cs-bots/roster] 技能 ${skillName} 落盘失败：${error?.message ?? error}`)
-        }
-      }
     } catch (error) {
       throw new RosterError(
-        `roster.setProfile：写 AGENTS.md 失败（cwd=${current.cwd}）→ ${error?.message ?? error}`,
+        `roster.${where}：写 AGENTS.md 失败（cwd=${current.cwd}）→ ${error?.message ?? error}`,
         'ROSTER_PROFILE_WRITE_FAILED',
         { id: current.id, cwd: current.cwd, cause: String(error?.message ?? error) },
       )
     }
 
-    const at = normalizeNow(now, 'setProfile')
+    let present = new Set()
+    try {
+      present = new Set(listSkills(current.cwd))
+    } catch (error) {
+      // 列技能失败不阻塞：下一步 writeSkill 会给出带 code 的真实失败原因
+      warn(`[cs-bots/roster] 列技能失败（${current.cwd}）：${error?.message ?? error}`)
+    }
+    for (const skillName of profile.skills ?? []) {
+      if (present.has(skillName)) continue
+      try {
+        writeSkill(current.cwd, skillName, { body: `# ${skillName}\n\n（在此写技能说明）` })
+      } catch (error) {
+        if (options.strictSkills) {
+          // 技能名非法与写盘失败要给不同 code：前者是调用方参数错（改参数即可），后者是环境问题
+          const badName = error?.code === 'PROFILE_BAD_SKILL_NAME'
+          throw new RosterError(
+            `roster.${where}：技能 ${JSON.stringify(skillName)} 落盘失败 → ${error?.message ?? error}`,
+            badName ? 'ROSTER_BAD_SKILL_NAME' : 'ROSTER_SKILL_WRITE_FAILED',
+            {
+              id: current.id,
+              cwd: current.cwd,
+              skill: skillName,
+              causeCode: error?.code,
+              cause: String(error?.message ?? error),
+            },
+          )
+        }
+        // 非显式技能操作（setProfile 顺带补骨架）失败只降级 warn：
+        // AGENTS.md 已写成功，档案本身有效，缺一个骨架文件不该让整次保存失败。
+        warn(`[cs-bots/roster] 技能 ${skillName} 落盘失败（不影响档案）：${error?.message ?? error}`)
+      }
+    }
+    return written
+  }
+
+  /**
+   * 档案变更的统一收尾：rev+1 + 审计字段 + 提交事件。
+   *
+   * @param {object} current
+   * @param {object} nextProfile
+   * @param {string} by
+   * @param {number} at
+   * @param {{ path: string }} written
+   * @param {string} action
+   * @returns {object} 变更后的 Bot（克隆）
+   */
+  function commitProfileChange(current, nextProfile, by, at, written, action = 'profile_updated') {
     const before = clone(current)
     const next = clone(current)
     next.profile = nextProfile
     next.profilePath = written.path
-    delete next.profileError
+    delete next.profileError // 落盘成功即清掉历史失败标记，否则记录会永远带着一条过期错误
     next.rev = current.rev + 1
     next.updatedAt = at
     next.updatedBy = by
-    return commit(current.id, 'profile_updated', by, at, before, next)
+    return commit(current.id, action, by, at, before, next)
+  }
+
+  /**
+   * 改一个 Bot 的档案（身份/经验/技能/预制记忆 + v2 的 title/persona/boundaries/disciplineIds）
+   * → 重写 AGENTS.md 托管段。
+   *
+   * **只动托管段**，用户在 AGENTS.md 段外写的内容原样保留。
+   *
+   * 语义是**浅合并**：`{ ...旧档案, ...归一后的新档案 }`。故传 `{ persona: '...' }`
+   * 不会清掉 identity —— 想清空某个字段传空串（`''` 会被 takeText 接受）；
+   * 想整份替换请先 `get()` 再传完整对象（UI 的档案抽屉就是这么做的）。
+   *
+   * @param {{ id: string, profile: object, byId?: string, expectedRev?: number, now?: number }} input
+   */
+  function setProfile(input = {}) {
+    const { profile, byId, now } = input ?? {}
+    const current = loadForCas(input, 'setProfile')
+    const by = requireString(byId, 'byId', 'setProfile')
+    assertProfileEditable(current, 'setProfile')
+    const nextProfile = { ...(current.profile ?? {}), ...normalizeProfile(profile) }
+
+    // 先落盘，成功再记事件（避免"记录说改了但文件没变"）
+    const written = writeProfileFiles(current, nextProfile, 'setProfile')
+    const at = normalizeNow(now, 'setProfile')
+    return commitProfileChange(current, nextProfile, by, at, written)
+  }
+
+  /**
+   * 往 Bot 的预制记忆里**追加**一批条目（v2，DESIGN-v2 特性 ③）。
+   *
+   * 与 setProfile 的分工：setProfile 是「整份档案覆盖」，本函数是「只加记忆、别的不动」——
+   * 记忆是持续生长的（会话里捞到一条值得常驻的结论就顺手加进来），
+   * 让调用方每次先 get 再整份回写，等于把并发 CAS 的窗口人为拉长，容易互相覆盖。
+   *
+   * 去重、空白、超限的规则全在 `botprofile.importMemoryToProfile`（纯函数，可单独测）。
+   *
+   * 无新增（全是重复/空白）时**不写事件、不 bump rev**：审计流里一条「什么都没改」的记录
+   * 只会污染历史，而且调用方手里的 expectedRev 还能继续用，不必再 get() 一次。
+   *
+   * @param {{ id: string, entries: string[], dedup?: boolean, byId: string,
+   *           expectedRev: number, now?: number }} input
+   * @returns {{ bot: object, added: number, skipped: number }}
+   * @throws {RosterError} 不存在 / CAS 冲突 / 已退役 / 落盘失败
+   * @throws {ProfileError} 条目超长或总量超限（不静默截断）
+   */
+  function addProfileMemory(input = {}) {
+    const { entries, dedup, byId, now } = input ?? {}
+    const current = loadForCas(input, 'addProfileMemory')
+    const by = requireString(byId, 'byId', 'addProfileMemory')
+    assertProfileEditable(current, 'addProfileMemory')
+
+    const profile = current.profile ?? {}
+    const existing = Array.isArray(profile.memory) ? profile.memory : []
+    const merged = importMemoryToProfile({ existing, entries, dedup: dedup !== false })
+
+    if (merged.added === 0) {
+      return { bot: clone(current), added: 0, skipped: merged.skipped }
+    }
+
+    const nextProfile = { ...profile, memory: merged.memory }
+    const written = writeProfileFiles(current, nextProfile, 'addProfileMemory')
+    const at = normalizeNow(now, 'addProfileMemory')
+    const bot = commitProfileChange(current, nextProfile, by, at, written, 'profile_memory_added')
+    return { bot, added: merged.added, skipped: merged.skipped }
+  }
+
+  /**
+   * 把技能**关联**到 Bot：写进 `bot.profile.skills` 并落 `.agents/skills/<名>/SKILL.md`（v2）。
+   *
+   * 为什么是「并集」而不是「替换」：函数名是 link（关联），语义是**追加关联**；
+   * 已关联的技能不会被这次调用摘掉。要整体替换技能清单请用 setProfile({ skills })。
+   *
+   * 为什么技能文件写失败要抛错（strictSkills）：技能能被官方 `skills.list({ cwd })` 发现
+   * **全靠那个文件**；文件写不成却把名字记进 profile，等于给 Bot 一个「查无此技能」的悬空关联，
+   * 比直接报错更坏（模型会一直找不到技能却不知道为什么）。
+   *
+   * 已关联且文件都在时：不写事件、不 bump rev（幂等，允许 UI 重复点「关联」）。
+   *
+   * @param {{ id: string, skills: string[], byId: string, expectedRev: number, now?: number }} input
+   * @returns {object} 变更后的 Bot（无变更时返回当前记录）
+   * @throws {RosterError} 不存在 / CAS 冲突 / 已退役 / 技能名非法 / 落盘失败
+   */
+  function linkSkills(input = {}) {
+    const { skills, byId, now } = input ?? {}
+    const current = loadForCas(input, 'linkSkills')
+    const by = requireString(byId, 'byId', 'linkSkills')
+    assertProfileEditable(current, 'linkSkills')
+
+    if (!Array.isArray(skills) || skills.length === 0) {
+      throw new RosterError(
+        `roster.linkSkills：skills 必填且不能为空（收到 ${JSON.stringify(skills)}）——`
+        + '空数组没有可关联对象，多半是调用方漏传参数',
+        'ROSTER_BAD_FIELD',
+        { field: 'skills', where: 'linkSkills' },
+      )
+    }
+    // 复用档案校验口径（条数 / 单项长度），避免为「关联技能」另造一套规则后与 setProfile 分叉
+    const incoming = normalizeProfile({ skills }).skills ?? []
+
+    const profile = current.profile ?? {}
+    const existing = Array.isArray(profile.skills) ? profile.skills : []
+    const nextSkills = [...existing]
+    let changed = false
+    for (const name of incoming) {
+      if (nextSkills.includes(name)) continue
+      nextSkills.push(name)
+      changed = true
+    }
+
+    // 先落盘（AGENTS.md + 技能文件），成功再记事件
+    const nextProfile = { ...profile, skills: nextSkills }
+    const written = writeProfileFiles(current, nextProfile, 'linkSkills', { strictSkills: true })
+    if (!changed) {
+      // 技能清单没变（可能只是补写了缺失的技能文件）→ 不改 rev，调用方 CAS 继续有效
+      return clone(current)
+    }
+    const at = normalizeNow(now, 'linkSkills')
+    return commitProfileChange(current, nextProfile, by, at, written, 'profile_skills_linked')
   }
 
   function setCwd(input = {}) {
@@ -1090,11 +1315,15 @@ export function createRoster(ctx, config = {}) {
     get,
     list,
     listRetired,
+    hasSession,
     rename,
     retire,
     setCwd,
     getProfile,
     setProfile,
+    // v2 档案增强（DESIGN-v2 特性 ③）：追加预制记忆 / 关联技能（都走 CAS）
+    addProfileMemory,
+    linkSkills,
     claim,
     release,
     heartbeat,

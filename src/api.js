@@ -16,12 +16,24 @@ import { registerRoute, listPresets, defaultPreset } from './kernel.js'
 import { createLibrary } from './library.js'
 import { createDirBrowser } from './dirbrowse.js'
 import { getServices } from './registry.js'
+import { createFence } from './fence.js'
 
 /** 请求体上限（防大包打爆内存）。 */
 const MAX_BODY = 2 * 1024 * 1024
 
 /** API 前缀。 */
 export const API_BASE = '/cs-bots/api'
+
+/**
+ * 页面操作者身份。
+ * 域服务用 `'user'` 表示「人类所有者 = 超级管理员」（见 room.js 的 USER 常量）。
+ * 之前 API 传的是 `'ui'`，导致房间设置页一改就 `ROOM_NOT_MEMBER` —— 人类反而没权限。
+ */
+const OWNER = 'user'
+
+/** 纪律层级与分类（前端下拉直接用，避免两边写死不一致）。 */
+const DISCIPLINE_SCOPES = ['global', 'workspace', 'room', 'bot']
+const DISCIPLINE_KINDS = ['rule', 'requirement', 'principle', 'style']
 
 /** 读请求体（JSON）。 */
 async function readBody(request) {
@@ -110,6 +122,71 @@ function seedBotMemory(services, bot, by) {
 }
 
 /**
+ * 把一条建议**真正写进目标域**（建议确认制的"采纳"落地）。
+ *
+ * 为什么放在 api 层而不是 suggest.js：`suggest.js` 刻意不 import memory/library/discipline，
+ * 避免循环依赖与越界写入。真正的写库动作由调用方以回调注入 —— 就是这里。
+ *
+ * 任一步抛错都会向上抛：`suggest.accept` 收到异常后会把该条**保持 pending**
+ * 并记 `lastError`，绝不静默标记成"已采纳"。
+ *
+ * @param {object} services
+ * @param {{ kind: string, layer?: string, payload?: object }} suggestion
+ * @param {string} by
+ */
+function applySuggestion(services, suggestion, by) {
+  const kind = suggestion?.kind
+  const payload = suggestion?.payload ?? {}
+
+  // ⚠️ 必须是**同步**函数：suggest.accept 的 apply 回调若返回 Promise，
+  //   它会在真正落库前就把状态标成 accepted（假采纳）。而这里要写的三个域服务
+  //   （memory / library / discipline）全部是同步内存写 + 同步落盘，所以可以同步完成。
+  const need = (key) => {
+    const svc = services?.[key]
+    if (!svc) {
+      const error = new Error(`${key} 服务未装配，无法落地这条建议`)
+      error.code = `${String(key).toUpperCase()}_UNAVAILABLE`
+      throw error
+    }
+    return svc
+  }
+
+  if (kind === 'memory') {
+    const entry = need('memory').add({
+      layer: suggestion.layer ?? payload.layer ?? 'L4',
+      content: payload.content,
+      tags: payload.tags,
+      by,
+      cwd: payload.cwd,
+    })
+    return { kind, id: Array.isArray(entry) ? entry[0]?.id : entry?.id }
+  }
+  if (kind === 'skill') {
+    const skill = need('library').createSkill({
+      name: payload.name,
+      description: payload.description,
+      body: payload.body,
+      tags: payload.tags,
+      by,
+    })
+    return { kind, id: skill?.id }
+  }
+  if (kind === 'discipline') {
+    const item = need('discipline').createDiscipline({
+      scope: payload.scope,
+      scopeId: payload.scopeId,
+      kind: payload.disciplineKind ?? payload.kind ?? 'rule',
+      title: payload.title,
+      content: payload.content,
+      priority: payload.priority,
+      by,
+    })
+    return { kind, id: item?.id }
+  }
+  throw new Error(`applySuggestion：未知建议类型 ${JSON.stringify(kind)}（拒绝静默忽略）`)
+}
+
+/**
  * 注册全部 API 路由。
  *
  * @param {object} ctx 宿主上下文
@@ -117,8 +194,20 @@ function seedBotMemory(services, bot, by) {
  * @returns {(() => void) | undefined} disposer
  */
 export function installApi(ctx, { warn } = {}) {
+  // ⚠️ 修复（2026-11-04 测试，P0）：此前本 API **完全没有鉴权**——
+  //   公网 `curl -X POST http://<IP>/cs-bots/api/tasks` 直接 200，
+  //   任何人都能建任务/改记忆/写房间/改 Bot 注册表，并借此绕过下游的受保护区写闸门。
+  //   现在所有请求先过 fence.judgeHttp：宿主不认证就一律 403。
+  const fence = createFence({ ctx, warn })
+
   const handler = async (request, response) => {
     const services = getServices(ctx)
+    // 鉴权先于一切业务逻辑（连 URL 解析都不做，避免攻击面）
+    const verdict = fence.judgeHttp(request)
+    if (!verdict.ok) {
+      sendJson(response, verdict.status ?? 403, { ok: false, reason: verdict.reason ?? 'unauthorized' })
+      return
+    }
     let url
     try {
       url = new URL(request.url || '/', 'http://localhost')
@@ -133,7 +222,13 @@ export function installApi(ctx, { warn } = {}) {
       // ── 读：状态总览 ──────────────────────────────────────────────────────
       if (request.method === 'GET' && path === '/status') {
         const out = { ok: true, services: {}, compat: services.compat ?? null }
-        for (const key of ['roster', 'board', 'dispatcher', 'room', 'memory']) {
+        // 状态面要覆盖**全部**域服务：新增模块若不上报，页面「系统体检」就会
+        // 显示「一切正常」而实际某功能没装配 —— 那是本平台最忌讳的静默失败。
+        const SERVICE_KEYS = [
+          'roster', 'board', 'dispatcher', 'room', 'memory',
+          'library', 'discipline', 'todo', 'scratch', 'prompts', 'suggest', 'reviewer',
+        ]
+        for (const key of SERVICE_KEYS) {
           const svc = services[key]
           out.services[key] = svc
             ? {
@@ -317,7 +412,10 @@ export function installApi(ctx, { warn } = {}) {
 
       // ── 房间 ──────────────────────────────────────────────────────────────
       if (request.method === 'GET' && path === '/rooms') {
-        const rooms = await withService(services, 'room', (r) => r.list())
+        // includeArchived=1 时连归档房一起返回（超级管理员的"回收站"视图）
+        const rooms = await withService(services, 'room', (r) =>
+          r.list({ includeArchived: qp(url, 'includeArchived') === '1' }),
+        )
         sendJson(response, 200, { ok: true, rooms })
         return
       }
@@ -338,7 +436,12 @@ export function installApi(ctx, { warn } = {}) {
           return
         }
         const messages = await withService(services, 'room', (r) =>
-          r.listMessages({ roomId, sinceSeq: qn(url, 'sinceSeq'), limit: qn(url, 'limit') }),
+          r.listMessages({
+            roomId,
+            sinceSeq: qn(url, 'sinceSeq'),
+            limit: qn(url, 'limit'),
+            withBody: qp(url, 'withBody') === '1',
+          }),
         )
         sendJson(response, 200, { ok: true, messages })
         return
@@ -369,9 +472,23 @@ export function installApi(ctx, { warn } = {}) {
       if (request.method === 'GET' && path === '/memory') {
         const layer = qp(url, 'layer')
         const query = qp(url, 'query')
+        const botId = qp(url, 'botId')
         const entries = await withService(services, 'memory', (m) =>
-          query ? m.search({ query, layers: layer ? [layer] : undefined, limit: qn(url, 'limit') })
-                : m.list({ layer, limit: qn(url, 'limit') }),
+          query ? m.search({
+              query,
+              layers: layer ? [layer] : undefined,
+              limit: qn(url, 'limit'),
+              botId,
+              includeArchived: qp(url, 'includeArchived') === '1',
+            })
+                : m.list({
+              layer,
+              limit: qn(url, 'limit'),
+              botId,
+              cwd: qp(url, 'cwd'),
+              includeArchived: qp(url, 'includeArchived') === '1',
+              onlyArchived: qp(url, 'onlyArchived') === '1',
+            }),
         )
         sendJson(response, 200, { ok: true, entries })
         return
@@ -386,8 +503,18 @@ export function installApi(ctx, { warn } = {}) {
         return
       }
 
+      if (request.method === 'GET' && path === '/memory/stats') {
+        const stats = await withService(services, 'memory', (m) => m.stats())
+        sendJson(response, 200, { ok: true, stats })
+        return
+      }
+
       if (request.method === 'GET' && path === '/memory/context') {
-        const text = await withService(services, 'memory', (m) => m.contextFor({ branch: qp(url, 'branch') }))
+        // cwd：按项目裁剪注入内容（不传＝全局口径，与改造前逐字一致）
+        const text = await withService(services, 'memory', (m) => m.contextFor({
+          branch: qp(url, 'branch'),
+          cwd: qp(url, 'cwd'),
+        }))
         sendJson(response, 200, { ok: true, text })
         return
       }
@@ -438,6 +565,17 @@ export function installApi(ctx, { warn } = {}) {
           })
         }
         sendJson(response, 200, { ok: true, task, wake })
+        return
+      }
+
+      if (request.method === 'POST' && path === '/tasks/expire-leases') {
+        // ⚠️ 修复（2026-11-04 测试，P1-4）：expireLeases 之前无任何调用者，
+        //   owner 崩溃/失联后任务永久停在 in_progress。现在通过 API 暴露回收能力。
+        const body = (await readBody(request)) ?? {}
+        const recycled = await withService(services, 'board', (b) =>
+          b.expireLeases({ now: Number.isFinite(body.now) ? body.now : undefined }),
+        )
+        sendJson(response, 200, { ok: true, recycled, note: recycled.length ? `回收了 ${recycled.length} 个过期任务` : '没有过期租约需要回收' })
         return
       }
 
@@ -640,14 +778,28 @@ export function installApi(ctx, { warn } = {}) {
       }
 
       // ── 设置 ──────────────────────────────────────────────────────────────
+      // ⚠️ 修复（2026-11-04 测试）：
+      //   ① GET 之前只返回 services.settings（启动时一次性加载的内存副本）⇒
+      //      「保存后立刻 GET 却看不到新值」的假象（磁盘上其实已写对）。
+      //      现改为：`saved` 永远来自磁盘（真相源），`effective` 才是运行时内存值。
+      //   ② POST 之前只回 saved.values，调用方无法区分「写进去的」与「当前生效的」⇒
+      //      现补 `effective` 与 `persisted` 两个字段，让 UI 能如实标注。
       if (request.method === 'GET' && path === '/settings') {
-        const { SETTING_SPECS } = await import('./settings.js')
+        const { SETTING_SPECS, loadSettings } = await import('./settings.js')
+        const dir = services.board?.paths?.stateDir ?? services.roster?.paths?.stateDir
+        const disk = dir ? loadSettings(dir) : { values: {}, diagnostics: { file: '', source: 'unknown', badKeys: [] } }
         sendJson(response, 200, {
           ok: true,
-          values: services.settings ?? {},
+          values: disk.values,
+          saved: disk.values,
+          effective: services.settings ?? {},
           specs: SETTING_SPECS,
-          diagnostics: services.settingsDiagnostics,
-          baseDir: services.board?.paths?.stateDir ?? services.roster?.paths?.stateDir,
+          diagnostics: disk.diagnostics,
+          baseDir: dir,
+          note: Object.keys(disk.values).length
+            && JSON.stringify(disk.values) !== JSON.stringify(services.settings ?? {})
+            ? '磁盘值与内存生效值不同：内核级参数需重启 DSH 才生效'
+            : undefined,
         })
         return
       }
@@ -664,6 +816,9 @@ export function installApi(ctx, { warn } = {}) {
         sendJson(response, 200, {
           ok: true,
           values: saved.values,
+          saved: saved.values,
+          effective: services.settings ?? {},
+          persisted: true,
           note: '已写入 settings.json；内核级参数需重启 DSH 生效',
         })
         return
@@ -683,6 +838,526 @@ export function installApi(ctx, { warn } = {}) {
           d.list({ target: qp(url, 'target'), limit: qn(url, 'limit') ?? 100 }),
         )
         sendJson(response, 200, { ok: true, wakes })
+        return
+      }
+
+
+      // ══════════════════════════════════════════════════════════════════════
+      // v2 新增端点（2026-11-04，五大功能）
+      // ══════════════════════════════════════════════════════════════════════
+
+      // ── 特性①：房间超级管理员 ────────────────────────────────────────────
+      if (request.method === 'POST' && path === '/rooms/archive') {
+        const body = (await readBody(request)) ?? {}
+        const room = await withService(services, 'room', (r) =>
+          r.archiveRoom({ ...body, byId: body.byId ?? OWNER }),
+        )
+        sendJson(response, 200, { ok: true, room })
+        return
+      }
+      if (request.method === 'POST' && path === '/rooms/unarchive') {
+        const body = (await readBody(request)) ?? {}
+        const room = await withService(services, 'room', (r) =>
+          r.unarchiveRoom({ ...body, byId: body.byId ?? OWNER }),
+        )
+        sendJson(response, 200, { ok: true, room })
+        return
+      }
+      if (request.method === 'POST' && path === '/rooms/remove') {
+        const body = (await readBody(request)) ?? {}
+        const result = await withService(services, 'room', (r) =>
+          r.removeRoom({ ...body, byId: body.byId ?? OWNER }),
+        )
+        sendJson(response, 200, { ok: true, result })
+        return
+      }
+      if (request.method === 'POST' && path === '/rooms/member-role') {
+        const body = (await readBody(request)) ?? {}
+        const room = await withService(services, 'room', (r) =>
+          r.setMemberRole({ ...body, byId: body.byId ?? OWNER }),
+        )
+        sendJson(response, 200, { ok: true, room })
+        return
+      }
+      if (request.method === 'POST' && path === '/rooms/kick') {
+        const body = (await readBody(request)) ?? {}
+        const room = await withService(services, 'room', (r) =>
+          r.kickMember({ ...body, byId: body.byId ?? OWNER }),
+        )
+        sendJson(response, 200, { ok: true, room })
+        return
+      }
+
+      // ── 特性②：分级纪律体系 ──────────────────────────────────────────────
+      if (request.method === 'GET' && path === '/disciplines') {
+        const items = await withService(services, 'discipline', (d) => d.listDisciplines({
+          scope: qp(url, 'scope'),
+          scopeId: qp(url, 'scopeId'),
+          kind: qp(url, 'kind'),
+          query: qp(url, 'query'),
+          enabled: qp(url, 'enabled') === undefined ? undefined : qp(url, 'enabled') === '1',
+        }))
+        sendJson(response, 200, { ok: true, items, scopes: DISCIPLINE_SCOPES, kinds: DISCIPLINE_KINDS })
+        return
+      }
+      if (request.method === 'POST' && path === '/disciplines') {
+        const body = (await readBody(request)) ?? {}
+        const item = await withService(services, 'discipline', (d) =>
+          d.createDiscipline({ ...body, by: body.by ?? OWNER }),
+        )
+        sendJson(response, 200, { ok: true, item })
+        return
+      }
+      if (request.method === 'POST' && path === '/disciplines/update') {
+        const body = (await readBody(request)) ?? {}
+        const item = await withService(services, 'discipline', (d) =>
+          d.updateDiscipline({ ...body, by: body.by ?? OWNER }),
+        )
+        sendJson(response, 200, { ok: true, item })
+        return
+      }
+      if (request.method === 'POST' && path === '/disciplines/remove') {
+        const body = (await readBody(request)) ?? {}
+        const result = await withService(services, 'discipline', (d) =>
+          d.removeDiscipline({ id: body.id, expectedRev: body.expectedRev, by: body.by ?? OWNER }),
+        )
+        sendJson(response, 200, { ok: true, result })
+        return
+      }
+      if (request.method === 'POST' && path === '/disciplines/import') {
+        const body = (await readBody(request)) ?? {}
+        const result = await withService(services, 'discipline', (d) =>
+          d.importDisciplines({ items: body.items ?? [], mode: body.mode, by: body.by ?? OWNER }),
+        )
+        sendJson(response, 200, { ok: true, result })
+        return
+      }
+      // 合并预览：给定 bot/cwd/room，看"这个对象实际会看到哪些纪律"
+      if (request.method === 'GET' && path === '/disciplines/resolve') {
+        const resolved = await withService(services, 'discipline', (d) => d.resolveDisciplines({
+          botId: qp(url, 'botId'),
+          cwd: qp(url, 'cwd'),
+          roomId: qp(url, 'roomId'),
+        }))
+        sendJson(response, 200, { ok: true, ...resolved })
+        return
+      }
+      if (request.method === 'GET' && path === '/disciplines/preview') {
+        const resolved = await withService(services, 'discipline', (d) => d.renderDisciplinePrompt({
+          botId: qp(url, 'botId'),
+          cwd: qp(url, 'cwd'),
+          roomId: qp(url, 'roomId'),
+          tokenBudget: qn(url, 'tokenBudget'),
+        }))
+        sendJson(response, 200, { ok: true, ...resolved })
+        return
+      }
+
+      // ── 特性③：Bot 档案增强（导入记忆 / 关联技能）────────────────────────
+      if (request.method === 'POST' && path === '/roster/profile/memory') {
+        const body = (await readBody(request)) ?? {}
+        if (!body.id) {
+          sendJson(response, 400, { ok: false, reason: 'id 必填' })
+          return
+        }
+        const out = await withService(services, 'roster', (r) =>
+          r.addProfileMemory({
+            id: body.id,
+            entries: body.entries ?? [],
+            dedup: body.dedup !== false,
+            byId: body.byId ?? OWNER,
+            expectedRev: body.expectedRev,
+          }),
+        )
+        sendJson(response, 200, { ok: true, ...out })
+        return
+      }
+      if (request.method === 'POST' && path === '/roster/skills/link') {
+        const body = (await readBody(request)) ?? {}
+        if (!body.id) {
+          sendJson(response, 400, { ok: false, reason: 'id 必填' })
+          return
+        }
+        const bot = await withService(services, 'roster', (r) =>
+          r.linkSkills({
+            id: body.id,
+            skills: body.skills ?? [],
+            byId: body.byId ?? OWNER,
+            expectedRev: body.expectedRev,
+          }),
+        )
+        sendJson(response, 200, { ok: true, bot })
+        return
+      }
+
+      // ── 特性④：记忆档案完整增删改查 ──────────────────────────────────────
+      if (request.method === 'GET' && path === '/memory/detail') {
+        const id = qp(url, 'id')
+        const layer = qp(url, 'layer')
+        if (!id || !layer) {
+          sendJson(response, 400, { ok: false, reason: 'id 与 layer 必填' })
+          return
+        }
+        const entry = await withService(services, 'memory', (m) => m.get({ layer, id }))
+        const history = await withService(services, 'memory', (m) => m.history(id))
+        sendJson(response, 200, { ok: true, entry, history })
+        return
+      }
+      if (request.method === 'POST' && path === '/memory/purge') {
+        // 彻底删除（不可恢复）：与 /memory/remove（软删除，可恢复）区分开
+        const body = (await readBody(request)) ?? {}
+        const entry = await withService(services, 'memory', (m) =>
+          m.purge({ layer: body.layer, id: body.id, expectedRev: body.expectedRev, by: body.by ?? OWNER }))
+        sendJson(response, 200, { ok: true, purged: entry })
+        return
+      }
+      if (request.method === 'POST' && path === '/memory/migrate-cwd') {
+        const body = (await readBody(request)) ?? {}
+        const result = await withService(services, 'memory', (m) =>
+          m.migrateCwd({ cwd: body.cwd, by: body.by ?? OWNER, now: body.now }))
+        sendJson(response, 200, { ok: true, result })
+        return
+      }
+      if (request.method === 'POST' && path === '/memory/import') {
+        const body = (await readBody(request)) ?? {}
+        const rows = Array.isArray(body.entries) ? body.entries : []
+        const added = []
+        const failed = []
+        for (const row of rows) {
+          try {
+            const entry = await withService(services, 'memory', (m) => m.add({
+              layer: row.layer ?? body.layer ?? 'L4',
+              content: row.content ?? row,
+              by: body.by ?? OWNER,
+              tags: row.tags,
+              explicit: row.explicit,
+            }))
+            const id = Array.isArray(entry) ? entry[0]?.id : entry?.id
+            if (id) added.push(id)
+          } catch (error) {
+            failed.push({ content: String(row?.content ?? row).slice(0, 60), reason: error?.message ?? String(error) })
+          }
+        }
+        sendJson(response, 200, { ok: true, added: added.length, ids: added, failed })
+        return
+      }
+
+      // ── 特性⑤：技能导入 / 导出 ───────────────────────────────────────────
+      if (request.method === 'POST' && path === '/library/skills/parse') {
+        const body = (await readBody(request)) ?? {}
+        const parsed = await withService(services, 'library', (l) =>
+          l.parseSkillMarkdown({ text: body.text ?? '', filename: body.filename }),
+        )
+        sendJson(response, 200, { ok: true, parsed })
+        return
+      }
+      if (request.method === 'POST' && path === '/library/skills/import') {
+        const body = (await readBody(request)) ?? {}
+        const result = await withService(services, 'library', (l) =>
+          l.importSkills({
+            items: body.items ?? [],
+            mode: body.mode ?? 'skip',
+            by: body.by ?? OWNER,
+          }),
+        )
+        sendJson(response, 200, { ok: true, result })
+        return
+      }
+      if (request.method === 'POST' && path === '/library/skills/scan') {
+        const body = (await readBody(request)) ?? {}
+        const result = await withService(services, 'library', (l) =>
+          l.scanSkillsDir({ dir: body.dir }),
+        )
+        sendJson(response, 200, { ok: true, ...result })
+        return
+      }
+      if (request.method === 'GET' && path === '/library/skills/export') {
+        const ids = qp(url, 'ids')
+        const out = await withService(services, 'library', (l) =>
+          l.exportSkills({ ids: ids ? ids.split(',').filter(Boolean) : undefined }),
+        )
+        sendJson(response, 200, { ok: true, ...out })
+        return
+      }
+
+      // ── 特性⑥：四轨待办 ──────────────────────────────────────────────────
+      if (request.method === 'GET' && path === '/todos') {
+        const out = await withService(services, 'todo', (t) => t.listTodos({
+          track: qp(url, 'track'),
+          cwd: qp(url, 'cwd'),
+          date: qp(url, 'date'),
+          status: qp(url, 'status'),
+          query: qp(url, 'query'),
+          all: qp(url, 'all') === '1',
+          past: qp(url, 'past') === '1',
+          expired: qp(url, 'expired') === '1',
+          limit: qn(url, 'limit'),
+        }))
+        // listTodos 返回 {items,total,truncated,defaultView,today,hint}；
+        // 原样展开（页面读 items）+ 保留 todos 别名（老调用方兼容）
+        sendJson(response, 200, { ok: true, ...out, todos: out.items ?? [] })
+        return
+      }
+      if (request.method === 'POST' && path === '/todos') {
+        const body = (await readBody(request)) ?? {}
+        const todo = await withService(services, 'todo', (t) => t.createTodo({ ...body, by: body.by ?? OWNER }))
+        sendJson(response, 200, { ok: true, todo })
+        return
+      }
+      if (request.method === 'POST' && path === '/todos/update') {
+        const body = (await readBody(request)) ?? {}
+        const todo = await withService(services, 'todo', (t) => t.updateTodo({ ...body, by: body.by ?? OWNER }))
+        sendJson(response, 200, { ok: true, todo })
+        return
+      }
+      if (request.method === 'POST' && path === '/todos/promote') {
+        // 「待办 → 任务」升级：待办是个人备忘，任务是要交给别人/Bot 干的协作单元。
+        // 两者是漏斗上下游，所以必须有一条**确定性**的升级通道（不是让用户手抄一遍）。
+        // 幂等靠 board 的 sourceSeq=`todo:<id>`：连点两次也只会产生一个任务。
+        const body = (await readBody(request)) ?? {}
+        const result = await withService(services, 'todo', async (t) => {
+          const todo = t.getTodo(body.id)
+          if (!todo) {
+            const error = new Error(`待办不存在：${body.id}`)
+            error.status = 404
+            error.code = 'TODO_NOT_FOUND'
+            throw error
+          }
+          if (body.expectedRev !== undefined && todo.rev !== body.expectedRev) {
+            const error = new Error(`待办 CAS 冲突：期望 rev=${body.expectedRev}，实际 rev=${todo.rev}`)
+            error.status = 409
+            error.code = 'TODO_REV_CONFLICT'
+            throw error
+          }
+          const task = await withService(services, 'board', (b) => b.create({
+            subject: String(todo.content).split(String.fromCharCode(10))[0].slice(0, 120),
+            description: todo.content,
+            priority: body.priority,
+            dueAt: todo.due ? Date.parse(`${todo.due}T00:00:00+08:00`) : undefined,
+            byId: body.by ?? OWNER,
+            sourceSeq: `todo:${todo.id}`,
+          }))
+          // 升级后把待办标成"进行中"，避免它又出现在「要关注」里被重复安排
+          let next = todo
+          if (todo.status === 'pending') {
+            next = t.updateTodo({ id: todo.id, expectedRev: todo.rev, status: 'doing', by: body.by ?? OWNER })
+          }
+          return { task, todo: next }
+        })
+        sendJson(response, 200, { ok: true, ...result })
+        return
+      }
+      if (request.method === 'POST' && path === '/todos/remove') {
+        const body = (await readBody(request)) ?? {}
+        const result = await withService(services, 'todo', (t) =>
+          t.removeTodo({ id: body.id, expectedRev: body.expectedRev, by: body.by ?? OWNER }))
+        sendJson(response, 200, { ok: true, result })
+        return
+      }
+
+      // ── 特性⑦：便签 ──────────────────────────────────────────────────────
+      if (request.method === 'GET' && path === '/scratch') {
+        const out = await withService(services, 'scratch', (s) => s.read({ scope: qp(url, 'scope') }))
+        sendJson(response, 200, { ok: true, ...out })
+        return
+      }
+      if (request.method === 'POST' && path === '/scratch') {
+        const body = (await readBody(request)) ?? {}
+        const out = await withService(services, 'scratch', (s) =>
+          s.write({ scope: body.scope, text: body.text ?? '', by: body.by ?? OWNER }))
+        sendJson(response, 200, { ok: true, ...out })
+        return
+      }
+      if (request.method === 'GET' && path === '/scratch/scopes') {
+        const scopes = await withService(services, 'scratch', (s) => s.listScopes())
+        sendJson(response, 200, { ok: true, scopes })
+        return
+      }
+
+      // ── 特性⑧：提示词库 + 注入轨 ──────────────────────────────────────────
+      if (request.method === 'GET' && path === '/prompts') {
+        const items = await withService(services, 'prompts', (p) => p.listPrompts({
+          category: qp(url, 'category'),
+          tag: qp(url, 'tag'),
+          query: qp(url, 'query'),
+          enabled: qp(url, 'enabled') === undefined ? undefined : qp(url, 'enabled') === '1',
+          limit: qn(url, 'limit'),
+        }))
+        const categories = await withService(services, 'prompts', (p) => p.listCategories())
+        sendJson(response, 200, { ok: true, items, categories })
+        return
+      }
+      if (request.method === 'POST' && path === '/prompts') {
+        const body = (await readBody(request)) ?? {}
+        const item = await withService(services, 'prompts', (p) => p.createPrompt({ ...body, by: body.by ?? OWNER }))
+        sendJson(response, 200, { ok: true, item })
+        return
+      }
+      if (request.method === 'POST' && path === '/prompts/update') {
+        const body = (await readBody(request)) ?? {}
+        const item = await withService(services, 'prompts', (p) => p.updatePrompt({ ...body, by: body.by ?? OWNER }))
+        sendJson(response, 200, { ok: true, item })
+        return
+      }
+      if (request.method === 'POST' && path === '/prompts/remove') {
+        const body = (await readBody(request)) ?? {}
+        const result = await withService(services, 'prompts', (p) =>
+          p.removePrompt({ id: body.id, expectedRev: body.expectedRev, by: body.by ?? OWNER }))
+        sendJson(response, 200, { ok: true, result })
+        return
+      }
+      if (request.method === 'POST' && path === '/prompts/categories/add') {
+        const body = (await readBody(request)) ?? {}
+        const categories = await withService(services, 'prompts', (p) =>
+          p.addCategory({ name: body.name, by: body.by ?? OWNER }))
+        sendJson(response, 200, { ok: true, categories })
+        return
+      }
+      if (request.method === 'POST' && path === '/prompts/categories/remove') {
+        const body = (await readBody(request)) ?? {}
+        const categories = await withService(services, 'prompts', (p) =>
+          p.removeCategory({ name: body.name, by: body.by ?? OWNER }))
+        sendJson(response, 200, { ok: true, categories })
+        return
+      }
+      if (request.method === 'POST' && path === '/prompts/inject') {
+        const body = (await readBody(request)) ?? {}
+        const injection = await withService(services, 'prompts', (p) => p.inject({
+          promptId: body.promptId,
+          text: body.text,
+          sessionId: body.sessionId,
+          times: body.times,
+          every: body.every,
+          immediate: body.immediate,
+          by: body.by ?? OWNER,
+        }))
+        sendJson(response, 200, { ok: true, injection })
+        return
+      }
+      if (request.method === 'POST' && path === '/prompts/injection/stop') {
+        const body = (await readBody(request)) ?? {}
+        const result = await withService(services, 'prompts', (p) => p.stopInjection({ id: body.id, by: body.by ?? OWNER }))
+        sendJson(response, 200, { ok: true, result })
+        return
+      }
+      if (request.method === 'GET' && path === '/prompts/injections') {
+        const injections = await withService(services, 'prompts', (p) => p.listInjections({ sessionId: qp(url, 'sessionId') }))
+        sendJson(response, 200, { ok: true, injections })
+        return
+      }
+
+      // ── 特性⑨：建议确认队列 + 审查调度 ───────────────────────────────────
+      if (request.method === 'GET' && path === '/suggestions') {
+        const items = await withService(services, 'suggest', (s) => s.listSuggestions({
+          kind: qp(url, 'kind'),
+          status: qp(url, 'status') ?? 'pending',
+          limit: qn(url, 'limit'),
+        }))
+        sendJson(response, 200, { ok: true, items })
+        return
+      }
+      if (request.method === 'POST' && path === '/suggestions/propose') {
+        const body = (await readBody(request)) ?? {}
+        const suggestion = await withService(services, 'suggest', (sg) => sg.suggest({
+          kind: body.kind,
+          layer: body.layer,
+          payload: body.payload,
+          reason: body.reason,
+          source: body.source ?? 'model',
+          confidence: body.confidence,
+          by: body.by ?? OWNER,
+        }))
+        sendJson(response, 200, { ok: true, suggestion })
+        return
+      }
+      if (request.method === 'POST' && path === '/suggestions/accept') {
+        const body = (await readBody(request)) ?? {}
+        // apply 回调把建议真正写进目标域（memory / library / discipline）
+        const applied = await withService(services, 'suggest', (s) => s.accept({
+          id: body.id,
+          by: body.by ?? OWNER,
+          apply: (sg) => applySuggestion(services, sg, body.by ?? OWNER),
+        }))
+        sendJson(response, 200, { ok: true, suggestion: applied })
+        return
+      }
+      if (request.method === 'POST' && path === '/suggestions/reject') {
+        const body = (await readBody(request)) ?? {}
+        const item = await withService(services, 'suggest', (s) =>
+          s.reject({ id: body.id, reason: body.reason, by: body.by ?? OWNER }))
+        sendJson(response, 200, { ok: true, suggestion: item })
+        return
+      }
+      if (request.method === 'GET' && path === '/review/status') {
+        const status = await withService(services, 'reviewer', (r) => r.status({ sessionId: qp(url, 'sessionId') }))
+        sendJson(response, 200, { ok: true, status })
+        return
+      }
+      if (request.method === 'POST' && path === '/review/note-turn') {
+        const body = (await readBody(request)) ?? {}
+        const out = await withService(services, 'reviewer', (r) => r.noteTurn({ sessionId: body.sessionId }))
+        sendJson(response, 200, { ok: true, ...out })
+        return
+      }
+      if (request.method === 'POST' && path === '/review/mark-reviewed') {
+        const body = (await readBody(request)) ?? {}
+        const out = await withService(services, 'reviewer', (r) =>
+          r.markReviewed({ sessionId: body.sessionId, by: body.by ?? OWNER }))
+        sendJson(response, 200, { ok: true, ...out })
+        return
+      }
+      if (request.method === 'POST' && path === '/review/interval') {
+        const body = (await readBody(request)) ?? {}
+        const out = await withService(services, 'reviewer', (r) => r.setInterval({ interval: body.interval }))
+        sendJson(response, 200, { ok: true, ...out })
+        return
+      }
+
+      // ── 特性⑩：技能管理器（来源/启用/自定义目录/浏览）────────────────────
+      if (request.method === 'POST' && path === '/library/skills/enable') {
+        const body = (await readBody(request)) ?? {}
+        const skill = await withService(services, 'library', (l) => l.setSkillEnabled({
+          id: body.id, enabled: body.enabled, by: body.by ?? OWNER, expectedRev: body.expectedRev,
+        }))
+        sendJson(response, 200, { ok: true, skill })
+        return
+      }
+      if (request.method === 'POST' && path === '/library/skills/source') {
+        const body = (await readBody(request)) ?? {}
+        const skill = await withService(services, 'library', (l) => l.setSkillSource({
+          id: body.id, source: body.source, by: body.by ?? OWNER, expectedRev: body.expectedRev,
+        }))
+        sendJson(response, 200, { ok: true, skill })
+        return
+      }
+      if (request.method === 'GET' && path === '/library/skills/dirs') {
+        const dirs = await withService(services, 'library', (l) => l.listSkillDirs())
+        sendJson(response, 200, { ok: true, dirs })
+        return
+      }
+      if (request.method === 'POST' && path === '/library/skills/dirs/add') {
+        const body = (await readBody(request)) ?? {}
+        const out = await withService(services, 'library', (l) =>
+          l.addSkillDir({ dir: body.dir, label: body.label, by: body.by ?? OWNER }))
+        sendJson(response, 200, { ok: true, ...out })
+        return
+      }
+      if (request.method === 'POST' && path === '/library/skills/dirs/remove') {
+        const body = (await readBody(request)) ?? {}
+        const out = await withService(services, 'library', (l) =>
+          l.removeSkillDir({ dir: body.dir, by: body.by ?? OWNER }))
+        sendJson(response, 200, { ok: true, ...out })
+        return
+      }
+      if (request.method === 'GET' && path === '/library/skills/browse') {
+        const out = await withService(services, 'library', (l) =>
+          l.browseSkillDir({ dir: qp(url, 'dir'), sub: qp(url, 'sub') }))
+        sendJson(response, 200, { ok: true, ...out })
+        return
+      }
+      if (request.method === 'POST' && path === '/library/skills/scan-all') {
+        const out = await withService(services, 'library', (l) => l.scanAllSkillDirs())
+        sendJson(response, 200, { ok: true, ...out })
         return
       }
 

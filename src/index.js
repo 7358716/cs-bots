@@ -17,9 +17,16 @@ import { createRoom } from './room.js'
 import { createMemory } from './memory.js'
 import { installTools } from './tools.js'
 import { setServices } from './registry.js'
-import { service, stateDir as kernelStateDir } from './kernel.js'
+import { service, stateDir as kernelStateDir, onLlmStream, sessionMeta } from './kernel.js'
+import { installLlmStreamHint } from './routing/hints.js'
 import { installApi } from './api.js'
 import { createLibrary } from './library.js'
+import { createDiscipline } from './discipline.js'
+import { createTodo } from './todo.js'
+import { createScratch } from './scratch.js'
+import { createPrompts } from './prompts.js'
+import { createSuggest } from './suggest.js'
+import { createReviewer } from './reviewer.js'
 import { createDirBrowser } from './dirbrowse.js'
 import { loadSettings } from './settings.js'
 import { probeHost, formatReport } from './compat.js'
@@ -113,6 +120,15 @@ function applyInner(ctx, config, { log, warn }) {
   try {
     services.board = createBoard(ctx, { stateDir: config.stateDir, leaseMs: settings.defaultLeaseMs })
     log(`[cs-bots] BoardService 就绪（stateDir=${services.board.paths?.stateDir ?? '?'}）`)
+    // ⚠️ 修复（2026-11-04 测试，P1-4）：expireLeases 之前无任何调用者，
+    //   owner 崩溃/失联后任务永久停在 in_progress（连"重启时回收"都不做）。
+    //   现在启动时先回收一次过期租约（失败不阻塞装配）。
+    try {
+      const recycled = services.board.expireLeases()
+      if (recycled.length > 0) log(`[cs-bots] 启动回收过期租约：${recycled.join(', ')}`)
+    } catch (error) {
+      warn(`[cs-bots] 启动回收过期租约失败（不影响装配）：${error?.message ?? error}`)
+    }
   } catch (error) {
     warn(`[cs-bots] BoardService 装配失败 → 降级（无任务板）：${error?.message ?? error}`)
     services.board = undefined
@@ -176,6 +192,59 @@ function applyInner(ctx, config, { log, warn }) {
     warn(`[cs-bots] library 装配失败（技能库/工作流库不可用）：${error?.message ?? error}`)
   }
 
+  // ── 分级纪律体系（全局/工作区/房间/Bot 四级，注入到各层级上下文）──────────
+  try {
+    services.discipline = createDiscipline(ctx, { stateDir: config.stateDir ?? kernelStateDir() })
+    log(`[cs-bots] discipline 就绪（${services.discipline.stats().total} 条纪律）`)
+  } catch (error) {
+    warn(`[cs-bots] discipline 装配失败（分级纪律不可用）：${error?.message ?? error}`)
+  }
+
+  // ── 四轨待办（生活/工作/项目/每日 + 四象限 + 逾期）─────────────────────────
+  try {
+    services.todo = createTodo(ctx, { stateDir: config.stateDir ?? kernelStateDir() })
+    log(`[cs-bots] todo 就绪（${services.todo.stats?.().total ?? 0} 条待办）`)
+  } catch (error) {
+    warn(`[cs-bots] todo 装配失败（待办不可用）：${error?.message ?? error}`)
+  }
+
+  // ── 便签（单文件随手记，原子写）────────────────────────────────────────────
+  try {
+    services.scratch = createScratch(ctx, { stateDir: config.stateDir ?? kernelStateDir() })
+    log('[cs-bots] scratch 就绪')
+  } catch (error) {
+    warn(`[cs-bots] scratch 装配失败（便签不可用）：${error?.message ?? error}`)
+  }
+
+  // ── 提示词库 + 注入轨 ──────────────────────────────────────────────────────
+  try {
+    services.prompts = createPrompts(ctx, { stateDir: config.stateDir ?? kernelStateDir() })
+    log(`[cs-bots] prompts 就绪（${services.prompts.stats?.().total ?? 0} 条提示词）`)
+  } catch (error) {
+    warn(`[cs-bots] prompts 装配失败（提示词库不可用）：${error?.message ?? error}`)
+  }
+
+  // ── 建议确认队列（模型只能提议，人点采纳才落库）───────────────────────────
+  try {
+    services.suggest = createSuggest(ctx, { stateDir: config.stateDir ?? kernelStateDir() })
+    log('[cs-bots] suggest 就绪')
+  } catch (error) {
+    warn(`[cs-bots] suggest 装配失败（建议队列不可用）：${error?.message ?? error}`)
+  }
+
+  // ── 自审调度（每 N 回合提醒模型做一次记忆自检）─────────────────────────────
+  try {
+    services.reviewer = createReviewer(ctx, {
+      stateDir: config.stateDir ?? kernelStateDir(),
+      memory: services.memory,
+      suggest: services.suggest,
+      interval: config.reviewInterval,
+    })
+    log(`[cs-bots] reviewer 就绪（每 ${services.reviewer.status?.().interval ?? '?'} 回合）`)
+  } catch (error) {
+    warn(`[cs-bots] reviewer 装配失败（自审调度不可用）：${error?.message ?? error}`)
+  }
+
   // ── 页面数据面：HTTP API（页面层靠它拿数据；没有它 UI 是空壳）──────────────
   services.apiDispose = installApi(ctx, { warn })
 
@@ -184,6 +253,37 @@ function applyInner(ctx, config, { log, warn }) {
     warn('[cs-bots] 未注册任何工具（tools 服务不可用？）→ 模型将看不到平台能力')
   } else {
     log(`[cs-bots] 已注册 ${toolNames.length} 个工具：${toolNames.join(', ')}`)
+  }
+
+  // ── 复杂度路由：llm/stream 拦截 → cs-myfree 旁路 hint 注册表 ────────────────
+  // 契约 §6。三条纪律都落在这里：
+  //   ① 钩子**总是尝试注册**（cs-myfree 后装载也能立刻生效）；
+  //   ② 没装 cs-myfree 只是 `installed:false`，不进日志噪音、更不影响对话；
+  //   ③ 任何异常都只 warn —— 路由优化不值得拿可用性换。
+  try {
+    const routing = installLlmStreamHint(ctx, { onLlmStream }, {
+      warn,
+      // 每次请求按会话动态解析角色（闭包读 services.roster，不缓存结果）：
+      //   注册表里的 Bot 会话 ⇒ subagent（free_only）；其余 ⇒ main（paid_allowed）；
+      //   roster 不可用/查询抛错 ⇒ unknown（fail-closed，仍 free_only）。
+      roleOf: (sessionId) => roleOfSession(services.roster, sessionId, sessionMeta(ctx, sessionId)),
+    })
+    services.routing = routing
+    if (routing.installed) {
+      log('[cs-bots] 复杂度路由 hint 注入已就绪（llm/stream → cs-myfree 注册表）')
+    } else if (routing.reason === 'cs-myfree-registry-missing') {
+      // 正常情形：本插件可能先于 cs-myfree 装载。注册表在**每次请求时**重新解析，
+      // 所以 cs-myfree 后装载也能立刻生效 —— 这里只记 info，不当降级故障报。
+      log('[cs-bots] 未发现 cs-myfree 路由注册表（稍后装载亦可生效）→ 暂不注入 hint，cs-myfree 默认 free_only')
+    } else {
+      warn(
+        `[cs-bots] 复杂度路由 hint 未就绪（${routing.reason}）→ 降级：不注入 hint，`
+        + 'cs-myfree 按默认 free_only 走（fail-closed，不影响对话）',
+      )
+    }
+  } catch (error) {
+    services.routing = { installed: false, reason: 'assembly-failed' }
+    warn(`[cs-bots] 复杂度路由装配失败（降级，不影响对话）：${error?.message ?? error}`)
   }
 
   // ── 生命周期收尾：停止定时器，避免进程退出被挂起的 timer 拖住 ────────────────
@@ -230,6 +330,68 @@ function installBlockingToolGate(ctx, { warn, roster }) {
   } catch (error) {
     warn(`[cs-bots] 装 K1 闸门失败：${error?.message ?? error}`)
     return undefined
+  }
+}
+
+/**
+ * 按会话判定复杂度路由角色（契约 §6 + P3-fix/P3-fix2）。
+ *
+ * 判定顺序（**先严后宽**，任何一步拿不到证据都停在 `'unknown'` ⇒ free_only）：
+ *   a. `roster.hasSession(sessionId)` 命中（含退役 Bot）⇒ `'subagent'`；
+ *   b. 宿主 session 谱系显示是子代理（`origin === 'subagent'` 或 `parentSession` 非空
+ *      或 `delegationDepth > 0`）⇒ `'subagent'`
+ *      —— **这一条堵的是官方 `spawn_teammate` 子会话的付费泄漏**（它们不在 roster 里）；
+ *   c. 两条查询都拿不到信息（roster 不可用/抛错，或 `sessionMeta` 为 null：无 sessions
+ *      服务、无此会话、查询抛错）⇒ `'unknown'`（fail-closed，保持 free_only）；
+ *   d. 能确认是顶层会话（roster 明确「不是 Bot」且宿主给得出 header 但无谱系字段）
+ *      ⇒ `'main'`（人类主对话 ⇒ 平台层注入 paid_allowed）。
+ *
+ * 为什么 c 这么严：宁可让主对话少拿一次付费授权，也不能让某个子智能体白拿 ——
+ * 两者的代价不对称（前者只是慢/弱，后者是持续花错钱）。
+ *
+ * @param {{ hasSession?: Function, list?: Function, listRetired?: Function } | undefined} roster
+ * @param {string} sessionId
+ * @param {{ origin?: string, parentSession?: string, delegationDepth?: number,
+ *           agentPreset?: string } | null} [meta] `kernel.sessionMeta()` 的结果
+ * @returns {'main'|'subagent'|'unknown'}
+ */
+export function roleOfSession(roster, sessionId, meta) {
+  if (typeof sessionId !== 'string' || sessionId === '') return 'unknown'
+
+  // ── a. 注册表：这是本平台的 Bot ⇒ 子智能体 ──
+  const fromRoster = rosterHasSession(roster, sessionId)
+  if (fromRoster === true) return 'subagent'
+  // roster 不可用 ⇒ 无法确认身份 ⇒ 停在这里（即使下面有谱系也不升级为主对话）
+  if (fromRoster === null) return 'unknown'
+
+  // ── b. 宿主谱系：官方子代理 / 任意带父会话的会话 ⇒ 子智能体 ──
+  if (meta === null || meta === undefined) return 'unknown'
+  if (typeof meta !== 'object') return 'unknown'
+  const isSubagent = meta.origin === 'subagent'
+    || (typeof meta.parentSession === 'string' && meta.parentSession !== '')
+    || (typeof meta.delegationDepth === 'number' && Number.isFinite(meta.delegationDepth) && meta.delegationDepth > 0)
+  if (isSubagent) return 'subagent'
+
+  // ── d. 确认是顶层会话 ⇒ 主对话 ──
+  return 'main'
+}
+
+/**
+ * 查 roster 判定某会话是否 Bot。
+ * @returns {true|false|null} `null` = 查询不可用（无 roster / 无查询能力 / 抛错）
+ */
+function rosterHasSession(roster, sessionId) {
+  if (!roster) return null
+  try {
+    if (typeof roster.hasSession === 'function') return roster.hasSession(sessionId) === true
+    // 老版本 roster（无 hasSession）：退化为扫一遍名录，不因此把 Bot 误判成主对话
+    const list = typeof roster.list === 'function' ? roster.list() : undefined
+    if (!Array.isArray(list)) return null
+    const retired = typeof roster.listRetired === 'function' ? roster.listRetired() : []
+    const rows = [...list, ...(Array.isArray(retired) ? retired : [])]
+    return rows.some((b) => b?.sessionId === sessionId)
+  } catch {
+    return null
   }
 }
 

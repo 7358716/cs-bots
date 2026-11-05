@@ -35,6 +35,18 @@
  *   ——「超上限」这件事**看得见**，不是静默截断。`update()` 无法切分（它是单条 CAS），
  *   故超长直接抛 `MEMORY_ENTRY_TOO_LONG`。
  *
+ * ── cwd 作用域（按工作目录隔离，2026-11-04 对齐记忆进化 #2）──
+ *   问题：改造前所有条目是**全局单库**，多个项目的记忆互相串味
+ *   （A 项目的「密钥在 .env.local」会出现在 B 项目的上下文里）。证据：`ANALYSIS-memory-evolve-parity.md` #2。
+ *   方案：
+ *     - 只有 **L3 项目 key / L4 任务笔记 / L5 日札**带 `cwd` 字段（归一化：`resolve()` 后去尾斜杠，只收绝对路径）；
+ *     - **L0/L1/L2 是全局层**（人的身份 / 偏好 / 团队规矩属于「这个人 / 这个团队」，不属于某个项目），
+ *       传了 cwd 也**不记**（记下来会让全局条目被某个项目锁住，别的项目反而看不见 —— 反直觉）；
+ *     - `list()` / `search()` / `contextFor()` 新增可选 `cwd`：**缺省不过滤**（保持旧行为，兼容既有调用方与 33 个用例），
+ *       `'*'` = 显式跨项目视图，具体路径 = 「全局条目 + 该 cwd 的 L3/L4/L5」；
+ *     - `migrateCwd()` 是把「未归属项目」的老条目批量归属到某个项目的迁移入口。
+ *   老条目兼容取舍见 `cwdVisible()` 的注释（**故意**不让它们出现在具体项目视图里）。
+ *
  * ── 存储 ──
  *   `memory.jsonl`     事件流（**真相源**，append-only）
  *   `memory.snap.json` 原子快照（加速启动；事件流为空时才作为回落）
@@ -52,11 +64,12 @@
  *   本仓库是**裸检出**（无 node_modules），静态 import 会让本文件连带 kernel.js 加载失败。
  *   拿不到 kernel 且调用方也没给 `config.stateDir` → **抛可读错误**（不静默兜底）。
  *
- * 依赖面：node 内置（`node:crypto` / `node:sqlite`）+ `./store.js` + `./kernel.js`。
+ * 依赖面：node 内置（`node:crypto` / `node:sqlite` / `node:path`）+ `./store.js` + `./kernel.js`。
  * **不 import 任何 `@deepseek-ai/*`**（`test/ci-zero-dep.sh` 检查 1 机械强制）。
  */
 
 import { randomBytes } from 'node:crypto'
+import { isAbsolute, resolve, sep } from 'node:path'
 
 import {
   appendJsonl,
@@ -116,7 +129,11 @@ const ID_LEN = 8
 /** 切分时的软边界回溯窗口占 max 的比例（在窗口内找换行/空格，找不到就硬切）。 */
 const SOFT_BOUNDARY_RATIO = 0.5
 /** 事件动作集合。 */
-const ACTIONS = ['add', 'update', 'remove', 'archive', 'restore', 'review', 'consolidate']
+const ACTIONS = ['add', 'update', 'remove', 'archive', 'restore', 'review', 'consolidate', 'migrate', 'purge']
+/** 按 cwd 隔离的层（见文件头「cwd 作用域」）：只有 L3/L4/L5 归属某个项目。 */
+export const CWD_LAYERS = ['L3', 'L4', 'L5']
+/** `cwd:'*'` = 显式要求跨项目视图（UI 的「全部项目」按钮）。 */
+export const CWD_ALL = '*'
 /** 否定极性标记（用于「冲突 vs 重复」判定，见 `polarityOf`）。 */
 const NEG_MARKERS = ['不', '禁止', '不要', '别', 'never', 'must not', 'mustn\'t', '避免', '不可', '无需', '不应']
 /** 肯定极性标记（存在即视为「有极性主张」，用于与否定对照）。 */
@@ -231,6 +248,99 @@ function normalizeNow(value, where) {
   )
 }
 
+// ── cwd 作用域（按工作目录隔离）───────────────────────────────────────────────
+
+/** 层是否按 cwd 隔离（L0/L1/L2 是全局层，见文件头「cwd 作用域」）。 */
+function cwdScopedLayer(layer) {
+  return CWD_LAYERS.includes(layer)
+}
+
+/**
+ * cwd 归一化：`resolve()` 后去掉结尾斜杠。
+ *
+ * 两条硬规定：
+ *   1. **只收绝对路径**。相对路径要按「某个进程的当前目录」解释，而记忆是跨会话、跨 Bot
+ *      共享的 —— 同一个相对路径在不同进程里指向不同项目，会把记忆静默挂错项目。
+ *      所以直接拒收（`MEMORY_BAD_FIELD`），不做「猜一个 cwd」的兜底。
+ *   2. **去尾斜杠**（根 `/` 除外）。`/a/b` 与 `/a/b/` 必须算同一个项目，
+ *      否则同一项目会分裂成两个视图、迁移看起来「一半成功」。
+ *
+ * @param {unknown} value
+ * @param {string} field
+ * @param {string} where
+ * @returns {string}
+ */
+function normalizeCwd(value, field, where) {
+  if (typeof value !== 'string' || value.trim() === '') {
+    throw new MemoryError(
+      `memory.${where}：字段 ${field} 必须是非空字符串（绝对路径），收到 ${JSON.stringify(value)}`,
+      'MEMORY_BAD_FIELD',
+      { field, where },
+    )
+  }
+  const raw = value.trim()
+  if (!isAbsolute(raw)) {
+    throw new MemoryError(
+      `memory.${where}：字段 ${field} 必须是绝对路径（收到 ${JSON.stringify(raw)}）—— `
+      + '相对路径要按某个进程的当前目录解释，跨会话会指向别的项目，故拒收',
+      'MEMORY_BAD_FIELD',
+      { field, where, value: raw },
+    )
+  }
+  let abs = resolve(raw)
+  while (abs.length > 1 && (abs.endsWith('/') || abs.endsWith(sep))) abs = abs.slice(0, -1)
+  return abs
+}
+
+/**
+ * 读侧过滤参数归一。
+ *
+ * **`undefined` / `null` → 不过滤**：这是兼容前提 —— `api.js` / `tools.js` 与既有
+ * 33 个用例都按「不传 cwd = 看全部」消费；若把缺省改成「只看当前项目」，
+ * 那些调用方会突然少一半记忆（静默行为变更）。
+ * `''`（空串）也按「未提供」处理：HTTP 查询串里 `?cwd=` 与「没有这个参数」在语义上
+ * 无法区分（UI 的「全部项目」很可能就发空串），读侧宽容比让 UI 报 400 更合理；
+ * 注意**写侧**相反 —— `add({cwd:''})` 是「要归属但没给路径」，必须报错（见 cwdForWrite）。
+ * `'*'` → 不过滤（语义上不同：调用方**显式**要求跨项目视图，如 UI 的「全部项目」）。
+ *
+ * @param {unknown} value
+ * @param {string} where
+ * @returns {string | undefined} undefined = 不过滤
+ */
+function normalizeCwdFilter(value, where) {
+  if (value === undefined || value === null) return undefined
+  if (typeof value === 'string' && (value.trim() === '' || value.trim() === CWD_ALL)) return undefined
+  return normalizeCwd(value, 'cwd', where)
+}
+
+/**
+ * 条目在某个 cwd 视图里是否可见（`targetCwd === undefined` 表示不过滤）。
+ *
+ * ── 老数据（无 cwd 字段）的处置：**故意如此，不是 bug** ──
+ * 改造前写入的 L3/L4/L5 条目没有 `cwd` 字段 = 「未归属项目」。按 cwd 过滤时
+ * **它们不出现在任何具体 cwd 视图里**（只在不传 cwd / `cwd:'*'` 时可见）。
+ *
+ * 为什么故意这样（取舍理由）：
+ *   - 老条目来自全局单库，**没人知道它属于哪个项目** —— 让它们出现在每个项目视图
+ *     就等于把「A 项目的密钥在 .env.local」原封不动搬进 B 项目，而那正是本次改造要消灭的串味。
+ *   - **宁可少看见，不可看错**：多看见一条不属于本项目的记忆，会让 Bot 做出错误决定
+ *     （且这种错误静默、难追溯）；少看见一条只是信息不全，用户有明确的补救入口 —— `migrateCwd()`。
+ *   - 恢复可见性是**一次显式、可审计的动作**（人点「把历史记忆归到当前项目」），
+ *     而不是靠启发式猜测归属（猜错的代价比不猜高）。
+ *
+ * 注意「全局层永远可见」的判据是 **layer**，不是「有没有 cwd 字段」：
+ * L0/L1/L2 即使记录里意外带了 cwd（手改 jsonl 等）也仍然全局可见 —— 层语义优先。
+ *
+ * @param {object} entry
+ * @param {string | undefined} targetCwd
+ * @returns {boolean}
+ */
+function cwdVisible(entry, targetCwd) {
+  if (targetCwd === undefined) return true
+  if (!cwdScopedLayer(entry?.layer)) return true
+  return entry.cwd === targetCwd
+}
+
 // ── 极性 / 签名（规定 3 的判定基础）────────────────────────────────────────────
 
 /**
@@ -311,6 +421,26 @@ function partitionContent(content, max) {
   }
   return parts
 }
+
+/**
+ * 粗略估 token（调研驱动：cs-myfree 用 4 字符/英文 + 1.5/中文）。
+ * 不追求精确（精确要 tokenizer，代价大于收益），只用于预算判断。
+ * @param {string} text
+ * @returns {number}
+ */
+function estimateTokens(text) {
+  const s = String(text ?? '')
+  if (s === '') return 0
+  let wide = 0
+  for (let i = 0; i < s.length; i += 1) {
+    if (s.charCodeAt(i) > 0x2e80) wide += 1
+  }
+  const narrow = s.length - wide
+  return Math.ceil(narrow / 4 + wide / 1.5)
+}
+
+/** 注入层的保留优先级（高者在预算不足时优先保留）：L3 项目 key 离当前任务最近。 */
+const INJECT_PRIORITY = { L3: 4, L2: 3, L1: 2, L0: 1 }
 
 // ── 写入优先级（规定 4）───────────────────────────────────────────────────────
 
@@ -456,6 +586,9 @@ export function createMemory(ctx, config = {}) {
     ftsTokenize: /** @type {string|null} */ (null),
     lastSearchAt: /** @type {number|undefined} */ (undefined),
     lastReplayAt: /** @type {number|undefined} */ (undefined),
+    // cwd 作用域诊断：上层（UI/调度）可据此判断「上次注入是按项目裁剪的，还是全局的」
+    lastContextCwd: /** @type {string|null|undefined} */ (undefined),
+    lastContextCwdScoped: /** @type {boolean} */ (false),
   }
 
   // ── FTS5 索引（派生缓存；坏了不影响真相源）──────────────────────────────────
@@ -638,7 +771,24 @@ export function createMemory(ctx, config = {}) {
     // 事件流是真相源：只接受 rev 递增的事件（同 rev 重放幂等，容忍重复投递）
     let skipped = 0
     for (const ev of rows) {
-      if (!ev || typeof ev.id !== 'string' || !ev.after || typeof ev.after.id !== 'string') {
+      if (!ev || typeof ev.id !== 'string') {
+        skipped += 1
+        continue
+      }
+      // `after === null` = **彻底删除墓碑**（purge）：从内存移除，但事件本身
+      // 仍进 events 供审计/历史查询。为什么不在文件里抹掉这一行：
+      // 事件流是只追加的真相源，改写历史会让「谁在什么时候删了什么」永久丢失。
+      if (ev.after === null) {
+        const beforePurge = entries.get(ev.id)
+        if (beforePurge && Number.isFinite(ev.rev) && ev.rev <= beforePurge.rev) {
+          skipped += 1
+          continue
+        }
+        entries.delete(ev.id)
+        events.push(clone(ev))
+        continue
+      }
+      if (!ev.after || typeof ev.after.id !== 'string') {
         skipped += 1
         continue
       }
@@ -724,6 +874,40 @@ export function createMemory(ctx, config = {}) {
     return branches.length === 0 || branches.includes(branch)
   }
 
+  /**
+   * 写侧 cwd 归属计算（add/update 共用）。
+   *
+   * - 隔离层（L3/L4/L5）：归一化后**返回要落盘的 cwd**；
+   * - 全局层（L0/L1/L2）：**忽略**（返回 undefined，不落字段）。为什么不报错：
+   *   调用方（工具 / UI）常把「当前工作目录」无脑透传，对 L1/L2 报错会让
+   *   「我在这条路径下写的偏好」整条写不进去 —— 那是把一次便利调用变成硬失败；
+   *   但**记下来**更糟（全局条目被某个项目锁住，别的项目反而看不见它，反直觉）。
+   *   故：忽略 + `warn` 留痕（绝不静默），层语义不受影响。
+   * - `'*'` 只能用于**过滤**，不能当作写入归属（会写出一个谁都看不见的 cwd）→ 拒收。
+   *
+   * @param {string} layer
+   * @param {unknown} rawCwd
+   * @param {string} where
+   * @returns {string | undefined}
+   */
+  function cwdForWrite(layer, rawCwd, where) {
+    if (rawCwd === undefined || rawCwd === null) return undefined
+    // 全局层先判：规格是「传了也不记」，故连非法值也一并忽略（不因一个与它无关的字段报错）
+    if (!cwdScopedLayer(layer)) {
+      warn(`[cs-bots/memory] ${where}：${layer} 是全局层，忽略传入的 cwd=${JSON.stringify(rawCwd)}（L0/L1/L2 不按项目隔离）`)
+      return undefined
+    }
+    if (typeof rawCwd === 'string' && rawCwd.trim() === CWD_ALL) {
+      throw new MemoryError(
+        `memory.${where}：cwd='*' 是**读侧**的跨项目视图标记，不能作为写入归属 —— `
+        + '请传具体项目目录的绝对路径',
+        'MEMORY_BAD_FIELD',
+        { field: 'cwd', where },
+      )
+    }
+    return normalizeCwd(rawCwd, 'cwd', where)
+  }
+
   // ── API：写 ───────────────────────────────────────────────────────────────
 
   /**
@@ -735,11 +919,11 @@ export function createMemory(ctx, config = {}) {
    *
    * @param {{ layer: string, content: string, by: string, explicit?: boolean,
    *           source?: 'explicit'|'review'|'consolidate', branch?: string|string[],
-   *           tags?: string[], now?: number }} input
+   *           tags?: string[], cwd?: string, now?: number }} input
    * @returns {object} Entry（含 id + rev）
    */
   function add(input = {}) {
-    const { layer, content, by, explicit, source, branch, tags, botId, now } = input ?? {}
+    const { layer, content, by, explicit, source, branch, tags, botId, now, cwd } = input ?? {}
     const targetLayer = requireLayer(layer, 'add')
     assertNotPersonaLayer(targetLayer, 'add')
     const author = requireString(by, 'by', 'add')
@@ -758,6 +942,8 @@ export function createMemory(ctx, config = {}) {
     // Bot 维度：不传 = 全局记忆；传了 = 只在那个 Bot 的 contextFor 里出现
     const ownerBot = optionalString(botId, 'botId', 'add')
     const tagList = stringList(tags, 'tags', 'add')
+    // cwd 维度：只有 L3/L4/L5 记录（全局层忽略，见 cwdForWrite 注释）
+    const ownerCwd = cwdForWrite(targetLayer, cwd, 'add')
     const at = normalizeNow(now, 'add')
 
     const parts = cpLength(text) > entryMax ? partitionContent(text, entryMax) : [text]
@@ -771,8 +957,15 @@ export function createMemory(ctx, config = {}) {
 
     /** @type {object[]} */
     const created = []
-    for (const part of parts) {
-      const id = newId()
+    // ⚠️ 修复（2026-11-04 测试，P1-2）：原来 `split`/`parts` 只挂在返回给调用方的
+    //   克隆上（commit 已落盘之后才挂），⇒ 读回来（list/search/replay）全部丢失，
+    //   切分状态"不可持久、不可审计"，UI 会显示成"单条完整"。
+    //   现在：先算出全量 id，把 `splitGroup`（同一原文的组标识）+ `splitIndex` +
+    //   `splitTotal` **写进每条 entry 本身**，然后一起落盘。
+    const groupId = parts.length > 1 ? newId() : null
+    const ids = parts.map(() => newId())
+    for (const [i, part] of parts.entries()) {
+      const id = ids[i]
       /** @type {Record<string, unknown>} */
       const entry = {
         id,
@@ -783,15 +976,21 @@ export function createMemory(ctx, config = {}) {
         explicit: explicit === true,
         branches,
         ...(ownerBot !== undefined ? { botId: ownerBot } : {}),
+        // cwd 必须写进**条目本身**（随 commit → 事件流 → 落盘）；
+        // 只挂在返回克隆上会重演 split 标记的老坑：读回来就丢（P1-2 教训）。
+        ...(ownerCwd !== undefined ? { cwd: ownerCwd } : {}),
         tags: tagList.slice(),
         createdAt: at,
         createdBy: author,
         updatedAt: at,
         updatedBy: author,
       }
-      if (parts.length > 1) {
-        entry.splitIndex = created.length
+      if (groupId !== null) {
+        // 持久化的切分元数据：组标识 + 序号 + 总数 + 组内全部 id（便于无损还原原文）
+        entry.splitGroup = groupId
+        entry.splitIndex = i
         entry.splitTotal = parts.length
+        entry.splitParts = ids.slice()
       }
       try {
         created.push(commit(id, 'add', author, at, null, entry))
@@ -822,11 +1021,11 @@ export function createMemory(ctx, config = {}) {
    * 抛 `MEMORY_EXPLICIT_PROTECTED`（并指向 `review()`）。
    *
    * @param {{ layer: string, id: string, expectedRev: number, content?: string, tags?: string[],
-   *           explicit?: boolean, by: string, now?: number }} input
+   *           cwd?: string, explicit?: boolean, by: string, now?: number }} input
    * @returns {object} 变更后的 Entry
    */
   function update(input = {}) {
-    const { layer, id, expectedRev, content, tags, explicit, by, now } = input ?? {}
+    const { layer, id, expectedRev, content, tags, explicit, by, now, cwd } = input ?? {}
     const targetLayer = requireLayer(layer, 'update')
     assertNotPersonaLayer(targetLayer, 'update')
     const author = requireString(by, 'by', 'update')
@@ -867,12 +1066,17 @@ export function createMemory(ctx, config = {}) {
     assertWriteAllowed(current, 'explicit', 'update')
 
     const at = normalizeNow(now, 'update')
+    // cwd 重新归属：不传 = 保持原归属（clone 已带上）；传了 = 归一化后覆盖。
+    // 注意这里**不清理**旧 cwd 字段 —— 显式「清空归属」没有对应语义（要改归属就传新路径，
+    // 回到「未归属」状态只能靠手改数据，避免一次误传把条目打回谁都看不见的状态）。
+    const nextCwd = cwdForWrite(targetLayer, cwd, 'update')
     const before = clone(current)
     const next = clone(current)
     next.rev = current.rev + 1
     next.updatedAt = at
     next.updatedBy = author
     if (explicit === true) next.explicit = true
+    if (nextCwd !== undefined) next.cwd = nextCwd
     if (content !== undefined && content !== null) {
       const text = requireString(content, 'content', 'update')
       if (cpLength(text) > entryMax) {
@@ -959,6 +1163,74 @@ export function createMemory(ctx, config = {}) {
   }
 
   /**
+   * **彻底删除**（purge）——与 `remove`（软删除，进归档区可恢复）的区别：
+   *   - `remove` = 归档，`archived.reason='removed'`，列表不可见但**可恢复**，可追溯；
+   *   - `purge`  = 真删，条目从内存与快照中移除，**不可恢复**；事件流只留一条
+   *     `after:null` 的墓碑，记录「谁在什么时候删了什么」，审计不丢、内容不留。
+   *
+   * 为什么两者都要有：`remove` 是对用户的保护（误删可救），`purge` 是对用户的
+   * 承诺（说删就真的删 —— 比如密钥/口令误写进记忆时必须能彻底清掉）。
+   * 只有 `remove` 时用户会遇到「删了还在归档区躺着」；只有 `purge` 时误删无从挽回。
+   *
+   * 仍然禁止 L0：人格层只允许人改，删除同样要人显式发起（by 必填）。
+   *
+   * @param {{ layer: string, id: string, by: string, expectedRev?: number, now?: number }} input
+   * @returns {object} 被删除的条目（删除前的样子，供 UI 回显）
+   */
+  function purge(input = {}) {
+    const { layer, id, by, expectedRev, now } = input ?? {}
+    const targetLayer = requireLayer(layer, 'purge')
+    assertNotPersonaLayer(targetLayer, 'purge')
+    const author = requireString(by, 'by', 'purge')
+    const current = requireEntry(id, targetLayer, 'purge')
+
+    if (expectedRev !== undefined && expectedRev !== null) {
+      if (typeof expectedRev !== 'number' || !Number.isInteger(expectedRev)) {
+        throw new MemoryError(
+          `memory.purge：expectedRev 必须是整数（收到 ${JSON.stringify(expectedRev)}）`,
+          'MEMORY_BAD_FIELD',
+          { field: 'expectedRev', id: current.id },
+        )
+      }
+      if (current.rev !== expectedRev) {
+        throw new MemoryError(
+          `memory.purge CAS 冲突：条目 [id:${current.id}] 期望 rev=${expectedRev}，实际 rev=${current.rev} —— 拒绝误删`,
+          'MEMORY_CAS_CONFLICT',
+          { id: current.id, expectedRev, rev: current.rev },
+        )
+      }
+    }
+
+    const at = normalizeNow(now, 'purge')
+    const event = {
+      id: current.id,
+      layer: targetLayer,
+      rev: current.rev + 1,
+      action: 'purge',
+      byId: author,
+      at,
+      before: clone(current),
+      after: null,
+    }
+    if (!appendJsonl(jsonlPath, event)) {
+      throw new MemoryError(
+        `memory.purge：事件追加失败（${jsonlPath}）——拒绝「只改内存不落盘」`,
+        'MEMORY_APPEND_FAILED',
+        { id: current.id, action: 'purge' },
+      )
+    }
+    entries.delete(current.id)
+    events.push(event)
+    // 全文索引重建：purge 是低频操作，整体重建比增量删除更不容易出错
+    try { indexRebuild() } catch { /* 索引失败不影响正确性，检索会退化 */ }
+    if (!writeJsonAtomic(snapPath, snapshot())) {
+      diagnostics.snapshotWriteFailures += 1
+      warn(`[cs-bots/memory] 快照写入失败（${snapPath}）——事件流已落盘，replay() 可完整恢复`)
+    }
+    return clone(current)
+  }
+
+  /**
    * 从归档恢复（与 `remove`/`archive` 构成往返一致）。归档不是删除，恢复后原文照旧。
    * @param {{ layer: string, id: string, by?: string, now?: number }} input
    * @returns {object} 恢复后的 Entry
@@ -1036,7 +1308,19 @@ export function createMemory(ctx, config = {}) {
       }
 
       if (!target) {
-        const created = add({ layer: targetLayer, content, by: author, source: 'review', tags: item.tags, now: at })
+        // cwd 透传：review 若带着项目上下文来（`item.cwd`），新增条目就归属该项目；
+        // 不带则保持「未归属」——**故意不猜**（猜错归属比不归属更糟，见 cwdVisible 注释）。
+        // 注意：更新既有条目时**不**透传 cwd —— review 按内容签名匹配，命中可能是别的项目的
+        // 同文条目，跟着当前 cwd 改写会把记忆静默搬到另一个项目去。
+        const created = add({
+          layer: targetLayer,
+          content,
+          by: author,
+          source: 'review',
+          tags: item.tags,
+          cwd: item.cwd,
+          now: at,
+        })
         const row = { action: 'added', id: created.id, rev: created.rev }
         results.push(row)
         applied.push(row)
@@ -1638,17 +1922,39 @@ export function createMemory(ctx, config = {}) {
 
   /**
    * 列出条目。
+   *
+   * `cwd` 语义（见文件头「cwd 作用域」）：
+   *   - **不传 / `null`** → 与改造前完全一致（返回全部，含未归属与他项目条目）；
+   *   - **传具体路径** → 全局条目（L0/L1/L2）+ 该 cwd 的 L3/L4/L5；其他 cwd 与
+   *     **未归属项目的**老条目都不返回（故意，见 `cwdVisible`）；
+   *   - **传 `'*'`** → 全部（UI「全部项目」视图）。
+   *
    * @param {{ layer?: string, branch?: string, limit?: number, query?: string,
-   *           includeArchived?: boolean, onlyArchived?: boolean }} [options]
+   *           includeArchived?: boolean, onlyArchived?: boolean, botId?: string,
+   *           cwd?: string }} [options]
    * @returns {object[]}
    */
   function list(options = {}) {
-    const { layer, branch, limit, query, includeArchived, onlyArchived } = options ?? {}
+    // ⚠️ 修复（2026-11-04 测试，P1-3）：list/search 之前不按 botId 过滤，
+    //   Bot 私有记忆对任何 API 调用者可见（与「只在那个 Bot 的 contextFor 里出现」
+    //   的注释自相矛盾）。现在与 contextFor 口径一致：
+    //   ① 传 botId → 只见该 Bot 的私有记忆（可见的可见性，不静默泄露）；
+    //   ② 不传 botId → 只见非私有（无 botId）的记忆。
+    const { layer, branch, limit, query, includeArchived, onlyArchived, botId, cwd } = options ?? {}
     const targetLayer = layer === undefined || layer === null ? undefined : requireLayer(layer, 'list')
     const lim = optionalLimit(limit, 'list')
     const q = optionalString(query, 'query', 'list')
+    // 先归一化（非法 cwd 早失败，避免「查了半天才报错」）
+    const targetCwd = normalizeCwdFilter(cwd, 'list')
 
     let rows = [...entries.values()]
+    if (botId !== undefined && botId !== null && botId !== '') {
+      const bid = requireString(botId, 'botId', 'list')
+      rows = rows.filter((e) => e.botId === bid)
+    } else {
+      rows = rows.filter((e) => !e.botId)
+    }
+    if (targetCwd !== undefined) rows = rows.filter((e) => cwdVisible(e, targetCwd))
     if (targetLayer) rows = rows.filter((e) => e.layer === targetLayer)
     if (onlyArchived === true) rows = rows.filter((e) => e.archived)
     else if (includeArchived !== true) rows = rows.filter((e) => !e.archived)
@@ -1675,12 +1981,14 @@ export function createMemory(ctx, config = {}) {
    * 检索（规定：**用 node:sqlite FTS5**，不可用则退化 `String.includes`）。
    *
    * @param {{ query: string, layers?: string[], branch?: string, limit?: number,
-   *           includeArchived?: boolean }} input
+   *           includeArchived?: boolean, botId?: string, cwd?: string }} input
    * @returns {object[]} 命中条目（按 FTS5 rank / 稳定顺序）
    */
   function search(input = {}) {
-    const { query, layers, branch, limit, includeArchived } = input ?? {}
+    // ⚠️ 修复（2026-11-04 测试，P1-3）：与 list 口径一致，见 list() 顶部注释。
+    const { query, layers, branch, limit, includeArchived, botId, cwd } = input ?? {}
     const q = requireString(query, 'query', 'search')
+    const targetCwd = normalizeCwdFilter(cwd, 'search')
     const layerFilter = layers === undefined || layers === null ? undefined : stringList(layers, 'layers', 'search')
     if (layerFilter) {
       for (const l of layerFilter) {
@@ -1745,6 +2053,8 @@ export function createMemory(ctx, config = {}) {
       .filter((e) => (includeArchived === true ? true : !e.archived))
       .filter((e) => (layerFilter ? layerFilter.includes(e.layer) : true))
       .filter((e) => branchVisible(e, b))
+      .filter((e) => cwdVisible(e, targetCwd))
+      .filter((e) => visibleToBot(e, botId))
     if (lim !== undefined) hits = hits.slice(0, lim)
     return clone(hits)
   }
@@ -1764,11 +2074,30 @@ export function createMemory(ctx, config = {}) {
    * 常驻注入文本（**L0–L3 冻结快照**）：值一旦返回即不受后续变更影响。
    * L0 来自 `config.persona`（人改），其余来自条目；L4/L5 永不进入常驻注入。
    *
-   * @param {{ layers?: string[], branch?: string, title?: string }} [options]
-   * @returns {string}
-   */
+   * ⚠️ 2026-11-04 增强（调研驱动）：新增 **tokenBudget** —— 按 contextWindow
+   *   （cs-myfree 上报的模型窗口）动态裁剪注入量。小窗模型（8k–32k）上
+   *   L0–L3 全量注入可能挤占工具/用户空间（调研：MemOS/Mem0 分级预算）。
+   *   预算耗尽时按「L3 项目 key > L2 团队 > L1 用户 > L0 人格」的**保留优先级**
+   *   截断（L3 离当前任务最近，优先保留）。
+   *
+   * ── cwd 作用域（2026-11-04 对齐记忆进化 #2）──
+   *   传 `cwd` 时只注入「全局条目（L0/L1/L2）+ 当前 cwd 的 L3」（L4/L5 本来就不常驻）；
+   *   不传时保持旧行为（全部可见），并在**诊断**里标 `cwdScoped:false`。
+   *
+   *   为什么默认仍返回**字符串**、`cwdScoped` 走 `withMeta`：`api.js` 的 `/memory/context`
+   *   与 `tools.js` 的 `bot_memory_context` 都按字符串消费 `contextFor()`，33 个既有用例也用
+   *   `assert.match(text, ...)` 断言；把返回值直接改成对象是破坏性变更（且这两个文件不在
+   *   本次改造的写入范围内）。故用显式开关：`withMeta:true` → 返回
+   *   `{ text, cwd, cwdScoped, layers }`；缺省 → 返回字符串。同样的诊断信息另见 `diagnostics()`。
+   *
+   * @param {{ layers?: string[], branch?: string, title?: string, botId?: string,
+   *           tokenBudget?: number, cwd?: string, withMeta?: boolean }} [options]
+   * @returns {string | { text: string, cwd: string|null, cwdScoped: boolean, layers: string[] }}
+  */
   function contextFor(options = {}) {
-    const { layers, branch, title, botId: forBot } = options ?? {}
+    const { layers, branch, title, botId: forBot, tokenBudget, cwd, withMeta } = options ?? {}
+    const rawCwd = cwd
+    const targetCwd = normalizeCwdFilter(cwd, 'contextFor')
     const want = layers === undefined || layers === null
       ? INJECTED_LAYERS.slice()
       : stringList(layers, 'layers', 'contextFor')
@@ -1786,26 +2115,91 @@ export function createMemory(ctx, config = {}) {
       throw new MemoryError('memory.contextFor：branch 过滤只对 L3 有意义', 'MEMORY_BAD_FIELD', { field: 'branch' })
     }
 
-    const out = []
-    out.push(`# cs-bots 分层记忆${title ? ` · ${title}` : ''}`)
-    out.push(`# branch=${b ?? '(all)'} · layers=${want.join(',')} · entries=${entries.size}`
-      + ` · search=${diagnostics.searchBackend}${forBot ? ` · bot=${forBot}` : ''}`)
+    // ⚠️ tokenBudget 计算（2026-11-04 增强）：
+    //   先把所有层渲染成行数组，再按预算裁剪。预算不足时从低优先级层开始整层丢弃，
+    //   并在输出尾部**可见地**标记被丢弃的层（不静默）。
+    const budget = Number.isFinite(tokenBudget) && tokenBudget > 0 ? Math.floor(tokenBudget) : 0
 
+    const header = [
+      `# cs-bots 分层记忆${title ? ` · ${title}` : ''}`,
+      `# branch=${b ?? '(all)'} · layers=${want.join(',')} · entries=${entries.size}`
+        + ` · search=${diagnostics.searchBackend}${forBot ? ` · bot=${forBot}` : ''}`
+        // 只有真按项目裁剪时才在头部标 cwd：不传 cwd 时输出与改造前保持逐字一致（兼容前提）
+        + (targetCwd !== undefined ? ` · cwd=${targetCwd}` : ''),
+    ]
+
+    /** 逐层收集渲染行 */
+    const layersOut = []
     for (const layer of want) {
-      out.push('')
-      out.push(`## ${layer} ${LAYER_NAMES[layer] ?? ''}`.trim())
+      const lines = [`## ${layer} ${LAYER_NAMES[layer] ?? ''}`.trim()]
       if (layer === PERSONA_LAYER) {
-        if (persona.length === 0) out.push('（未配置——人格层只能由人改配置，模型不可写）')
-        else for (const line of persona) out.push(`- ${line}`)
-        continue
+        if (persona.length === 0) lines.push('（未配置——人格层只能由人改配置，模型不可写）')
+        else for (const line of persona) lines.push(`- ${line}`)
+      } else {
+        const rows = [...entries.values()]
+          .filter((e) => e.layer === layer && !e.archived && branchVisible(e, b)
+            && cwdVisible(e, targetCwd) && visibleToBot(e, forBot))
+          .sort((x, y) => (x.id < y.id ? -1 : 1))
+        if (rows.length === 0) lines.push('（空）')
+        else for (const e of rows) lines.push(renderLine(e))
       }
-      const rows = [...entries.values()]
-        .filter((e) => e.layer === layer && !e.archived && branchVisible(e, b) && visibleToBot(e, forBot))
-        .sort((x, y) => (x.id < y.id ? -1 : 1))
-      if (rows.length === 0) out.push('（空）')
-      else for (const e of rows) out.push(renderLine(e))
+      layersOut.push({
+        layer,
+        lines,
+        tokens: estimateTokens(lines.join('\n')),
+        priority: INJECT_PRIORITY[layer] ?? 0,
+      })
     }
-    return out.join('\n')
+
+    /**
+     * 统一出口：默认返回字符串（向后兼容），`withMeta:true` 返回带 `cwdScoped` 的结构。
+     * 同时把「本次注入是否按项目裁剪」写进 diagnostics —— 即使调用方只要字符串，
+     * 上层诊断（UI / 调度器）也能查到。
+     * @param {string} text
+     */
+    function finish(text) {
+      diagnostics.lastContextCwd = rawCwd ?? null
+      diagnostics.lastContextCwdScoped = targetCwd !== undefined
+      if (withMeta === true) {
+        return { text, cwd: targetCwd ?? null, cwdScoped: targetCwd !== undefined, layers: want.slice() }
+      }
+      return text
+    }
+
+    if (budget <= 0) {
+      const out = header.slice()
+      for (const ly of layersOut) out.push('', ...ly.lines)
+      return finish(out.join('\n'))
+    }
+
+    // 按**优先级**（L3 > L2 > L1 > L0）从高到低决定保留顺序，而不是按渲染顺序
+    // （渲染顺序是 L0→L3，直接遍历会让"最先渲染的层"占满预算，与注释说的
+    // 「L3 离当前任务最近、优先保留」相反 —— 2026-11-04 实测抓到并修）。
+    // 例外：L0 人格是身份，即使优先级最低也**永远保留**（丢了身份比丢几条偏好严重）。
+    const headerTokens = estimateTokens(header.join('\n'))
+    const byPriority = [...layersOut].sort((x, y) => (y.priority - x.priority) || (x.layer < y.layer ? -1 : 1))
+    let used = headerTokens
+    const kept = []
+    // 先无条件保留 L0
+    for (const ly of byPriority) {
+      if (ly.layer === PERSONA_LAYER) { kept.push(ly); used += ly.tokens }
+    }
+    for (const ly of byPriority) {
+      if (ly.layer === PERSONA_LAYER) continue
+      if (used + ly.tokens <= budget) { kept.push(ly); used += ly.tokens }
+    }
+    // 渲染仍按 L0→L3 的自然阅读顺序
+    const out2 = header.slice()
+    for (const layer of want) {
+      const ly = kept.find((k) => k.layer === layer)
+      if (ly) out2.push('', ...ly.lines)
+    }
+    if (layersOut.length !== kept.length) {
+      const dropped = layersOut.filter((l) => !kept.includes(l)).map((l) => l.layer).join(',')
+      out2.push(`\n# ⚠️ tokenBudget 生效（预算 ${budget} token）：已丢弃 ${dropped} 层`
+        + '（按 L3>L2>L1>L0 优先级保留，L0 人格永不丢弃）')
+    }
+    return finish(out2.join('\n'))
   }
 
   // ── API：回放与统计 ────────────────────────────────────────────────────────
@@ -1826,6 +2220,80 @@ export function createMemory(ctx, config = {}) {
     }
   }
 
+  /**
+   * 迁移入口：把「未归属项目」的 L3/L4/L5 老条目**批量**打上指定 `cwd`。
+   *
+   * 为什么需要它：改造前写入的老条目没有 `cwd` 字段，按 cwd 过滤时它们在任何具体项目
+   * 视图里都不可见（见 `cwdVisible` 的取舍）。用户需要一个「把历史记忆归到当前项目」的
+   * **显式、可审计**入口 —— 本函数就是那个入口：一次性归属、返回计数与明细，不猜归属。
+   *
+   * 语义细节（都有明确理由，不是随手写的）：
+   *   - 只处理 **L3/L4/L5**：L0/L1/L2 是全局层，没有「归属项目」这回事。
+   *   - 只处理 **`cwd` 尚未设置**的条目：已归属其他项目的**不动**（避免把 B 项目的记忆
+   *     偷到 A 项目），它们计入 `alreadyScoped`，不算 migrated 也不算 skipped。
+   *   - **已归档的未归属条目不动**（计入 `skipped`，code=`MEMORY_ENTRY_ARCHIVED`）：
+   *     归档是审计证据，迁移只作用于活跃条目；`restore()` 之后可以再迁一次。
+   *   - 迁移只改 `cwd` 元数据、**不动正文**，因此按 `explicit` 写者身份执行
+   *     （这是人发起的显式动作，不违反规定 2 的「review/consolidate 不得改 explicit」）。
+   *   - 每条一次 `commit`（rev+1 + 事件流 `action:'migrate'`），所以迁移本身也可回放/可审计；
+   *     单条失败不中断整批，失败条目进 `skippedEntries`（可见，不静默）。
+   *
+   * @param {{ cwd: string, by?: string, now?: number }} input
+   * @returns {{ cwd: string, migrated: number, skipped: number, alreadyScoped: number,
+   *            migratedIds: string[], skippedEntries: object[] }}
+   */
+  function migrateCwd(input = {}) {
+    const { cwd, by, now } = input ?? {}
+    const target = normalizeCwd(cwd, 'cwd', 'migrateCwd')
+    const author = by === undefined || by === null ? 'human' : requireString(by, 'by', 'migrateCwd')
+    const at = normalizeNow(now, 'migrateCwd')
+
+    const migratedIds = []
+    const skippedEntries = []
+    let alreadyScoped = 0
+
+    for (const entry of [...entries.values()]) {
+      if (!cwdScopedLayer(entry.layer)) continue
+      if (typeof entry.cwd === 'string' && entry.cwd !== '') { alreadyScoped += 1; continue }
+      if (entry.archived) {
+        skippedEntries.push({
+          id: entry.id,
+          layer: entry.layer,
+          code: 'MEMORY_ENTRY_ARCHIVED',
+          reason: '已归档条目不改（归档是证据；restore() 后可再迁移一次）',
+        })
+        continue
+      }
+      // cwd 未归属且活跃 → 归属到目标项目（只改 cwd 元数据，正文一字不动）
+      const before = clone(entry)
+      const next = clone(entry)
+      next.rev = entry.rev + 1
+      next.updatedAt = at
+      next.updatedBy = author
+      next.cwd = target
+      try {
+        migratedIds.push(commit(entry.id, 'migrate', author, at, before, next).id)
+      } catch (error) {
+        if (!(error instanceof MemoryError)) throw error
+        skippedEntries.push({ id: entry.id, layer: entry.layer, code: error.code, reason: error.message })
+        warn(`[cs-bots/memory] migrateCwd 跳过 ${entry.id}：${error.code} —— ${error.message}`)
+      }
+    }
+
+    if (migratedIds.length > 0) {
+      info(`[cs-bots/memory] migrateCwd：${migratedIds.length} 条未归属条目 → cwd=${target}`
+        + `（跳过 ${skippedEntries.length} 条，已归属他处 ${alreadyScoped} 条）`)
+    }
+    return {
+      cwd: target,
+      migrated: migratedIds.length,
+      skipped: skippedEntries.length,
+      alreadyScoped,
+      migratedIds,
+      skippedEntries,
+    }
+  }
+
   /** 统计（给记忆中心页面与诊断用）。 */
   function stats() {
     const byLayer = {}
@@ -1833,12 +2301,28 @@ export function createMemory(ctx, config = {}) {
     let archived = 0
     let conflict = 0
     const bySource = {}
+    // 2026-11-04 增强（调研驱动）：按层估 token（token 计量），
+    // 让 UI/诊断能看到"记忆注入花了多少 token"（MemOS/Mem0 统一 token 计量的落地）。
+    const layerTokens = {}
+    let injectedTokens = 0
+    // cwd 聚合（2026-11-04 对齐记忆进化 #2）：byCwd 只统计**有 cwd 的条目**（含归档 ——
+    // 这是库分布，不是注入量）；未归属的隔离层条目单独计数，供 UI 提示「去迁移」。
+    const byCwd = {}
+    let cwdUnassignedActive = 0
+    let cwdUnassignedArchived = 0
     for (const e of entries.values()) {
       const slot = byLayer[e.layer] ?? (byLayer[e.layer] = { active: 0, archived: 0, conflict: 0 })
-      if (e.archived) { slot.archived += 1; archived += 1 } else slot.active += 1
+      if (e.archived) { slot.archived += 1; archived += 1 } else { slot.active += 1; injectedTokens += estimateTokens(renderLine(e)) }
+      layerTokens[e.layer] = (layerTokens[e.layer] ?? 0) + estimateTokens(renderLine(e))
       if (e.conflict === true) { slot.conflict += 1; conflict += 1 }
       const src = e.source ?? 'unknown'
       bySource[src] = (bySource[src] ?? 0) + 1
+      if (typeof e.cwd === 'string' && e.cwd !== '') {
+        byCwd[e.cwd] = (byCwd[e.cwd] ?? 0) + 1
+      } else if (cwdScopedLayer(e.layer)) {
+        if (e.archived) cwdUnassignedArchived += 1
+        else cwdUnassignedActive += 1
+      }
     }
     return {
       stateDir,
@@ -1846,6 +2330,8 @@ export function createMemory(ctx, config = {}) {
       layers: LAYERS,
       injectedLayers: INJECTED_LAYERS,
       entryMax,
+      // ⚠️ 修复（2026-11-04 测试，P2-2）：UI 概览读 `stats.total`，此处之前没有 ⇒ 恒显示 `—`
+      total: entries.size,
       persona: persona.length,
       entries: entries.size,
       active: entries.size - archived,
@@ -1853,6 +2339,21 @@ export function createMemory(ctx, config = {}) {
       conflicts: conflict,
       byLayer,
       bySource,
+      // cwd 聚合：`byCwd` 是需求要求的形态（cwd → 条数，只含有 cwd 的条目）；
+      // `cwd` 段是给 UI 的完整视图（隔离层清单 + 未归属计数，用于提示「历史记忆待归项目」）。
+      byCwd,
+      cwd: {
+        layers: CWD_LAYERS,
+        all: CWD_ALL,
+        byCwd,
+        unassignedActive: cwdUnassignedActive,
+        unassignedArchived: cwdUnassignedArchived,
+      },
+      tokens: {
+        byLayer: layerTokens,
+        injected: INJECTED_LAYERS,
+        injectedEstimate: injectedTokens,
+      },
       events: events.length,
       search: { backend: diagnostics.searchBackend, reason: diagnostics.searchBackendReason, tokenize: diagnostics.ftsTokenize },
       hydration: {
@@ -1881,18 +2382,21 @@ export function createMemory(ctx, config = {}) {
     paths: Object.freeze({ stateDir, jsonl: jsonlPath, snapshot: snapPath, fts: ftsPath }),
     layers: LAYERS,
     injectedLayers: INJECTED_LAYERS,
+    cwdLayers: CWD_LAYERS,
     entryMax,
     add,
     get,
     list,
     update,
     remove,
+    purge,
     archive,
     restore,
     review,
     consolidate,
     search,
     contextFor,
+    migrateCwd,
     history,
     replay,
     stats,

@@ -50,6 +50,8 @@ function boot() {
     ctx,
     stateDir,
     registered,
+    /** 暴露底层 handler（给需要自定义 headers/socket 的安全测试用）。 */
+    handler: () => handler,
     /** 调用 API（method + path + 可选 JSON body）。 */
     async req(method, path, body) {
       assert.ok(handler, 'API handler 应已注册')
@@ -354,6 +356,103 @@ test('POST /wakes/notify 手动唤醒：去重键生效', async () => {
     })
     assert.equal(second.status, 200)
     assert.equal(second.json.result.result, 'skipped', '同键第二次应被去重')
+  } finally {
+    h.cleanup()
+  }
+})
+
+// ── 2026-11-04 测试回归 ──────────────────────────────────────────────────
+// 🔴 设置"陈旧缓存"：POST /settings 写盘成功，但 GET /settings 之前返回启动时的
+//   内存副本（services.settings），导致"保存后立刻 GET 看不到新值"的假象。
+//   修复：GET 返回 saved（磁盘真相源）+ effective（内存生效值）；POST 返回两者。
+test('2026-11-04：POST /settings 后 GET 能读到磁盘上的新值（不陈旧）', async () => {
+  const h = boot()
+  try {
+    const post = await h.req('POST', '/settings', { throttleMs: 7777 })
+    assert.equal(post.status, 200)
+    assert.equal(post.json.saved.throttleMs, 7777, 'POST 应回 saved=磁盘值')
+    assert.equal(post.json.persisted, true, '应明确 persisted=true')
+
+    const get = await h.req('GET', '/settings')
+    assert.equal(get.status, 200)
+    assert.equal(get.json.saved.throttleMs, 7777, 'GET 的 saved 必须来自磁盘（不陈旧）')
+    assert.ok('effective' in get.json, '应同时给出 effective（内存生效值）')
+  } finally {
+    h.cleanup()
+  }
+})
+
+test('2026-11-04：磁盘值与内存生效值不同时给出重启提示', async () => {
+  const h = boot()
+  try {
+    await h.req('POST', '/settings', { throttleMs: 8888 })
+    const get = await h.req('GET', '/settings')
+    assert.ok(get.json.note, '磁盘/内存不同时应提示需重启')
+    assert.match(String(get.json.note), /重启/)
+  } finally {
+    h.cleanup()
+  }
+})
+
+// ── 2026-11-04 测试回归 ─────────────────────────────────────────────────────
+// 🔴 P0：cs-bots 的 HTTP API 此前**完全没有鉴权**——公网 curl 直接 200，
+//   任何人可建任务/改记忆/写房间/改注册表，并借高层绕过受保护区写闸门。
+//   修复方式：所有请求先过 src/fence.js 的 judgeHttp。
+
+test('2026-11-04 P0：经代理的请求在无宿主校验能力时必须 403', async () => {
+  const { judge } = await import('../src/fence.js')
+  const proxied = { method: 'POST', headers: { 'x-forwarded-for': '1.2.3.4', host: 'example.com' } }
+  const verdict = judge(proxied, {})
+  assert.equal(verdict.ok, false)
+  assert.equal(verdict.status, 403)
+})
+
+test('2026-11-04 P0：宿主会话有效才放行，无效 401，抛错 fail-closed', async () => {
+  const { judge } = await import('../src/fence.js')
+  const req = { method: 'GET', headers: { 'x-forwarded-for': '1.2.3.4', host: 'example.com' } }
+
+  assert.equal(judge(req, { getConnection: () => ({ requestRejection: () => 0 }) }).ok, true)
+  assert.equal(judge(req, { getConnection: () => ({ requestRejection: () => 401 }) }).status, 401)
+  assert.equal(judge(req, { getConnection: () => ({ requestRejection: () => 1 }) }).status, 403)
+  assert.equal(
+    judge(req, { getConnection: () => ({ requestRejection: () => { throw new Error('boom') } }) }).status,
+    403,
+    '校验抛错必须 fail-closed，不能当放行',
+  )
+})
+
+test('2026-11-04 P0：跨源 Origin 必须被拒（防 CSRF）', async () => {
+  const { judge } = await import('../src/fence.js')
+  const crossOrigin = {
+    method: 'POST',
+    headers: { origin: 'http://evil.example', host: '150.158.175.241' },
+  }
+  const verdict = judge(crossOrigin, { getConnection: () => ({ requestRejection: () => 0 }) })
+  assert.equal(verdict.ok, false)
+  assert.equal(verdict.reason, 'cross-origin')
+})
+
+test('2026-11-04 P0：API handler 对无会话的代理请求返回 403（端到端）', async () => {
+  const h = boot()
+  try {
+    // 构造"经 nginx 转发的公网请求"：有 x-forwarded-for，且宿主无 connection 服务
+    const payload = [Buffer.from(JSON.stringify({ subject: 'unauth-probe' }), 'utf8')]
+    const request = Object.assign(Readable.from(payload), {
+      method: 'POST',
+      url: `${API_BASE}/tasks`,
+      headers: { 'x-forwarded-for': '1.2.3.4', host: '150.158.175.241' },
+      socket: { remoteAddress: '127.0.0.1' },
+    })
+    let status = 0
+    let raw = ''
+    const response = {
+      writeHead: (code) => { status = code },
+      end: (chunk) => { raw += chunk ?? '' },
+      setHeader: () => {},
+    }
+    await h.handler()(request, response)
+    assert.equal(status, 403, `公网未认证请求必须 403，实际 ${status}`)
+    assert.equal(JSON.parse(raw).ok, false)
   } finally {
     h.cleanup()
   }

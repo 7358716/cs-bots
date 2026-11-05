@@ -518,3 +518,101 @@ test('createBoard：config.stateDir 优先；缺省时若 kernel 不可用则抛
   }
   void t
 })
+
+// ── 2026-11-04 测试回归 ─────────────────────────────────────────────────────
+// 🔴 P0-3：tools.js schema / README / UI 都承诺 unblock 与 set，board 实现里没有 ⇒
+//   BOARD_BAD_ACTION。另外 block 的 reason 字段被静默忽略（实现只读 note）。
+
+test('2026-11-04 P0-3：unblock 动作存在且把 blocked 拉回 pending', (t) => {
+  const { board } = setup(t)
+  const a = seed(board, { subject: 'A' })
+  const blocked = board.update({ id: a.id, expectedRev: 1, action: 'block', byId: 'lead', reason: 'WHY' })
+  assert.equal(blocked.status, 'blocked')
+  assert.equal(blocked.blockedReason, 'WHY', 'reason 字段必须被记录（修复前被静默丢弃）')
+
+  const un = board.update({ id: a.id, expectedRev: 2, action: 'unblock', byId: 'lead' })
+  assert.equal(un.status, 'pending')
+  assert.equal(un.blockedReason, undefined)
+})
+
+test('2026-11-04 P0-3：unblock 在有未完成依赖时保持 blocked', (t) => {
+  const { board } = setup(t)
+  const parent = seed(board, { subject: 'P' })
+  const child = seed(board, { subject: 'C', blockedBy: [parent.id] })
+  const b2 = board.update({ id: child.id, expectedRev: 1, action: 'block', byId: 'lead' })
+  const un = board.update({ id: child.id, expectedRev: b2.rev, action: 'unblock', byId: 'lead' })
+  assert.equal(un.status, 'blocked', '依赖未完成 → 保持 blocked')
+})
+
+test('2026-11-04 P0-3：set 动作存在且能改字段', (t) => {
+  const { board } = setup(t)
+  const a = seed(board, { subject: 'A' })
+  const r = board.update({ id: a.id, expectedRev: 1, action: 'set', byId: 'lead', priority: 8, subject: 'A2' })
+  assert.equal(r.priority, 8)
+  assert.equal(r.subject, 'A2')
+})
+
+test('2026-11-04 P0-3：set 拒绝非法 status（completed 必须走 complete/accept）', (t) => {
+  const { board } = setup(t)
+  const a = seed(board, { subject: 'A' })
+  assert.throws(
+    () => board.update({ id: a.id, expectedRev: 1, action: 'set', byId: 'lead', status: 'completed' }),
+    (e) => e instanceof BoardError && e.code === 'BOARD_BAD_FIELD',
+  )
+})
+
+// 🔴 P1-1：accept 之前只看「任务存在」，任何状态都能被 pass 置 completed，
+//   绕过 complete() 的 blockedBy/lease/artifacts 校验。
+
+test('2026-11-04 P1-1：accept/pass 拒绝未完成的任务（不能绕过依赖与产出物）', (t) => {
+  const { board } = setup(t)
+  const a = seed(board, { subject: 'A' })
+  assert.throws(
+    () => board.accept({ id: a.id, by: 'lead', result: 'pass' }),
+    (e) => e instanceof BoardError && e.code === 'BOARD_BAD_STATE',
+  )
+})
+
+test('2026-11-04 P1-1：accept/pass 拒绝依赖未完成的 completed 任务', (t) => {
+  const { board } = setup(t)
+  const parent = seed(board, { subject: 'P' })
+  const child = seed(board, { subject: 'C', blockedBy: [parent.id] })
+  // 直接把 child 置 completed（绕过 complete 的依赖校验，模拟历史脏数据）
+  const c = board.update({ id: child.id, expectedRev: 1, action: 'set', byId: 'lead', status: 'in_progress' })
+  board.update({ id: child.id, expectedRev: c.rev, action: 'complete', byId: 'lead', artifacts: ['x'] }).catch?.(() => {})
+  // 依赖未完成时不能验收 → 应当抛错（无论走哪条分支）
+  let threw = false
+  try {
+    board.accept({ id: child.id, by: 'lead', result: 'pass' })
+  } catch { threw = true }
+  assert.equal(threw, true, '依赖未完成时 accept/pass 必须拒绝')
+})
+
+// 🔴 P1-4：expireLeases 之前无任何调用者 ⇒ 租约永不回收。
+
+test('2026-11-04 P1-4：expireLeases 把过期租约任务回收成 pending', (t) => {
+  const { board } = setup(t)
+  const a = seed(board, { subject: 'A' })
+  const claimed = board.update({ id: a.id, expectedRev: 1, action: 'claim', byId: 'worker', leaseMs: 1000 })
+  assert.equal(claimed.status, 'in_progress')
+  // 时间推进到租约过期之后
+  const later = claimed.lease.expiresAt + 1000
+  const recycled = board.expireLeases({ now: later })
+  assert.deepEqual(recycled, [a.id])
+  const after = board.get(a.id)
+  assert.equal(after.status, 'pending')
+  assert.equal(after.lease, undefined)
+})
+
+// ── 2026-11-04 测试回归 ─────────────────────────────────────────────────────
+// 🔴 P2-2：board 没有 stats() ⇒ /status 与 UI 概览里任务数恒显示 `—`。
+test('2026-11-04 P2-2：board.stats() 存在且含 total', (t) => {
+  const { board } = setup(t)
+  seed(board, { subject: 'A' })
+  seed(board, { subject: 'B' })
+  const st = board.stats()
+  assert.equal(typeof st, 'object')
+  assert.equal(st.total, 2)
+  assert.ok(st.byStatus)
+  assert.equal(st.ready, 2)
+})

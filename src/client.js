@@ -79,6 +79,12 @@ window.__ModuleLoader__.load({
 .csb-tab-on{color:var(--dsw-alias-label-primary);font-weight:500}
 .csb-tab-on::after{content:"";position:absolute;left:9px;right:9px;bottom:-1px;height:2px;
   background:var(--dsw-alias-brand-primary);border-radius:2px 2px 0 0}
+.csb-subtabs{display:flex;gap:4px;padding:8px 0 10px;overflow-x:auto;border-top:1px solid var(--dsw-alias-border-l1);margin-top:8px}
+.csb-subtab{padding:5px 11px;border-radius:999px;border:1px solid transparent;background:transparent;
+  cursor:pointer;white-space:nowrap;color:var(--dsw-alias-label-secondary);font-size:12.5px;font-family:inherit}
+.csb-subtab:hover{color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-2)}
+.csb-subtab-on{color:var(--dsw-alias-label-primary);font-weight:500;
+  background:var(--dsw-alias-bg-layer-2);border-color:var(--dsw-alias-border-l2)}
 .csb-body{flex:1;overflow-y:auto;padding:20px 24px 56px;min-height:0}
 .csb-wrap{max-width:920px;margin:0 auto}
 
@@ -107,6 +113,19 @@ window.__ModuleLoader__.load({
   line-height:1;cursor:pointer;padding:4px 6px;font-family:inherit}
 .csb-btn-x:hover{color:var(--dsw-alias-label-primary)}
 
+.csb-field{display:flex;flex-direction:column;gap:5px;margin-bottom:14px}
+.csb-field-l{font-size:12.5px;font-weight:500}
+.csb-field-h{font-size:11.5px;color:var(--dsw-alias-label-secondary);line-height:1.5}
+.csb-field-c{display:flex;flex-direction:column;gap:6px}
+.csb-notice{display:flex;align-items:center;gap:8px;padding:9px 12px;border-radius:9px;margin-bottom:12px;
+  font-size:12.5px;border:1px solid transparent}
+.csb-notice-t{flex:1;min-width:0}
+.csb-notice-ok{background:color-mix(in srgb,var(--dsw-alias-state-success-primary) 10%,transparent);
+  border-color:color-mix(in srgb,var(--dsw-alias-state-success-primary) 35%,transparent)}
+.csb-notice-err{background:color-mix(in srgb,var(--dsw-alias-state-error-primary) 10%,transparent);
+  border-color:color-mix(in srgb,var(--dsw-alias-state-error-primary) 35%,transparent)}
+.csb-b-warn{color:var(--dsw-alias-state-warning-primary);
+  border-color:color-mix(in srgb,var(--dsw-alias-state-warning-primary) 40%,transparent)}
 .csb-list{display:flex;flex-direction:column;gap:8px}
 .csb-card{display:flex;align-items:center;gap:12px;padding:12px 14px;border-radius:12px;
   border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-1)}
@@ -851,20 +870,58 @@ window.__ModuleLoader__.load({
 
     // ── 技能库 / 工作流库 ───────────────────────────────────────────────────
 
+    const SKILL_SOURCES = [
+      { id: 'custom', label: '自建' },
+      { id: 'user', label: '用户级' },
+      { id: 'project', label: '项目级' },
+      { id: 'bundled', label: '系统自带' },
+    ]
+
     function SkillsTab() {
-      const { data, loading, error, reload } = useApi('/library/skills')
+      const [source, setSource] = useState('')
+      const qs = new URLSearchParams({ all: '1' })
+      if (source) qs.set('source', source)
+      const { data, loading, error, reload } = useApi(`/library/skills?${qs.toString()}`, [source])
       const [editing, setEditing] = useState(null) // null | {} | skill
       const [confirmDel, setConfirmDel] = useState(null)
       const [err, setErr] = useState(null)
+      const [ok, setOk] = useState(null)
+      const [importing, setImporting] = useState(null)
+      const [showDirs, setShowDirs] = useState(false)
       const skills = data?.skills ?? []
+
+      const toggleEnabled = async (s) => {
+        setErr(null)
+        try {
+          await call('/library/skills/enable', {
+            method: 'POST',
+            body: { id: s.id, enabled: s.enabled === false, expectedRev: s.rev },
+          })
+          setOk(s.enabled === false ? '已启用' : '已停用（不删除，只是不再加载）')
+          reload()
+        } catch (e) {
+          setErr(e.message)
+        }
+      }
 
       return h('div', { className: 'csb-wrap' },
         h(Section, {
           title: '技能库',
-          desc: '可复用的「怎么做某件事」的说明书。建好后可以在 Bot 的档案里关联，Bot 就能在它自己的工作目录里加载到。',
+          desc: '可复用的「怎么做某件事」的说明书。建好后可以在 Bot 的档案里关联，Bot 就能在它自己的工作目录里加载到。'
+            + '也可以从文件/目录直接导入现成的 SKILL.md。',
         }),
         h('div', { className: 'csb-bar', style: { marginTop: 12 } },
+          h('select', {
+            className: 'csb-sel', style: { width: 130 }, value: source,
+            onChange: (e) => setSource(e.target.value),
+          },
+          h('option', { value: '' }, '全部来源'),
+          SKILL_SOURCES.map((x) => h('option', { key: x.id, value: x.id }, x.label))),
+          h('span', { className: 'csb-spacer' }),
+          h('button', { className: 'csb-btn', onClick: () => setImporting({ mode: 'paste', text: '', dir: '', items: [] }) }, '导入技能'),
+          h('button', { className: 'csb-btn', onClick: () => setShowDirs(true) }, '来源目录'),
           h('button', { className: 'csb-btn csb-btn-p', onClick: () => setEditing({}) }, '新建技能')),
+        h(Notice, { kind: 'ok', onClose: () => setOk(null) }, ok),
         err ? h('div', { className: 'csb-err' }, err) : null,
         error ? h('div', { className: 'csb-err' }, error) : null,
         loading ? h(Skeleton, { n: 2 }) : null,
@@ -876,15 +933,37 @@ window.__ModuleLoader__.load({
             h('div', { className: 'csb-card-main' },
               h('div', { className: 'csb-card-t' }, s.name),
               h('div', { className: 'csb-card-m' },
+                h('span', { className: 'csb-b' }, (SKILL_SOURCES.find((x) => x.id === (s.source ?? 'custom')) ?? {}).label ?? '自建'),
+                s.enabled === false ? h('span', { className: 'csb-b csb-b-idle' }, '已停用') : null,
                 s.description ? h('span', null, s.description) : h('span', null, '（无说明）'),
                 h('span', null, `· 第 ${s.rev} 版`))),
             h('div', { style: { display: 'flex', gap: 6, flex: 'none' } },
+              h('button', { className: 'csb-btn csb-btn-s', onClick: () => toggleEnabled(s) }, s.enabled === false ? '启用' : '停用'),
               h('button', { className: 'csb-btn csb-btn-s', onClick: () => setEditing(s) }, '编辑'),
               h('button', { className: 'csb-btn csb-btn-s csb-btn-d', onClick: () => setConfirmDel(s) }, '删除'))))),
         editing
           ? h(SkillEditor, {
               skill: editing, onClose: () => setEditing(null),
               onSaved: () => { setEditing(null); reload() },
+              onError: setErr,
+            })
+          : null,
+        showDirs
+          ? h(SkillDirsModal, {
+              onClose: () => setShowDirs(false),
+              onError: setErr,
+              onImport: (dir) => {
+                setShowDirs(false)
+                setImporting({ mode: 'dir', dir, text: '', items: [] })
+              },
+            })
+          : null,
+        importing
+          ? h(SkillImportModal, {
+              state: importing,
+              onChange: setImporting,
+              onClose: () => setImporting(null),
+              onDone: (msg) => { setImporting(null); setOk(msg); reload() },
               onError: setErr,
             })
           : null,
@@ -961,6 +1040,246 @@ window.__ModuleLoader__.load({
             placeholder: '写清楚：什么情况下用它、具体步骤、判断标准、常见坑。',
             onChange: (e) => setForm({ ...form, body: e.target.value }),
           })))
+    }
+
+
+    /** 技能来源目录：登记几个常放技能的目录，以后一键扫描导入。只登记目录，不复制文件。 */
+    function SkillDirsModal({ onClose, onError, onImport }) {
+      const { data, loading, reload } = useApi('/library/skills/dirs')
+      const [dir, setDir] = useState('')
+      const [label, setLabel] = useState('')
+      const [err, setErr] = useState(null)
+      const [busy, setBusy] = useState(false)
+      const dirs = data?.dirs ?? []
+
+      const add = async () => {
+        const d = dir.trim()
+        if (!d) return
+        setBusy(true)
+        setErr(null)
+        try {
+          await call('/library/skills/dirs/add', { method: 'POST', body: { dir: d, label: label.trim() || null } })
+          setDir('')
+          setLabel('')
+          reload()
+        } catch (e) {
+          setErr(e.message)
+        } finally {
+          setBusy(false)
+        }
+      }
+
+      const remove = async (target) => {
+        setErr(null)
+        try {
+          await call('/library/skills/dirs/remove', { method: 'POST', body: { dir: target } })
+          reload()
+        } catch (e) {
+          setErr(e.message)
+        }
+      }
+
+      return h(Modal, {
+        title: '技能来源目录',
+        wide: true,
+        onClose,
+        footer: [h('button', { key: 'c', className: 'csb-btn', onClick: onClose }, '关闭')],
+      },
+        h('p', { style: { color: 'var(--dsw-alias-label-secondary)', fontSize: 12 } },
+          '登记存放技能的目录后，可以随时扫描把它们导进技能库。登记只是「记住这个位置」，不会复制或改动磁盘上的文件。'),
+        h('div', { className: 'csb-bar', style: { marginTop: 12 } },
+          h('input', {
+            className: 'csb-in csb-grow', placeholder: '目录路径，例如 /home/you/.agents/skills',
+            value: dir, onChange: (e) => setDir(e.target.value),
+            onKeyDown: (e) => e.key === 'Enter' && add(),
+          }),
+          h('input', {
+            className: 'csb-in', style: { width: 140 }, placeholder: '备注名（可选）',
+            value: label, onChange: (e) => setLabel(e.target.value),
+          }),
+          h('button', { className: 'csb-btn csb-btn-p', disabled: busy || !dir.trim(), onClick: add }, '登记')),
+        h(Notice, { kind: 'err', onClose: () => setErr(null) }, err),
+        loading ? h(Skeleton, { n: 1 }) : null,
+        !loading && dirs.length === 0
+          ? h(Empty, {
+              icon: '⌸',
+              title: '还没登记任何目录',
+              hint: '把常放技能的地方登记进来，以后改完技能点一下就能重新导入。',
+            })
+          : null,
+        h('div', { className: 'csb-list' }, dirs.map((d) => h('div', { key: d.dir, className: 'csb-card' },
+          h('div', { className: 'csb-card-main' },
+            h('div', { className: 'csb-card-t' }, d.label || short(d.dir, 50)),
+            h('div', { className: 'csb-card-m' },
+              h('span', { className: 'csb-mono', style: { fontSize: 11.5 } }, d.dir),
+              d.exists === false
+                ? h('span', { className: 'csb-b csb-b-err' }, '目录不见了')
+                : h('span', { className: 'csb-b csb-b-ok' }, `${d.skillCount ?? 0} 个技能`))),
+          h('div', { style: { display: 'flex', gap: 6, flex: 'none' } },
+            h('button', {
+              className: 'csb-btn csb-btn-s csb-btn-p',
+              disabled: d.exists === false,
+              onClick: () => onImport(d.dir),
+            }, '扫描导入'),
+            h('button', { className: 'csb-btn csb-btn-s csb-btn-d', onClick: () => remove(d.dir) }, '取消登记'))))))
+    }
+
+    /** 技能导入：两种方式（粘贴 SKILL.md / 扫描目录），导入前先预览。 */
+    function SkillImportModal({ state, onChange, onClose, onDone, onError }) {
+      const [busy, setBusy] = useState(false)
+      const [parsed, setParsed] = useState(null)
+      const [scanned, setScanned] = useState(null)
+      const [picked, setPicked] = useState([])
+      const [mode, setMode] = useState('skip')
+      const [err, setErr] = useState(null)
+
+      const parseText = async () => {
+        setErr(null)
+        setBusy(true)
+        try {
+          const d = await call('/library/skills/parse', {
+            method: 'POST',
+            body: { text: state.text ?? '', filename: 'SKILL.md' },
+          })
+          setParsed(d.parsed)
+          setPicked([d.parsed.name])
+        } catch (e) {
+          setErr(e.message)
+          setParsed(null)
+        } finally {
+          setBusy(false)
+        }
+      }
+
+      const scanDir = async () => {
+        setErr(null)
+        setBusy(true)
+        try {
+          const d = await call('/library/skills/scan', { method: 'POST', body: { dir: state.dir } })
+          setScanned(d)
+          setPicked((d.items ?? []).map((x) => x.name))
+        } catch (e) {
+          setErr(e.message)
+          setScanned(null)
+        } finally {
+          setBusy(false)
+        }
+      }
+
+      const items = () => {
+        if (state.mode === 'paste') return parsed ? [parsed] : []
+        return (scanned?.items ?? []).filter((x) => picked.includes(x.name))
+      }
+
+      const doImport = async () => {
+        const list = items()
+        if (list.length === 0) {
+          setErr('没有可导入的技能')
+          return
+        }
+        setErr(null)
+        setBusy(true)
+        try {
+          const d = await call('/library/skills/import', {
+            method: 'POST',
+            body: { items: list, mode },
+          })
+          const r = d.result ?? {}
+          const parts = []
+          if ((r.created ?? []).length) parts.push(`新增 ${r.created.length} 个`)
+          if ((r.updated ?? []).length) parts.push(`覆盖 ${r.updated.length} 个`)
+          if ((r.skipped ?? []).length) parts.push(`跳过 ${r.skipped.length} 个（已存在）`)
+          if ((r.errors ?? []).length) parts.push(`失败 ${r.errors.length} 个`)
+          onDone(parts.length ? `导入完成：${parts.join('，')}` : '没有变化')
+        } catch (e) {
+          setErr(e.message)
+        } finally {
+          setBusy(false)
+        }
+      }
+
+      return h(Modal, {
+        title: '导入技能',
+        wide: true,
+        onClose,
+        footer: [
+          h('button', { key: 'c', className: 'csb-btn', onClick: onClose }, '取消'),
+          h('button', {
+            key: 'i',
+            className: 'csb-btn csb-btn-p',
+            disabled: busy || items().length === 0,
+            onClick: doImport,
+          }, busy ? '导入中…' : `导入 ${items().length} 个`),
+        ],
+      },
+        h('div', { className: 'csb-bar' },
+          h('button', {
+            className: `csb-btn csb-btn-s${state.mode === 'paste' ? ' csb-btn-p' : ''}`,
+            onClick: () => onChange({ ...state, mode: 'paste' }),
+          }, '粘贴 SKILL.md'),
+          h('button', {
+            className: `csb-btn csb-btn-s${state.mode === 'dir' ? ' csb-btn-p' : ''}`,
+            onClick: () => onChange({ ...state, mode: 'dir' }),
+          }, '从目录导入')),
+
+        state.mode === 'paste'
+          ? h('div', null,
+              h(Field, { label: '把 SKILL.md 的内容粘进来', hint: '格式：开头用 --- 包住 name/description，下面是正文' },
+                h('textarea', {
+                  className: 'csb-ta',
+                  style: { minHeight: 200, fontFamily: 'ui-monospace,monospace' },
+                  placeholder: '---\nname: deploy-check\ndescription: 部署前检查环境与端口\n---\n\n# 部署前检查\n\n1. 核对环境变量\n2. 核对端口占用',
+                  value: state.text ?? '',
+                  onChange: (e) => onChange({ ...state, text: e.target.value }),
+                })),
+              h('button', { className: 'csb-btn', disabled: busy || !(state.text ?? '').trim(), onClick: parseText }, '解析预览'),
+              parsed
+                ? h('div', { style: { marginTop: 12 } },
+                    h('div', { className: 'csb-card-m' },
+                      h('span', { className: 'csb-b csb-b-ok' }, '解析成功'),
+                      h('span', { className: 'csb-b' }, parsed.name),
+                      parsed.tags?.length ? h('span', null, parsed.tags.map((t) => `#${t}`).join(' ')) : null),
+                    parsed.description ? h('div', { className: 'csb-field-h', style: { marginTop: 4 } }, parsed.description) : null)
+                : null)
+          : h('div', null,
+              h(Field, { label: '技能目录', hint: '填一个存放技能文件夹的目录，会读出里面每个 SKILL.md' },
+                h('input', {
+                  className: 'csb-in', placeholder: '/home/you/.agents/skills',
+                  value: state.dir ?? '',
+                  onChange: (e) => onChange({ ...state, dir: e.target.value }),
+                })),
+              h('button', { className: 'csb-btn', disabled: busy || !(state.dir ?? '').trim(), onClick: scanDir }, '扫描目录'),
+              scanned
+                ? h('div', { style: { marginTop: 12 } },
+                    h('div', { className: 'csb-field-h' }, `扫描到 ${(scanned.items ?? []).length} 个技能`),
+                    h('div', { className: 'csb-list', style: { marginTop: 8 } },
+                      (scanned.items ?? []).map((x) => h('label', { key: x.name, className: 'csb-pick-i' },
+                        h('input', {
+                          type: 'checkbox',
+                          checked: picked.includes(x.name),
+                          onChange: (e) => {
+                            setPicked(e.target.checked
+                              ? [...picked, x.name]
+                              : picked.filter((n) => n !== x.name))
+                          },
+                        }),
+                        h('span', null, x.name),
+                        x.description ? h('span', { className: 'csb-set-d' }, x.description) : null))),
+                    (scanned.errors ?? []).length
+                      ? h('div', { className: 'csb-field-h', style: { color: 'var(--dsw-alias-state-error-primary)' } },
+                          `${scanned.errors.length} 个文件读不出来（会跳过）`)
+                      : null)
+                : null),
+
+        h(Field, { label: '如果已经有同名技能', hint: '点「导入」前先选好' },
+          h('select', {
+            className: 'csb-sel', value: mode, onChange: (e) => setMode(e.target.value),
+          },
+          h('option', { value: 'skip' }, '跳过（保留现有的）'),
+          h('option', { value: 'overwrite' }, '覆盖（用导入的替换）'),
+          h('option', { value: 'rename' }, '保留两者（新的自动改名）'))),
+
+        err ? h('div', { className: 'csb-err' }, err) : null)
     }
 
     function WorkflowsTab() {
@@ -1276,11 +1595,15 @@ window.__ModuleLoader__.load({
         if (data && draft === null) {
           const p = data.profile ?? {}
           setDraft({
+            title: p.title ?? '',
             identity: p.identity ?? '',
+            persona: p.persona ?? '',
+            boundaries: p.boundaries ?? '',
             experience: p.experience ?? '',
             skills: Array.isArray(p.skills) ? [...p.skills] : [],
             workflows: Array.isArray(p.workflows) ? [...p.workflows] : [],
             memory: Array.isArray(p.memory) ? [...p.memory] : [],
+            disciplineIds: Array.isArray(p.disciplineIds) ? [...p.disciplineIds] : [],
           })
         }
       }, [data, draft])
@@ -1328,21 +1651,42 @@ window.__ModuleLoader__.load({
             ? h('div', { className: 'csb-note' }, '你的 AGENTS.md 里还有手写内容 —— 保存档案不会覆盖它，只改 cs-bots 托管的那一段。')
             : null,
 
-          h(Section, { title: '① 身份', desc: '它是谁。这段话会在每次对话开始前进到它的上下文里。' }),
+          h(Section, { title: '① 岗位名', desc: '一句话说清它是什么角色。会作为档案里的小标题显示。' }),
+          h('input', {
+            className: 'csb-in', style: { marginTop: 10 },
+            placeholder: '例如：后端负责人 / 发布管理员 / 代码审查员',
+            value: draft.title, onChange: (e) => setDraft({ ...draft, title: e.target.value }),
+          }),
+
+          h(Section, { title: '② 人格与说话方式', desc: '它该用什么性格、什么口吻跟你说话。不填就用默认的。' }),
+          h('textarea', {
+            className: 'csb-ta', style: { marginTop: 10 },
+            placeholder: '例如：说话先给结论再列证据；不确定就明说不知道，不许编；不要用"作为一个 AI"这类腔调。',
+            value: draft.persona, onChange: (e) => setDraft({ ...draft, persona: e.target.value }),
+          }),
+
+          h(Section, { title: '③ 边界与红线', desc: '绝对不许它做的事。写在这里的每一条都会强约束它。' }),
+          h('textarea', {
+            className: 'csb-ta', style: { marginTop: 10, minHeight: 90 },
+            placeholder: '例如：不许直接改生产数据；未经确认不许删除或推送；不许替我做付费决定。',
+            value: draft.boundaries, onChange: (e) => setDraft({ ...draft, boundaries: e.target.value }),
+          }),
+
+          h(Section, { title: '④ 身份', desc: '它是谁、负责什么。这段话会在每次对话开始前进到它的上下文里。' }),
           h('textarea', {
             className: 'csb-ta', style: { marginTop: 10 },
             placeholder: '例如：你是本项目的后端工程师，负责 API 设计、数据模型与数据库迁移；对 SQL 性能负责；拿不准时先给方案再动手。',
             value: draft.identity, onChange: (e) => setDraft({ ...draft, identity: e.target.value }),
           }),
 
-          h(Section, { title: '② 经验与规矩', desc: '它踩过的坑、你定下的规矩。写在这里的每一条，它每次都会看到。' }),
+          h(Section, { title: '⑤ 经验与规矩', desc: '它踩过的坑、你定下的规矩。写在这里的每一条，它每次都会看到。' }),
           h('textarea', {
             className: 'csb-ta', style: { marginTop: 10, minHeight: 100 },
             placeholder: '例如：改数据库结构必须先写迁移；禁止直接 force push；测试必须全绿才算完成。',
             value: draft.experience, onChange: (e) => setDraft({ ...draft, experience: e.target.value }),
           }),
 
-          h(Section, { title: '③ 技能', desc: '从技能库挑，或临时加一个名字。勾选的技能会同步到它自己目录下的 .agents/skills/，别的 Bot 看不到。' }),
+          h(Section, { title: '⑥ 技能', desc: '从技能库挑，或临时加一个名字。勾选的技能会同步到它自己目录下的 .agents/skills/，别的 Bot 看不到。' }),
           h('div', { className: 'csb-pick', style: { marginTop: 10 } },
             libSkills.length === 0
               ? h('div', { className: 'csb-set-d', style: { padding: '8px 9px' } }, '技能库还是空的 —— 先去「技能库」页建一个')
@@ -1388,7 +1732,7 @@ window.__ModuleLoader__.load({
                     h('button', { className: 'csb-tag-x', onClick: () => setDraft({ ...draft, skills: draft.skills.filter((x) => x !== s) }) }, '×'))))
             : null,
 
-          h(Section, { title: '④ 工作流', desc: '这个 Bot 干活时该按哪套步骤。勾选后会写进它的身份说明里。' }),
+          h(Section, { title: '⑦ 工作流', desc: '这个 Bot 干活时该按哪套步骤。勾选后会写进它的身份说明里。' }),
           h('div', { className: 'csb-pick', style: { marginTop: 10 } },
             libWfs.length === 0
               ? h('div', { className: 'csb-set-d', style: { padding: '8px 9px' } }, '工作流库还是空的 —— 先去「工作流库」页建一个')
@@ -1407,7 +1751,7 @@ window.__ModuleLoader__.load({
                     h('span', null, w.name),
                     h('span', { className: 'csb-set-d' }, `${(w.steps ?? []).length} 步`)))),
 
-          h(Section, { title: '⑤ 预制记忆', desc: '它一开始就该知道的事实。会写进身份说明，同时存进记忆服务（按 Bot 隔离，可检索）。' }),
+          h(Section, { title: '⑧ 预制记忆', desc: '它一开始就该知道的事实。会写进身份说明，同时存进记忆服务（按 Bot 隔离，可检索）。' }),
           h('div', { className: 'csb-tags', style: { marginTop: 10 } },
             draft.memory.length === 0 ? h('span', { className: 'csb-set-d' }, '（还没有）') : null,
             draft.memory.map((m, i) =>
@@ -1434,7 +1778,29 @@ window.__ModuleLoader__.load({
                 setDraft({ ...draft, memory: [...draft.memory, n] })
                 setMemInput('')
               },
-            }, '添加')),
+            }, '添加'),
+            h('button', {
+              className: 'csb-btn',
+              title: '把记忆库里已有的条目挑出来，一键加入这个 Bot 的预制记忆',
+              onClick: async () => {
+                setErr(null)
+                try {
+                  const d = await call('/memory?layer=L2')
+                  const rows = (d.entries ?? []).map((e) => e.content).filter(Boolean)
+                  const key = (x) => String(x).trim().replace(/\s+/g, ' ').toLowerCase()
+                  const existing = new Set(draft.memory.map(key))
+                  const add = rows.filter((r) => !existing.has(key(r)))
+                  if (add.length === 0) {
+                    setMsg('记忆库里没有新的条目可导入')
+                    return
+                  }
+                  setDraft({ ...draft, memory: [...draft.memory, ...add] })
+                  setMsg(`已从记忆库导入 ${add.length} 条（去重后）`)
+                } catch (e) {
+                  setErr(e.message)
+                }
+              },
+            }, '从记忆库导入')),
 
           data.managedText
             ? h('div', null,
@@ -1447,14 +1813,18 @@ window.__ModuleLoader__.load({
     // ── 房间 ────────────────────────────────────────────────────────────────
 
     function RoomsTab() {
-      const { data, loading, error, reload } = useApi('/rooms')
+      const [showArchived, setShowArchived] = useState(false)
+      const { data, loading, error, reload } = useApi(`/rooms${showArchived ? '?includeArchived=1' : ''}`, [showArchived])
       const { data: rosterData } = useApi('/roster')
       const [active, setActive] = useState(null)
       const [msgs, setMsgs] = useState([])
       const [text, setText] = useState('')
       const [roomName, setRoomName] = useState('')
       const [err, setErr] = useState(null)
+      const [ok, setOk] = useState(null)
       const [editing, setEditing] = useState(null)
+      const [confirmDel, setConfirmDel] = useState(null)
+      const [showBody, setShowBody] = useState(null)
       const endRef = useRef(null)
 
       const bots = rosterData?.bots ?? []
@@ -1462,7 +1832,8 @@ window.__ModuleLoader__.load({
       const current = rooms.find((r) => r.id === active)
 
       const loadMsgs = useCallback((roomId) => {
-        call(`/rooms/messages?roomId=${encodeURIComponent(roomId)}`)
+        // withBody=1：超级管理员直接把长正文一起拿回来，不用逐条二次请求
+        call(`/rooms/messages?roomId=${encodeURIComponent(roomId)}&withBody=1`)
           .then((d) => setMsgs(d.messages ?? []))
           .catch((e) => setErr(e.message))
       }, [])
@@ -1478,31 +1849,47 @@ window.__ModuleLoader__.load({
         if (!n) return
         setErr(null)
         try {
-          const r = await call('/rooms', { method: 'POST', body: { name: n, members: ['user'] } })
+          const r = await call('/rooms', { method: 'POST', body: { name: n, members: ['user'], byId: 'user' } })
           setRoomName('')
+          setOk('房间已创建')
           reload()
           setActive(r.room?.id ?? null)
         } catch (e) {
           setErr(e.message)
         }
       }
+
       const post = async () => {
         const t = text.trim()
         if (!t || !active) return
         setErr(null)
         try {
-          await call('/rooms/post', { method: 'POST', body: { roomId: active, text: t } })
+          await call('/rooms/post', { method: 'POST', body: { roomId: active, text: t, from: 'user' } })
           setText('')
           loadMsgs(active)
         } catch (e) {
           setErr(e.message)
         }
       }
+
       const member = async (op, sessionId) => {
         if (!sessionId || !active) return
         setErr(null)
         try {
-          await call(`/rooms/${op}`, { method: 'POST', body: { roomId: active, sessionId } })
+          await call(`/rooms/${op}`, { method: 'POST', body: { roomId: active, sessionId, byId: 'user' } })
+          reload()
+        } catch (e) {
+          setErr(e.message)
+        }
+      }
+
+      const archive = async (r, on) => {
+        setErr(null)
+        try {
+          await call(`/rooms/${on ? 'archive' : 'unarchive'}`, {
+            method: 'POST', body: { roomId: r.id, expectedRev: r.rev },
+          })
+          setOk(on ? '已归档（可以随时恢复）' : '已恢复')
           reload()
         } catch (e) {
           setErr(e.message)
@@ -1512,7 +1899,8 @@ window.__ModuleLoader__.load({
       return h('div', { className: 'csb-wrap' },
         h(Section, {
           title: '房间 = 群聊',
-          desc: '你的理解基本对：房间就是一群成员共用的消息流。只比普通群聊多两件事 —— 成员是「会话」，而且消息可以直接转发去唤醒某个 Bot。',
+          desc: '房间就是一群成员共用的消息流。成员是「会话」，消息可以直接转发去唤醒某个 Bot。'
+            + '你是超级管理员：所有房间都能进、都能看全文、都能改设置。',
         }),
         h('div', { className: 'csb-bar', style: { marginTop: 12 } },
           h('input', {
@@ -1520,13 +1908,20 @@ window.__ModuleLoader__.load({
             value: roomName, onChange: (e) => setRoomName(e.target.value),
             onKeyDown: (e) => e.key === 'Enter' && create(),
           }),
+          h('button', {
+            className: `csb-btn csb-btn-s${showArchived ? ' csb-btn-p' : ''}`,
+            onClick: () => setShowArchived((v) => !v),
+          }, showArchived ? '隐藏归档' : '看归档'),
           h('button', { className: 'csb-btn csb-btn-p', disabled: !roomName.trim(), onClick: create }, '创建房间')),
-        err ? h('div', { className: 'csb-err' }, err) : null,
+
+        h(Notice, { kind: 'ok', onClose: () => setOk(null) }, ok),
+        h(Notice, { kind: 'err', onClose: () => setErr(null) }, err),
         error ? h('div', { className: 'csb-err' }, error) : null,
         loading ? h(Skeleton, { n: 2 }) : null,
         !loading && rooms.length === 0
           ? h(Empty, { icon: '◌', title: '还没有房间', hint: '建一个房间，然后把 Bot 拉进来，它们就能在同一个消息流里对话。' })
           : null,
+
         h('div', { className: 'csb-list' }, rooms.map((r) =>
           h('div', {
             key: r.id, className: `csb-card csb-card-c${active === r.id ? ' csb-card-on' : ''}`,
@@ -1535,54 +1930,118 @@ window.__ModuleLoader__.load({
             h('div', { className: 'csb-card-main' },
               h('div', { className: 'csb-card-t' }, r.name),
               h('div', { className: 'csb-card-m' },
+                r.archivedAt ? h('span', { className: 'csb-b csb-b-idle' }, '已归档') : null,
                 h('span', null, `${(r.members ?? []).length} 人`),
                 h('span', null, `· ${r.mode === 'admin' ? '管理员模式' : '自由发言'}`),
-                h('span', null, `· ${r.seq ?? 0} 条消息`))),
-            h('button', {
-              className: 'csb-btn csb-btn-s', style: { flex: 'none' },
-              onClick: (e) => { e.stopPropagation(); setEditing(r) },
-            }, '设置')))),
-        current ? h('div', null,
-          h(Section, { title: `消息 · ${current.name}`, desc: `${msgs.length} 条。发帖者必须是成员。` }),
-          current.notice ? h('div', { className: 'csb-note', style: { marginTop: 10 } }, current.notice) : null,
-          h('div', { style: { maxHeight: 420, overflowY: 'auto', margin: '12px 0' } },
-            msgs.length === 0 ? h(Empty, { title: '还没有消息' }) : null,
-            msgs.slice(-100).map((m) =>
-              h('div', { key: m.id, className: `csb-msg${m.from === 'user' || m.from === 'ui' ? ' csb-msg-me' : ''}` },
-                h('div', { className: 'csb-msg-h' },
-                  h('span', null, `#${m.seq}`),
-                  h('span', null, botName(bots, m.from)),
-                  m.bodyRef ? h('span', { className: 'csb-b' }, '长正文') : null),
-                h('div', { className: 'csb-msg-b' }, m.bodyRef ? `（正文较长，已单独存为：${m.bodyRef}）` : m.text))),
-            h('div', { ref: endRef })),
-          h('div', { className: 'csb-bar' },
-            h('input', {
-              className: 'csb-in csb-grow', placeholder: '说点什么…（回车发送）',
-              value: text, onChange: (e) => setText(e.target.value),
-              onKeyDown: (e) => e.key === 'Enter' && post(),
-            }),
-            h('button', { className: 'csb-btn csb-btn-p', disabled: !text.trim(), onClick: post }, '发送')),
-          h(Section, { title: '成员', desc: '勾选要拉进来的 Bot；勾掉就是移出。' }),
-          h('div', { className: 'csb-pick', style: { marginTop: 10 } },
-            bots.filter((b) => b.state !== 'retired').length === 0
-              ? h('div', { className: 'csb-set-d', style: { padding: '8px 9px' } }, '还没有 Bot —— 先去「Bot」页建一个')
-              : bots.filter((b) => b.state !== 'retired').map((b) => {
-                  const inRoom = (current.members ?? []).includes(b.sessionId)
-                  return h('label', { key: b.id, className: 'csb-pick-i' },
-                    h('input', {
-                      type: 'checkbox', checked: inRoom,
-                      onChange: (e) => member(e.target.checked ? 'join' : 'leave', b.sessionId),
-                    }),
-                    h('span', null, b.name),
-                    h('span', { className: 'csb-set-d' }, inRoom ? '已在房间' : '未加入'))
-                })))
+                h('span', null, `· ${r.seq ?? 0} 条消息`),
+                r.purpose ? h('span', null, `· ${r.purpose.slice(0, 30)}`) : null)),
+            h('div', { style: { display: 'flex', gap: 6, flex: 'none' } },
+              h('button', {
+                className: 'csb-btn csb-btn-s',
+                onClick: (e) => { e.stopPropagation(); archive(r, !r.archivedAt) },
+              }, r.archivedAt ? '恢复' : '归档'),
+              h('button', {
+                className: 'csb-btn csb-btn-s',
+                onClick: (e) => { e.stopPropagation(); setEditing(r) },
+              }, '设置'),
+              h('button', {
+                className: 'csb-btn csb-btn-s csb-btn-d',
+                onClick: (e) => { e.stopPropagation(); setConfirmDel(r) },
+              }, '删除'))))),
+
+        current
+          ? h('div', null,
+              h(Section, {
+                title: `消息 · ${current.name}`,
+                desc: `${msgs.length} 条。发帖者必须是成员；你是超级管理员，可以直接看全部内容。`,
+              }),
+              current.purpose ? h('div', { className: 'csb-note', style: { marginTop: 10 } }, `用途：${current.purpose}`) : null,
+              current.notice ? h('div', { className: 'csb-note', style: { marginTop: 10 } }, current.notice) : null,
+              h('div', { style: { maxHeight: 460, overflowY: 'auto', margin: '12px 0' } },
+                msgs.length === 0 ? h(Empty, { title: '还没有消息' }) : null,
+                msgs.slice(-120).map((m) => {
+                  const body = m.body ?? m.text ?? ''
+                  const long = body.length > 300
+                  return h('div', { key: m.id, className: `csb-msg${m.from === 'user' || m.from === 'ui' ? ' csb-msg-me' : ''}` },
+                    h('div', { className: 'csb-msg-h' },
+                      h('span', null, `#${m.seq}`),
+                      h('span', null, botName(bots, m.from)),
+                      m.bodyRef ? h('span', { className: 'csb-b' }, '长正文') : null,
+                      m.bodyError ? h('span', { className: 'csb-b csb-b-err' }, '正文读取失败') : null,
+                      long
+                        ? h('button', {
+                            className: 'csb-btn csb-btn-s', style: { marginLeft: 'auto' },
+                            onClick: () => setShowBody(m),
+                          }, '看全文')
+                        : null),
+                    h('div', { className: 'csb-msg-b' }, long ? `${body.slice(0, 300)}…` : body))
+                }),
+                h('div', { ref: endRef })),
+              h('div', { className: 'csb-bar' },
+                h('input', {
+                  className: 'csb-in csb-grow', placeholder: '说点什么…（回车发送）',
+                  value: text, onChange: (e) => setText(e.target.value),
+                  onKeyDown: (e) => e.key === 'Enter' && post(),
+                }),
+                h('button', { className: 'csb-btn csb-btn-p', disabled: !text.trim(), onClick: post }, '发送')),
+              h(Section, { title: '成员', desc: '勾选要拉进来的 Bot；勾掉就是移出。' }),
+              h('div', { className: 'csb-pick', style: { marginTop: 10 } },
+                bots.filter((b) => b.state !== 'retired').length === 0
+                  ? h('div', { className: 'csb-set-d', style: { padding: '8px 9px' } }, '还没有 Bot —— 先去「Bot」页建一个')
+                  : bots.filter((b) => b.state !== 'retired').map((b) => {
+                      const inRoom = (current.members ?? []).includes(b.sessionId)
+                      const role = (current.roles ?? {})[b.sessionId]
+                      return h('label', { key: b.id, className: 'csb-pick-i' },
+                        h('input', {
+                          type: 'checkbox', checked: inRoom,
+                          onChange: (e) => member(e.target.checked ? 'join' : 'leave', b.sessionId),
+                        }),
+                        h('span', null, b.name),
+                        h('span', { className: 'csb-set-d' },
+                          inRoom ? `已在房间${role ? ` · ${role === 'admin' ? '管理员' : role === 'observer' ? '旁听' : '成员'}` : ''}` : '未加入'))
+                    })))
           : null,
+
+        // 长正文全文
+        showBody
+          ? h(Modal, {
+              title: `第 ${showBody.seq} 条 · 全文`,
+              wide: true,
+              onClose: () => setShowBody(null),
+              footer: [h('button', { key: 'c', className: 'csb-btn', onClick: () => setShowBody(null) }, '关闭')],
+            }, h('div', { className: 'csb-pre', style: { whiteSpace: 'pre-wrap' } }, showBody.body ?? showBody.text ?? ''))
+          : null,
+
         editing
           ? h(RoomEditor, {
               room: editing, bots,
               onClose: () => setEditing(null),
-              onSaved: () => { setEditing(null); reload() },
+              onSaved: () => { setEditing(null); setOk('房间设置已保存'); reload() },
               onError: setErr,
+            })
+          : null,
+
+        confirmDel
+          ? h(ConfirmModal, {
+              title: '删除这个房间？',
+              message: `「${confirmDel.name}」及其消息会被彻底删除，无法恢复。\n\n如果只是想先停用，用「归档」更安全。`,
+              danger: true, confirmText: '彻底删除',
+              onCancel: () => setConfirmDel(null),
+              onConfirm: async () => {
+                const r = confirmDel
+                setConfirmDel(null)
+                try {
+                  await call('/rooms/remove', {
+                    method: 'POST',
+                    body: { roomId: r.id, expectedRev: r.rev, force: true },
+                  })
+                  setOk('房间已删除')
+                  if (active === r.id) setActive(null)
+                  reload()
+                } catch (e) {
+                  setErr(`${e.message}（如果房间里有消息，必须用强制删除）`)
+                }
+              },
             })
           : null)
     }
@@ -1591,13 +2050,34 @@ window.__ModuleLoader__.load({
       const [form, setForm] = useState({
         name: room.name ?? '',
         notice: room.notice ?? '',
+        purpose: room.purpose ?? '',
         mode: room.mode ?? 'everyone',
+        adminId: room.adminId ?? '',
+      })
+      const [settings, setSettings] = useState({
+        allowBotAutoPost: room.settings?.allowBotAutoPost !== false,
+        maxBotsPerRound: room.settings?.maxBotsPerRound ?? 3,
+        relayEnabled: room.settings?.relayEnabled !== false,
       })
       const save = async () => {
         try {
           await call('/rooms/update', {
             method: 'POST',
-            body: { roomId: room.id, expectedRev: room.rev, ...form, byId: 'user' },
+            body: {
+              roomId: room.id,
+              expectedRev: room.rev,
+              name: form.name,
+              notice: form.notice,
+              purpose: form.purpose,
+              mode: form.mode,
+              adminId: form.adminId || null,
+              settings: {
+                allowBotAutoPost: settings.allowBotAutoPost,
+                maxBotsPerRound: Number(settings.maxBotsPerRound) || 3,
+                relayEnabled: settings.relayEnabled,
+              },
+              byId: 'user',
+            },
           })
           onSaved()
         } catch (e) {
@@ -1607,32 +2087,60 @@ window.__ModuleLoader__.load({
       }
       return h(Modal, {
         title: `房间设置 · ${room.name}`,
+        wide: true,
         onClose,
         footer: [
           h('button', { key: 'c', className: 'csb-btn', onClick: onClose }, '取消'),
           h('button', { key: 's', className: 'csb-btn csb-btn-p', onClick: save }, '保存'),
         ],
       },
-        h('div', { className: 'csb-fld' },
-          h('label', null, '房间名'),
+        h(Field, { label: '房间名' },
           h('input', { className: 'csb-in', value: form.name, onChange: (e) => setForm({ ...form, name: e.target.value }) })),
-        h('div', { className: 'csb-fld' },
-          h('label', null, '发言方式'),
+        h(Field, { label: '这个房间是干什么的', hint: '一句话说明用途，方便以后判断消息该发哪里' },
+          h('input', {
+            className: 'csb-in', value: form.purpose,
+            placeholder: '例如：发版前的跨组协调',
+            onChange: (e) => setForm({ ...form, purpose: e.target.value }),
+          })),
+        h(Field, { label: '发言方式' },
           h('select', {
             className: 'csb-sel', value: form.mode,
             onChange: (e) => setForm({ ...form, mode: e.target.value }),
           },
-            h('option', { value: 'everyone' }, '自由发言（所有成员都能说话）'),
-            h('option', { value: 'admin' }, '管理员模式（只有管理员能改设置）')),
-          h('div', { className: 'csb-fld-h' }, `${(room.members ?? []).length} 个成员，${room.seq ?? 0} 条消息`)),
-        h('div', { className: 'csb-fld' },
-          h('label', null, '房间公告'),
+          h('option', { value: 'everyone' }, '自由发言（所有成员都能说话、都能改设置）'),
+          h('option', { value: 'admin' }, '管理员模式（只有管理员能改设置）')),
+          h('div', { className: 'csb-field-h' }, `${(room.members ?? []).length} 个成员，${room.seq ?? 0} 条消息`)),
+        form.mode === 'admin'
+          ? h(Field, { label: '管理员是谁', hint: '填会话 ID；留空表示还没指定' },
+              h('input', {
+                className: 'csb-in', value: form.adminId,
+                onChange: (e) => setForm({ ...form, adminId: e.target.value }),
+              }))
+          : null,
+        h(Field, { label: '房间公告', hint: '会显示在消息列表上方，所有进这个房间的人都能看到' },
           h('textarea', {
             className: 'csb-ta', value: form.notice,
             placeholder: '例如：本房间只讨论发布相关事项；发版前 24 小时冻结代码。',
             onChange: (e) => setForm({ ...form, notice: e.target.value }),
-          }),
-          h('div', { className: 'csb-fld-h' }, '公告会显示在消息列表上方。')))
+          })),
+        h('h4', { style: { marginTop: 18 } }, '房间规则'),
+        h(Field, { label: '允许 Bot 自己发言', hint: '关掉后只有人能主动发消息，Bot 只能被动回复' },
+          h('label', { style: { display: 'flex', gap: 6, alignItems: 'center' } },
+            h('input', {
+              type: 'checkbox', checked: settings.allowBotAutoPost,
+              onChange: (e) => setSettings({ ...settings, allowBotAutoPost: e.target.checked }),
+            }), settings.allowBotAutoPost ? '允许' : '不允许')),
+        h(Field, { label: '一轮里最多几个 Bot 说话', hint: '防止多个 Bot 抢话刷屏' },
+          h('input', {
+            className: 'csb-in', type: 'number', min: 1, max: 20, value: settings.maxBotsPerRound,
+            onChange: (e) => setSettings({ ...settings, maxBotsPerRound: e.target.value }),
+          })),
+        h(Field, { label: '允许转发消息去唤醒 Bot', hint: '关掉后这个房间不能做跨房间转发' },
+          h('label', { style: { display: 'flex', gap: 6, alignItems: 'center' } },
+            h('input', {
+              type: 'checkbox', checked: settings.relayEnabled,
+              onChange: (e) => setSettings({ ...settings, relayEnabled: e.target.checked }),
+            }), settings.relayEnabled ? '允许' : '不允许')))
     }
 
     // ── 记忆 ────────────────────────────────────────────────────────────────
@@ -1643,25 +2151,111 @@ window.__ModuleLoader__.load({
     function MemoryTab() {
       const [layer, setLayer] = useState('')
       const [query, setQuery] = useState('')
+      const [project, setProject] = useState('*')
+      const [stats, setStats] = useState(null)
+      const [showArchived, setShowArchived] = useState(false)
       const [err, setErr] = useState(null)
+      const [ok, setOk] = useState(null)
       const [adding, setAdding] = useState(false)
       const [newLayer, setNewLayer] = useState('L2')
       const [newContent, setNewContent] = useState('')
+      const [newTags, setNewTags] = useState('')
+      const [editing, setEditing] = useState(null)
+      const [detail, setDetail] = useState(null)
       const [ctxPreview, setCtxPreview] = useState(null)
       const [confirmDel, setConfirmDel] = useState(null)
-      const path = `/memory${query ? `?query=${encodeURIComponent(query)}` : layer ? `?layer=${layer}` : ''}`
-      const { data, loading, error, reload } = useApi(path, [layer, query])
+      const [confirmPurge, setConfirmPurge] = useState(null)
+      const [showSug, setShowSug] = useState(false)
+
+      const qs = new URLSearchParams()
+      if (query) qs.set('query', query)
+      if (layer) qs.set('layer', layer)
+      if (project !== '*') qs.set('cwd', project)
+      if (showArchived) qs.set('onlyArchived', '1')
+      const { data, loading, error, reload } = useApi(`/memory?${qs.toString()}`, [layer, query, showArchived, project])
+      const loadStats = useCallback(() => {
+        call('/memory/stats').then((d) => setStats(d.stats)).catch(() => {})
+      }, [])
+      useEffect(() => loadStats(), [loadStats])
+      const { data: sugData, reload: reloadSug } = useApi('/suggestions?status=pending')
+
       const entries = data?.entries ?? []
-      const act = (p, body) => call(p, { method: 'POST', body }).then(reload).catch((e) => setErr(e.message))
+      const suggestions = sugData?.items ?? []
+
+      const act = (p, body) => call(p, { method: 'POST', body })
+        .then(() => { setErr(null); setOk('操作成功'); reload() })
+        .catch((e) => setErr(e.message))
+
+      const splitTags = (t) => String(t ?? '').split(/[,，]/).map((x) => x.trim()).filter(Boolean)
 
       const add = async () => {
         if (!newContent.trim()) return
         setErr(null)
         try {
-          await call('/memory', { method: 'POST', body: { layer: newLayer, content: newContent.trim(), by: 'user' } })
+          await call('/memory', {
+            method: 'POST',
+            body: {
+              layer: newLayer,
+              content: newContent.trim(),
+              tags: splitTags(newTags),
+              by: 'user',
+              explicit: true,
+            },
+          })
           setNewContent('')
+          setNewTags('')
           setAdding(false)
+          setOk('已添加')
           reload()
+        } catch (e) {
+          setErr(e.message)
+        }
+      }
+
+      const openDetail = async (e) => {
+        setErr(null)
+        try {
+          const d = await call(`/memory/detail?id=${encodeURIComponent(e.id)}&layer=${encodeURIComponent(e.layer)}`)
+          setDetail(d)
+        } catch (ec) {
+          setErr(ec.message)
+        }
+      }
+
+      const saveEdit = async () => {
+        setErr(null)
+        try {
+          await call('/memory/update', {
+            method: 'POST',
+            body: {
+              layer: editing.layer,
+              id: editing.id,
+              expectedRev: editing.rev,
+              content: editing.content,
+              tags: splitTags(editing.tagsText),
+              explicit: editing.explicit === true,
+            },
+          })
+          setEditing(null)
+          setOk('已保存')
+          reload()
+        } catch (e) {
+          setErr(e.message)
+        }
+      }
+
+      const decideSuggestion = async (sg, accept) => {
+        setErr(null)
+        try {
+          if (accept) {
+            await call('/suggestions/accept', { method: 'POST', body: { id: sg.id } })
+            setOk('已采纳，内容已写入记忆')
+          } else {
+            await call('/suggestions/reject', { method: 'POST', body: { id: sg.id, reason: '人工驳回' } })
+            setOk('已驳回')
+          }
+          reload()
+          reloadSug()
         } catch (e) {
           setErr(e.message)
         }
@@ -1670,44 +2264,128 @@ window.__ModuleLoader__.load({
       return h('div', { className: 'csb-wrap' },
         h(Section, {
           title: '记忆',
-          desc: 'L0–L3 会一直注入到上下文里（模型每轮都看得到）；L4/L5 按需检索。标了「explicit」的条目是你明确说的，自动整理只能建议、不能改。',
+          desc: '越靠上的层越"重"：人格和你明确说的话（L0–L1）永远不丢；L2–L3 常驻注入；'
+            + 'L4/L5 只在需要时检索。点任意一条可以看全文、修改、删除。',
         }),
+
+        suggestions.length > 0
+          ? h('div', {
+              className: 'csb-notice csb-notice-err',
+              style: { marginTop: 12, cursor: 'pointer' },
+              onClick: () => setShowSug(true),
+            },
+            h('span', { className: 'csb-notice-t' },
+              `有 ${suggestions.length} 条「自动整理建议」等你确认 —— 模型不能直接改你的长期记忆，只能提议。点这里看。`),
+            h('span', { className: 'csb-b' }, '去确认'))
+          : null,
+
         h('div', { className: 'csb-bar', style: { marginTop: 12 } },
-          h('select', { className: 'csb-sel', style: { width: 176 }, value: layer, onChange: (e) => setLayer(e.target.value) },
-            h('option', { value: '' }, '全部层'),
-            LAYERS.map((l) => h('option', { key: l, value: l }, `${l} · ${LAYER_HINT[l]}`))),
+          h('select', {
+            className: 'csb-sel', style: { width: 200 }, value: project,
+            onChange: (e) => setProject(e.target.value),
+            title: '项目记忆只在对应工作目录里生效，避免 A 项目的事串到 B 项目',
+          },
+          h('option', { value: '*' }, '全部项目（不做隔离）'),
+          Object.entries(stats?.cwd?.byCwd ?? {}).map(([dir, n]) =>
+            h('option', { key: dir, value: dir }, `${short(dir, 42)}（${n} 条）`))),
+          layer
+            ? null
+            : null),
+        (stats?.cwd?.unassignedActive ?? 0) > 0 && project !== '*'
+          ? h('div', { className: 'csb-notice csb-notice-err', style: { marginBottom: 12 } },
+              h('span', { className: 'csb-notice-t' },
+                `有 ${stats.cwd.unassignedActive} 条历史记忆还不知道属于哪个项目（改造前写的）。`
+                + '它们现在不会出现在任何项目视图里 —— 宁可少看见，也不要把别的项目的事串进来。'),
+              h('button', {
+                className: 'csb-btn csb-btn-s',
+                onClick: () => call('/memory/migrate-cwd', { method: 'POST', body: { cwd: project } })
+                  .then((d) => {
+                    setOk(`已把 ${d.result?.migrated ?? 0} 条历史记忆归到当前项目`)
+                    loadStats()
+                    reload()
+                  })
+                  .catch((e) => setErr(e.message)),
+              }, '归到当前项目'))
+          : null,
+        h('div', { className: 'csb-bar' },
+          h('select', {
+            className: 'csb-sel', style: { width: 176 }, value: layer,
+            onChange: (e) => setLayer(e.target.value),
+          },
+          h('option', { value: '' }, '全部层'),
+          LAYERS.map((l) => h('option', { key: l, value: l }, `${l} · ${LAYER_HINT[l]}`))),
           h('input', {
             className: 'csb-in csb-grow', placeholder: '搜记忆…',
             value: query, onChange: (e) => setQuery(e.target.value),
           }),
-          h('button', { className: 'csb-btn csb-btn-p', onClick: () => setAdding(true) }, '新建条目'),
           h('button', {
-            className: 'csb-btn',
-            onClick: () => call('/memory/context').then((d) => setCtxPreview(d.text)).catch((e) => setErr(e.message)),
+            className: `csb-btn csb-btn-s${showArchived ? ' csb-btn-p' : ''}`,
+            onClick: () => setShowArchived((v) => !v),
+          }, showArchived ? '看有效记忆' : '看归档'),
+          h('button', { className: 'csb-btn csb-btn-s', onClick: () => setAdding(true) }, '＋ 新建'),
+          h('button', {
+            className: 'csb-btn csb-btn-s',
+            onClick: () => call(`/memory/context${project !== '*' ? `?cwd=${encodeURIComponent(project)}` : ''}`)
+              .then((d) => setCtxPreview(d.text)).catch((e) => setErr(e.message)),
           }, '看注入效果')),
-        err ? h('div', { className: 'csb-err' }, err) : null,
+
+        h(Notice, { kind: 'ok', onClose: () => setOk(null) }, ok),
+        h(Notice, { kind: 'err', onClose: () => setErr(null) }, err),
         error ? h('div', { className: 'csb-err' }, error) : null,
         loading ? h(Skeleton, { n: 3 }) : null,
         !loading && entries.length === 0
-          ? h(Empty, { icon: '◇', title: '还没有记忆条目', hint: '把「事实」和「规矩」写进来，模型每次都能看到。任务笔记这类一次性的放 L4。' })
+          ? h(Empty, {
+              icon: '◇',
+              title: showArchived ? '归档区是空的' : '还没有记忆条目',
+              hint: showArchived
+                ? '归档的记忆不参与注入，但随时可以恢复。'
+                : '把「以后一直有用的事实和规矩」写进来（比如：本项目用 pnpm）。一次性的笔记放 L4。',
+            })
           : null,
+
         h('div', { className: 'csb-list' }, entries.map((e) =>
           h('div', { key: e.id, className: 'csb-card' },
-            h('div', { className: 'csb-card-main' },
-              h('div', { className: 'csb-card-t2' }, e.content),
+            h('div', {
+              className: 'csb-card-main csb-card-c',
+              onClick: () => openDetail(e),
+              title: '点开看全文与历史',
+            },
+              h('div', {
+                className: 'csb-card-t2',
+                style: { display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' },
+              }, e.content),
               h('div', { className: 'csb-card-m' },
-                h('span', { className: 'csb-b' }, `${e.layer} ${LAYER_HINT[e.layer] ?? ''}`),
-                e.botId ? h('span', { className: 'csb-b' }, `属于 Bot ${short(e.botId, 10)}`) : h('span', { className: 'csb-b' }, '全局'),
-                e.explicit ? h('span', { className: 'csb-b csb-b-ok' }, 'explicit') : null,
+                h('span', { className: 'csb-b' }, `${e.layer} · ${LAYER_HINT[e.layer] ?? ''}`),
+                e.botId ? h('span', { className: 'csb-b' }, `Bot ${short(e.botId, 10)}`) : h('span', { className: 'csb-b' }, '全局'),
+                e.explicit ? h('span', { className: 'csb-b csb-b-ok' }, '你说过的') : null,
                 e.conflict ? h('span', { className: 'csb-b csb-b-err' }, '与另一条冲突') : null,
-                e.archived ? h('span', { className: 'csb-b csb-b-idle' }, '已归档') : null,
+                e.archived
+                  ? h('span', { className: 'csb-b csb-b-idle' },
+                      e.archived?.reason === 'removed' ? '已删除（可恢复）' : '已归档')
+                  : null,
+                e.splitTotal > 1 ? h('span', { className: 'csb-b' }, `超长切成 ${e.splitTotal} 段`) : null,
+                (e.tags ?? []).length ? h('span', null, (e.tags ?? []).map((t) => `#${t}`).join(' ')) : null,
                 h('span', null, `· 第 ${e.rev} 版`))),
             h('div', { style: { display: 'flex', gap: 6, flex: 'none' } },
+              h('button', {
+                className: 'csb-btn csb-btn-s',
+                onClick: () => setEditing({
+                  ...e,
+                  tagsText: (e.tags ?? []).join(', '),
+                }),
+              }, '改'),
               e.archived
                 ? h('button', { className: 'csb-btn csb-btn-s', onClick: () => act('/memory/restore', { layer: e.layer, id: e.id }) }, '恢复')
                 : h('button', { className: 'csb-btn csb-btn-s', onClick: () => act('/memory/archive', { layer: e.layer, id: e.id, reason: '过时' }) }, '归档'),
-              h('button', { className: 'csb-btn csb-btn-s csb-btn-d', onClick: () => setConfirmDel(e) }, '删除'))))),
+              e.archived
+                ? h('button', {
+                    className: 'csb-btn csb-btn-s csb-btn-d',
+                    title: '从记忆库里彻底抹掉，不可恢复',
+                    onClick: () => setConfirmPurge(e),
+                  }, '彻底删除')
+                : h('button', { className: 'csb-btn csb-btn-s csb-btn-d', onClick: () => setConfirmDel(e) }, '删除'))))),
 
+        // ── 新建 ──
         adding
           ? h(Modal, {
               title: '新建记忆条目',
@@ -1717,21 +2395,103 @@ window.__ModuleLoader__.load({
                 h('button', { key: 's', className: 'csb-btn csb-btn-p', disabled: !newContent.trim(), onClick: add }, '保存'),
               ],
             },
-            h('div', { className: 'csb-fld' },
-              h('label', null, '放在哪一层'),
-              h('select', { className: 'csb-sel', value: newLayer, onChange: (e) => setNewLayer(e.target.value) },
-                LAYERS.filter((l) => l !== 'L0').map((l) => h('option', { key: l, value: l }, `${l} · ${LAYER_HINT[l]}`))),
-              h('div', { className: 'csb-fld-h' }, 'L0 是人格层，只能通过配置改，界面不给写。')),
-            h('div', { className: 'csb-fld' },
-              h('label', null, '内容'),
+            h(Field, { label: '放在哪一层', hint: '拿不准就选 L2（团队全局）或 L3（本项目）' },
+              h('select', {
+                className: 'csb-sel', value: newLayer,
+                onChange: (e) => setNewLayer(e.target.value),
+              }, LAYERS.filter((l) => l !== 'L0').map((l) => h('option', { key: l, value: l }, `${l} · ${LAYER_HINT[l]}`)))),
+            h(Field, { label: '内容', hint: `${newContent.length} / 600 字，超长会自动切成多条存（不丢内容）` },
               h('textarea', {
                 className: 'csb-ta', value: newContent,
                 placeholder: '例如：本项目只用 pnpm，不用 npm。',
                 onChange: (e) => setNewContent(e.target.value),
-              }),
-              h('div', { className: 'csb-fld-h' }, `${newContent.length} / 600 字符，超长会自动切分存储。`)))
+              })),
+            h(Field, { label: '标签', hint: '用逗号分隔，方便以后搜' },
+              h('input', {
+                className: 'csb-in', value: newTags, placeholder: '例如：构建, 依赖',
+                onChange: (e) => setNewTags(e.target.value),
+              })),
+            h('div', { className: 'csb-field-h' },
+              '你手动写的内容会标记为「你说过的」——以后自动整理只能建议、不能改它。'))
           : null,
 
+        // ── 编辑 ──
+        editing
+          ? h(Modal, {
+              title: '修改记忆',
+              wide: true,
+              onClose: () => setEditing(null),
+              footer: [
+                h('button', { key: 'c', className: 'csb-btn', onClick: () => setEditing(null) }, '取消'),
+                h('button', { key: 's', className: 'csb-btn csb-btn-p', onClick: saveEdit }, '保存'),
+              ],
+            },
+            h(Field, { label: `内容（${editing.layer} · ${LAYER_HINT[editing.layer] ?? ''}）` },
+              h('textarea', {
+                className: 'csb-ta', style: { minHeight: 160 }, value: editing.content,
+                onChange: (e) => setEditing({ ...editing, content: e.target.value }),
+              })),
+            h(Field, { label: '标签' },
+              h('input', {
+                className: 'csb-in', value: editing.tagsText ?? '',
+                onChange: (e) => setEditing({ ...editing, tagsText: e.target.value }),
+              })),
+            h(Field, { label: '保护级别', hint: '勾上＝你说过的话，自动整理不能改；不勾＝允许模型提议修订' },
+              h('label', { style: { display: 'flex', gap: 6, alignItems: 'center' } },
+                h('input', {
+                  type: 'checkbox', checked: editing.explicit === true,
+                  onChange: (e) => setEditing({ ...editing, explicit: e.target.checked }),
+                }), '这是我说过的话，不许自动改')))
+          : null,
+
+        // ── 详情 ──
+        detail
+          ? h(Drawer, {
+              title: '记忆详情',
+              onClose: () => setDetail(null),
+              footer: [h('button', { key: 'c', className: 'csb-btn', onClick: () => setDetail(null) }, '关闭')],
+            },
+            h('div', { className: 'csb-card-m', style: { marginBottom: 10 } },
+              h('span', { className: 'csb-b' }, `${detail.entry?.layer} · ${LAYER_HINT[detail.entry?.layer] ?? ''}`),
+              h('span', { className: 'csb-b' }, `第 ${detail.entry?.rev} 版`),
+              detail.entry?.explicit ? h('span', { className: 'csb-b csb-b-ok' }, '你说过的') : null),
+            h('div', { className: 'csb-pre', style: { whiteSpace: 'pre-wrap' } }, detail.entry?.content ?? ''),
+            h('h4', { style: { marginTop: 18 } }, '修改历史'),
+            h('div', { className: 'csb-list' }, (detail.history ?? []).slice(-10).reverse().map((ev, i) =>
+              h('div', { key: i, className: 'csb-card', style: { padding: '8px 10px' } },
+                h('div', { className: 'csb-card-main' },
+                  h('div', { className: 'csb-card-m' },
+                    h('span', { className: 'csb-b' }, ev.action ?? '变更'),
+                    h('span', null, new Date(ev.at ?? 0).toLocaleString()),
+                    h('span', null, `由 ${ev.byId ?? ev.by ?? '未知'}`)))))))
+          : null,
+
+        // ── 建议确认 ──
+        showSug
+          ? h(Modal, {
+              title: '自动整理建议',
+              wide: true,
+              onClose: () => setShowSug(false),
+              footer: [h('button', { key: 'c', className: 'csb-btn', onClick: () => setShowSug(false) }, '关闭')],
+            },
+            h('p', { style: { color: 'var(--dsw-alias-label-secondary)', fontSize: 12 } },
+              '这些是模型整理的「它认为该记住/该改」的条目。你不点采纳，它就不会生效。'),
+            suggestions.length === 0
+              ? h(Empty, { icon: '✓', title: '没有待确认的建议', hint: '有建议时这里会出现。' })
+              : h('div', { className: 'csb-list' }, suggestions.map((sg) => h('div', { key: sg.id, className: 'csb-card' },
+                  h('div', { className: 'csb-card-main' },
+                    h('div', { className: 'csb-card-t2' }, sg.payload?.content ?? sg.payload?.name ?? sg.payload?.title ?? '（无内容）'),
+                    h('div', { className: 'csb-card-m' },
+                      h('span', { className: 'csb-b' }, sg.kind),
+                      sg.layer ? h('span', { className: 'csb-b' }, sg.layer) : null,
+                      sg.reason ? h('span', null, sg.reason) : null,
+                      sg.confidence ? h('span', null, `把握 ${Math.round(sg.confidence * 100)}%`) : null)),
+                  h('div', { style: { display: 'flex', gap: 6, flex: 'none' } },
+                    h('button', { className: 'csb-btn csb-btn-s csb-btn-p', onClick: () => decideSuggestion(sg, true) }, '采纳'),
+                    h('button', { className: 'csb-btn csb-btn-s', onClick: () => decideSuggestion(sg, false) }, '驳回'))))))
+          : null,
+
+        // ── 注入效果 ──
         ctxPreview !== null
           ? h(Modal, {
               title: '模型实际看到的记忆',
@@ -1744,13 +2504,42 @@ window.__ModuleLoader__.load({
         confirmDel
           ? h(ConfirmModal, {
               title: '删除这条记忆？',
-              message: `内容：${confirmDel.content.slice(0, 80)}\n\n删除后模型不会再看到它。如果只是想暂时不用，建议「归档」而不是删除。`,
+              message: `内容：${confirmDel.content.slice(0, 80)}\n\n`
+                + '删除后模型不会再看到它。这条会移进「归档」区保留一段时间，误删还能恢复；'
+                + '想彻底抹掉请到归档区点「彻底删除」。',
               danger: true, confirmText: '删除',
               onCancel: () => setConfirmDel(null),
               onConfirm: async () => {
                 const e = confirmDel
                 setConfirmDel(null)
                 await act('/memory/remove', { layer: e.layer, id: e.id })
+              },
+            })
+          : null,
+
+        confirmPurge
+          ? h(ConfirmModal, {
+              title: '彻底删除，无法恢复',
+              message: `内容：${confirmPurge.content.slice(0, 120)}\n\n`
+                + '这一步会把这条件目从记忆库里抹掉，模型以后永远看不到它，也不能恢复。\n'
+                + '如果里面有你以后还想查的内容，请先用「恢复」拿回来备份。',
+              danger: true, confirmText: '我确认，彻底删除',
+              onCancel: () => setConfirmPurge(null),
+              onConfirm: async () => {
+                const e = confirmPurge
+                setConfirmPurge(null)
+                setErr(null)
+                try {
+                  await call('/memory/purge', {
+                    method: 'POST',
+                    body: { layer: e.layer, id: e.id, expectedRev: e.rev },
+                  })
+                  setOk('已彻底删除')
+                  loadStats()
+                  reload()
+                } catch (ec) {
+                  setErr(ec.message)
+                }
               },
             })
           : null)
@@ -1825,6 +2614,48 @@ window.__ModuleLoader__.load({
           h('span', { className: 'csb-sw-t' }, value === true ? '开' : '关')))
     }
 
+    /** 记忆自审设置（间隔 + 当前状态）。 */
+    function ReviewSettings() {
+      const { data, reload } = useApi('/review/status?sessionId=ui')
+      const [interval, setInterval] = useState(null)
+      const [err, setErr] = useState(null)
+      const [ok, setOk] = useState(null)
+      const cur = data?.status?.interval
+      const val = interval ?? cur ?? ''
+
+      const save = async () => {
+        setErr(null)
+        try {
+          await call('/review/interval', { method: 'POST', body: { interval: Number(val) } })
+          setOk('已保存，下个回合起生效')
+          setInterval(null)
+          reload()
+        } catch (e) {
+          setErr(e.message)
+        }
+      }
+
+      return h('div', { style: { marginTop: 12 } },
+        h('div', { className: 'csb-bar' },
+          h('span', { className: 'csb-set-d' }, '每隔'),
+          h('input', {
+            className: 'csb-in', type: 'number', min: 1, max: 100000,
+            style: { width: 90 }, value: val,
+            onChange: (e) => setInterval(e.target.value),
+          }),
+          h('span', { className: 'csb-set-d' }, '回合提醒一次'),
+          h('button', {
+            className: 'csb-btn csb-btn-p csb-btn-s',
+            disabled: val === '' || String(val) === String(cur),
+            onClick: save,
+          }, '保存')),
+        h('div', { className: 'csb-field-h' },
+          '数字越小越频繁（费 token）。一般 10 回合一次就够了；'
+          + (cur ? `当前是每 ${cur} 回合。` : '')),
+        h(Notice, { kind: 'ok', onClose: () => setOk(null) }, ok),
+        h(Notice, { kind: 'err', onClose: () => setErr(null) }, err))
+    }
+
     function SettingsBody() {
       const { data, loading, error, reload } = useApi('/settings')
       const { data: statusData, reload: reloadStatus } = useApi('/status')
@@ -1886,6 +2717,13 @@ window.__ModuleLoader__.load({
             .map(([l, n]) => h('div', { key: l, className: 'csb-stat' },
               h('div', { className: 'csb-stat-n' }, n ?? '—'),
               h('div', { className: 'csb-stat-l' }, l)))),
+
+        h(Section, {
+          title: '记忆自审',
+          desc: '每聊若干回合，让模型停下来检查一次「有没有该记住的、有没有记错的」。'
+            + '它只会**提议**，你在「记忆」页点采纳才真正写进去。',
+        }),
+        h(ReviewSettings, {}),
 
         h(Section, { title: '系统体检', desc: '出问题时把这一段发回开发者，能直接定位。' }),
         h('div', { className: 'csb-fold' },
@@ -1973,36 +2811,905 @@ window.__ModuleLoader__.load({
           : null)
     }
 
+
+    // ══════════════════════════════════════════════════════════════════════
+    // v2 新页面（2026-11-05）
+    // 设计纪律：不出现 L0/rev/cwd/CAS 等内部术语；空态有引导；破坏操作二次确认；
+    //          保存有明确反馈；长文折叠展开。
+    // ══════════════════════════════════════════════════════════════════════
+
+    /** 表单行：标签 + 说明 + 控件（人类视角：先说要填什么，再说为什么）。 */
+    function Field({ label, hint, children }) {
+      return h('div', { className: 'csb-field' },
+        h('div', { className: 'csb-field-l' }, label),
+        h('div', { className: 'csb-field-c' }, children),
+        hint ? h('div', { className: 'csb-field-h' }, hint) : null)
+    }
+
+    /** 操作结果提示条（成功/失败都说人话）。 */
+    function Notice({ kind, children, onClose }) {
+      if (!children) return null
+      return h('div', { className: `csb-notice csb-notice-${kind ?? 'ok'}` },
+        h('span', { className: 'csb-notice-t' }, children),
+        onClose ? h('button', { className: 'csb-btn-x', onClick: onClose, 'aria-label': '关闭' }, '×') : null)
+    }
+
+    // ── 待办 ────────────────────────────────────────────────────────────────
+    const TRACKS = [
+      { id: 'life', label: '生活', hint: '家务、健康、私人事务' },
+      { id: 'work', label: '工作', hint: '跨项目的工作事项' },
+      { id: 'project', label: '本项目', hint: '跟着当前工作目录走' },
+      { id: 'daily', label: '每日', hint: '今天要做的事' },
+    ]
+    const QUADRANTS = [
+      { id: 'q1', label: '重要且紧急', hint: '马上做', color: 'var(--dsw-alias-state-error-primary)' },
+      { id: 'q2', label: '重要不紧急', hint: '排计划做', color: 'var(--dsw-alias-state-warning-primary)' },
+      { id: 'q3', label: '紧急不重要', hint: '尽快处理或委托', color: 'var(--dsw-alias-state-info-primary)' },
+      { id: 'q4', label: '不重要不紧急', hint: '有空再说', color: 'var(--dsw-alias-label-secondary)' },
+    ]
+    const TODO_STATUS = {
+      pending: { label: '待办', cls: 'csb-b' },
+      doing: { label: '进行中', cls: 'csb-b csb-b-warn' },
+      done: { label: '已完成', cls: 'csb-b csb-b-ok' },
+      blocked: { label: '卡住了', cls: 'csb-b csb-b-err' },
+      cancelled: { label: '已取消', cls: 'csb-b csb-b-idle' },
+    }
+
+    function todayStr() {
+      const d = new Date()
+      const p = (n) => String(n).padStart(2, '0')
+      return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`
+    }
+
+    function TodoTab() {
+      const [track, setTrack] = useState('daily')
+      const [showAll, setShowAll] = useState(false)
+      const [err, setErr] = useState(null)
+      const [ok, setOk] = useState(null)
+      const [adding, setAdding] = useState(false)
+      const [form, setForm] = useState({ content: '', quadrant: 'q2', due: '', cat: '' })
+      const [editing, setEditing] = useState(null)
+      const [confirmDel, setConfirmDel] = useState(null)
+
+      const qs = new URLSearchParams({ track })
+      if (showAll) qs.set('all', '1')
+      const { data, loading, error, reload } = useApi(`/todos?${qs.toString()}`, [track, showAll])
+      const todos = data?.items ?? data?.todos ?? []
+
+      const act = (p, body) => call(p, { method: 'POST', body })
+        .then(() => { setErr(null); reload() })
+        .catch((e) => setErr(e.message))
+
+      const create = async () => {
+        if (!form.content.trim()) return
+        setErr(null)
+        try {
+          await call('/todos', {
+            method: 'POST',
+            body: {
+              track,
+              content: form.content.trim(),
+              quadrant: form.quadrant,
+              due: form.due || null,
+              cat: form.cat || null,
+              ...(track === 'daily' ? { date: todayStr() } : {}),
+            },
+          })
+          setForm({ content: '', quadrant: 'q2', due: '', cat: '' })
+          setAdding(false)
+          setOk('已添加')
+          reload()
+        } catch (e) {
+          setErr(e.message)
+        }
+      }
+
+      // 待办 → 任务：待办是个人备忘，任务是要交出去的协作单元。
+      // 幂等由服务端 sourceSeq 保证，连点两次不会产生两个任务。
+      const promote = async (t) => {
+        setErr(null)
+        try {
+          const out = await call('/todos/promote', { method: 'POST', body: { id: t.id, expectedRev: t.rev } })
+          setOk(`已放进协作看板（任务：${out.task?.subject ?? ''}）——去「协作看板」看进度，待办这边标成进行中`)
+          reload()
+        } catch (e) {
+          setErr(e.message)
+        }
+      }
+
+      const toggleDone = (t) => {
+        const next = t.status === 'done' ? 'pending' : 'done'
+        act('/todos/update', { id: t.id, expectedRev: t.rev, status: next })
+      }
+
+      const saveEdit = async () => {
+        try {
+          await call('/todos/update', {
+            method: 'POST',
+            body: {
+              id: editing.id,
+              expectedRev: editing.rev,
+              content: editing.content,
+              quadrant: editing.quadrant,
+              due: editing.due || null,
+              cat: editing.cat || null,
+            },
+          })
+          setEditing(null)
+          setOk('已保存')
+          reload()
+        } catch (e) {
+          setErr(e.message)
+        }
+      }
+
+      const overdue = (t) => t.due && t.status !== 'done' && t.status !== 'cancelled' && t.due < todayStr()
+
+      return h('div', { className: 'csb-wrap' },
+        h(Section, {
+          title: '我的待办',
+          desc: '给自己记的事，四类分开管：生活、工作、本项目、每日。可以标「重要 / 紧急」，逾期自动变红。'
+            + '要交给 Bot 或别人做的，点「派下去」就会出现在「协作看板」里。',
+        }),
+        h('div', { className: 'csb-bar', style: { marginTop: 12 } },
+          TRACKS.map((t) => h('button', {
+            key: t.id,
+            className: `csb-btn csb-btn-s${track === t.id ? ' csb-btn-p' : ''}`,
+            title: t.hint,
+            onClick: () => setTrack(t.id),
+          }, t.label)),
+          h('span', { className: 'csb-spacer' }),
+          h('button', {
+            className: `csb-btn csb-btn-s${showAll ? ' csb-btn-p' : ''}`,
+            onClick: () => setShowAll((v) => !v),
+          }, showAll ? '只看要关注的' : '全部显示'),
+          h('button', { className: 'csb-btn csb-btn-p csb-btn-s', onClick: () => setAdding(true) }, '＋ 新建待办')),
+
+        h(Notice, { kind: 'ok', onClose: () => setOk(null) }, ok),
+        h(Notice, { kind: 'err', onClose: () => setErr(null) }, err),
+        error ? h('div', { className: 'csb-err' }, error) : null,
+
+        loading ? h(Skeleton, { n: 4 }) : null,
+        !loading && todos.length === 0
+          ? h(Empty, {
+              icon: '☑',
+              title: `「${TRACKS.find((t) => t.id === track)?.label}」这类还没有待办`,
+              hint: '点右上角「＋ 新建待办」记一件要做的事。逾期的会排在前面。',
+            })
+          : null,
+
+        h('div', { className: 'csb-list' }, todos.map((t) => {
+          const q = QUADRANTS.find((x) => x.id === t.quadrant) ?? QUADRANTS[3]
+          const st = TODO_STATUS[t.status] ?? TODO_STATUS.pending
+          const isOverdue = overdue(t)
+          return h('div', { key: t.id, className: 'csb-card' },
+            h('span', {
+              style: {
+                width: 4, height: 30, borderRadius: 2, flex: 'none',
+                background: q.color, opacity: t.status === 'done' ? 0.35 : 1,
+              },
+              title: q.label,
+            }),
+            h('input', {
+              type: 'checkbox',
+              checked: t.status === 'done',
+              onChange: () => toggleDone(t),
+              style: { cursor: 'pointer', flex: 'none' },
+              'aria-label': '标记完成',
+            }),
+            h('div', { className: 'csb-card-main' },
+              h('div', {
+                className: 'csb-card-t2',
+                style: t.status === 'done' ? { textDecoration: 'line-through', opacity: 0.55 } : null,
+              }, t.content.split('\n')[0]),
+              h('div', { className: 'csb-card-m' },
+                h('span', { className: st.cls }, st.label),
+                h('span', { className: 'csb-b' }, q.label),
+                t.cat ? h('span', { className: 'csb-b' }, t.cat) : null,
+                t.due
+                  ? h('span', { className: isOverdue ? 'csb-b csb-b-err' : 'csb-b' },
+                      isOverdue ? `逾期 ${t.due}` : `截止 ${t.due}`)
+                  : null)),
+            h('div', { style: { display: 'flex', gap: 6, flex: 'none' } },
+              t.status === 'done'
+                ? null
+                : h('button', {
+                    className: 'csb-btn csb-btn-s',
+                    title: '把它变成一个正式任务，放进协作看板交给 Bot 或别人做',
+                    onClick: () => promote(t),
+                  }, '派下去'),
+              h('button', {
+                className: 'csb-btn csb-btn-s',
+                onClick: () => setEditing({ ...t }),
+              }, '改'),
+              h('button', {
+                className: 'csb-btn csb-btn-s csb-btn-d',
+                onClick: () => setConfirmDel(t),
+              }, '删')))
+        })),
+
+        adding
+          ? h(Modal, {
+              title: '新建待办',
+              onClose: () => setAdding(false),
+              footer: [
+                h('button', { key: 'c', className: 'csb-btn', onClick: () => setAdding(false) }, '取消'),
+                h('button', { key: 's', className: 'csb-btn csb-btn-p', onClick: create }, '添加'),
+              ],
+            },
+            h(Field, { label: '要做什么' },
+              h('textarea', {
+                className: 'csb-ta', autoFocus: true, placeholder: '例如：把插件发布流程写成脚本',
+                value: form.content, onChange: (e) => setForm({ ...form, content: e.target.value }),
+              })),
+            h(Field, { label: '重要程度', hint: q2Hint(form.quadrant) },
+              h('select', {
+                className: 'csb-sel', value: form.quadrant,
+                onChange: (e) => setForm({ ...form, quadrant: e.target.value }),
+              }, QUADRANTS.map((q) => h('option', { key: q.id, value: q.id }, `${q.label}（${q.hint}）`)))),
+            h(Field, { label: '截止日期', hint: '可不填。填了逾期会变红。' },
+              h('input', {
+                className: 'csb-in', type: 'date', value: form.due,
+                onChange: (e) => setForm({ ...form, due: e.target.value }),
+              })),
+            h(Field, { label: '分类', hint: '可不填，例如「招聘」「报销」' },
+              h('input', {
+                className: 'csb-in', value: form.cat, placeholder: '分类',
+                onChange: (e) => setForm({ ...form, cat: e.target.value }),
+              })))
+          : null,
+
+        editing
+          ? h(Modal, {
+              title: '修改待办',
+              onClose: () => setEditing(null),
+              footer: [
+                h('button', { key: 'c', className: 'csb-btn', onClick: () => setEditing(null) }, '取消'),
+                h('button', { key: 's', className: 'csb-btn csb-btn-p', onClick: saveEdit }, '保存'),
+              ],
+            },
+            h(Field, { label: '要做什么' },
+              h('textarea', {
+                className: 'csb-ta', value: editing.content,
+                onChange: (e) => setEditing({ ...editing, content: e.target.value }),
+              })),
+            h(Field, { label: '重要程度' },
+              h('select', {
+                className: 'csb-sel', value: editing.quadrant,
+                onChange: (e) => setEditing({ ...editing, quadrant: e.target.value }),
+              }, QUADRANTS.map((q) => h('option', { key: q.id, value: q.id }, `${q.label}（${q.hint}）`)))),
+            h(Field, { label: '截止日期' },
+              h('input', {
+                className: 'csb-in', type: 'date', value: editing.due ?? '',
+                onChange: (e) => setEditing({ ...editing, due: e.target.value }),
+              })),
+            h(Field, { label: '分类' },
+              h('input', {
+                className: 'csb-in', value: editing.cat ?? '',
+                onChange: (e) => setEditing({ ...editing, cat: e.target.value }),
+              })))
+          : null,
+
+        confirmDel
+          ? h(ConfirmModal, {
+              title: '删除这条待办？',
+              message: `「${confirmDel.content.split('\n')[0]}」删除后无法恢复。如果只是做完了，建议直接勾选完成。`,
+              danger: true,
+              confirmText: '删除',
+              onCancel: () => setConfirmDel(null),
+              onConfirm: () => {
+                act('/todos/remove', { id: confirmDel.id, expectedRev: confirmDel.rev })
+                setConfirmDel(null)
+              },
+            })
+          : null)
+    }
+
+    function q2Hint(qid) {
+      const q = QUADRANTS.find((x) => x.id === qid)
+      return q ? q.hint : ''
+    }
+
+    // ── 便签 ────────────────────────────────────────────────────────────────
+    function ScratchTab() {
+      const { data, loading, error } = useApi('/scratch')
+      const [text, setText] = useState('')
+      const [dirty, setDirty] = useState(false)
+      const [savedAt, setSavedAt] = useState(null)
+      const [err, setErr] = useState(null)
+      const [ok, setOk] = useState(null)
+      const taRef = useRef(null)
+
+      useEffect(() => {
+        if (data && !dirty) {
+          setText(data.text ?? '')
+          setSavedAt(data.updatedAt ?? null)
+        }
+      }, [data])
+
+      const save = useCallback(async () => {
+        setErr(null)
+        try {
+          const out = await call('/scratch', { method: 'POST', body: { text } })
+          setDirty(false)
+          setSavedAt(out.updatedAt)
+          setOk('已保存')
+        } catch (e) {
+          setErr(e.message)
+        }
+      }, [text])
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
+            e.preventDefault()
+            save()
+          }
+        }
+        window.addEventListener('keydown', onKey)
+        return () => window.removeEventListener('keydown', onKey)
+      }, [save])
+
+      const bytes = new Blob([text]).size
+
+      return h('div', { className: 'csb-wrap' },
+        h(Section, {
+          title: '便签',
+          desc: '随手记的地方。想写什么都行，不参与任何自动整理。按 Ctrl+S（Mac 上 ⌘S）保存。',
+        }),
+        h('div', { className: 'csb-bar', style: { marginTop: 12 } },
+          h('span', { className: 'csb-hint', style: { marginLeft: 0 } },
+            dirty ? '● 有未保存的修改' : (savedAt ? `上次保存：${new Date(savedAt).toLocaleString()}` : '还没保存过')),
+          h('span', { className: 'csb-spacer' }),
+          h('span', { className: 'csb-hint', style: { marginLeft: 0 } }, `${(bytes / 1024).toFixed(1)} KB / 512 KB`),
+          h('button', {
+            className: 'csb-btn csb-btn-p', disabled: !dirty, onClick: save,
+          }, '保存')),
+        h(Notice, { kind: 'ok', onClose: () => setOk(null) }, ok),
+        h(Notice, { kind: 'err', onClose: () => setErr(null) }, err),
+        error ? h('div', { className: 'csb-err' }, error) : null,
+        loading
+          ? h(Skeleton, { n: 1 })
+          : h('textarea', {
+              ref: taRef,
+              className: 'csb-ta',
+              style: { minHeight: '60vh', fontFamily: 'ui-monospace,SFMono-Regular,Menlo,monospace', fontSize: 13 },
+              placeholder: '在这里随手记…\n\n例如：\n- 明天问小王要测试环境账号\n- 插件发布前记得跑 ci-zero-dep',
+              value: text,
+              onChange: (e) => {
+                setText(e.target.value)
+                setDirty(true)
+              },
+            }))
+    }
+
+    // ── 提示词 ──────────────────────────────────────────────────────────────
+    function PromptsTab() {
+      const [query, setQuery] = useState('')
+      const [category, setCategory] = useState('')
+      const qs = new URLSearchParams()
+      if (query) qs.set('query', query)
+      if (category) qs.set('category', category)
+      const { data, loading, error, reload } = useApi(`/prompts?${qs.toString()}`, [query, category])
+      const [editing, setEditing] = useState(null)
+      const [err, setErr] = useState(null)
+      const [ok, setOk] = useState(null)
+      const [confirmDel, setConfirmDel] = useState(null)
+      const [injecting, setInjecting] = useState(null)
+      const [showCats, setShowCats] = useState(false)
+
+      const items = data?.items ?? []
+      const categories = data?.categories ?? []
+
+      const blank = { name: '', description: '', category: '', tags: '', body: '', enabled: true }
+
+      const save = async () => {
+        const body = {
+          name: editing.name,
+          description: editing.description,
+          category: editing.category,
+          tags: String(editing.tags ?? '').split(/[,，]/).map((s) => s.trim()).filter(Boolean),
+          body: editing.body,
+          enabled: editing.enabled !== false,
+        }
+        try {
+          if (editing.id) {
+            await call('/prompts/update', { method: 'POST', body: { ...body, id: editing.id, expectedRev: editing.rev } })
+          } else {
+            await call('/prompts', { method: 'POST', body })
+          }
+          setEditing(null)
+          setOk('已保存')
+          reload()
+        } catch (e) {
+          setErr(e.message)
+        }
+      }
+
+      const doInject = async (p, mode) => {
+        setErr(null)
+        try {
+          const body = { promptId: p?.id, text: p?.body, sessionId: hostCtx?.sessionId ?? null }
+          if (mode === 'once') Object.assign(body, { times: 1, every: 1 })
+          if (mode === 'always') Object.assign(body, { times: 0, every: 1 })
+          if (mode === 'now') Object.assign(body, { immediate: true })
+          await call('/prompts/inject', { method: 'POST', body })
+          setOk(mode === 'now' ? '已立即注入（本回合生效）' : '已开始注入')
+          setInjecting(null)
+        } catch (e) {
+          setErr(e.message)
+        }
+      }
+
+      return h('div', { className: 'csb-wrap' },
+        h(Section, {
+          title: '提示词',
+          desc: '把常用的要求/流程存成模板，需要时一键注入到对话里。三个按钮对应三种最常见的用法。',
+        }),
+        h('div', { className: 'csb-bar', style: { marginTop: 12 } },
+          h('select', {
+            className: 'csb-sel', style: { width: 160 }, value: category,
+            onChange: (e) => setCategory(e.target.value),
+          },
+          h('option', { value: '' }, '全部分类'),
+          categories.map((c) => h('option', { key: c.name ?? c, value: c.name ?? c }, c.name ?? c))),
+          h('input', {
+            className: 'csb-in csb-grow', placeholder: '搜提示词…',
+            value: query, onChange: (e) => setQuery(e.target.value),
+          }),
+          h('button', { className: 'csb-btn csb-btn-s', onClick: () => setShowCats(true) }, '分类管理'),
+          h('button', { className: 'csb-btn csb-btn-p', onClick: () => setEditing({ ...blank }) }, '＋ 新建提示词')),
+        showCats
+          ? h(PromptCatsModal, {
+              categories,
+              onClose: () => setShowCats(false),
+              onDone: (msg) => { setShowCats(false); setOk(msg); reload() },
+              onError: setErr,
+            })
+          : null,
+
+        h(Notice, { kind: 'ok', onClose: () => setOk(null) }, ok),
+        h(Notice, { kind: 'err', onClose: () => setErr(null) }, err),
+        error ? h('div', { className: 'csb-err' }, error) : null,
+        loading ? h(Skeleton, { n: 3 }) : null,
+        !loading && items.length === 0
+          ? h(Empty, {
+              icon: '⌘',
+              title: '还没有提示词',
+              hint: '把「你每次都要说一遍的要求」存成提示词，以后一键注入，不用重复打字。',
+            })
+          : null,
+
+        h('div', { className: 'csb-list' }, items.map((p) => h('div', { key: p.id, className: 'csb-card' },
+          h('div', { className: 'csb-card-main' },
+            h('div', { className: 'csb-card-t2' }, p.name),
+            h('div', { className: 'csb-card-m' },
+              p.category ? h('span', { className: 'csb-b' }, p.category) : null,
+              p.enabled === false ? h('span', { className: 'csb-b csb-b-idle' }, '已停用') : null,
+              p.description ? h('span', null, p.description) : null),
+            h('div', {
+              style: {
+                marginTop: 6, fontSize: 12, color: 'var(--dsw-alias-label-secondary)',
+                overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+              },
+            }, p.body.split('\n')[0].slice(0, 120))),
+          h('div', { style: { display: 'flex', gap: 6, flex: 'none' } },
+            h('button', { className: 'csb-btn csb-btn-s', onClick: () => doInject(p, 'once') }, '注入一次'),
+            h('button', { className: 'csb-btn csb-btn-s', onClick: () => doInject(p, 'always') }, '持续注入'),
+            h('button', { className: 'csb-btn csb-btn-s csb-btn-p', onClick: () => doInject(p, 'now') }, '⚡ 立即'),
+            h('button', { className: 'csb-btn csb-btn-s', onClick: () => setEditing({ ...p, tags: (p.tags ?? []).join(', ') }) }, '改'),
+            h('button', { className: 'csb-btn csb-btn-s csb-btn-d', onClick: () => setConfirmDel(p) }, '删'))))),
+
+        editing
+          ? h(Modal, {
+              title: editing.id ? '修改提示词' : '新建提示词',
+              wide: true,
+              onClose: () => setEditing(null),
+              footer: [
+                h('button', { key: 'c', className: 'csb-btn', onClick: () => setEditing(null) }, '取消'),
+                h('button', { key: 's', className: 'csb-btn csb-btn-p', onClick: save }, '保存'),
+              ],
+            },
+            h(Field, { label: '叫什么', hint: '给自己看的名字，短一点' },
+              h('input', {
+                className: 'csb-in', autoFocus: true, value: editing.name,
+                onChange: (e) => setEditing({ ...editing, name: e.target.value }),
+              })),
+            h(Field, { label: '一句话说明', hint: '以后翻列表时靠它判断这条是干什么的' },
+              h('input', {
+                className: 'csb-in', value: editing.description,
+                onChange: (e) => setEditing({ ...editing, description: e.target.value }),
+              })),
+            h(Field, { label: '分类', hint: '留空会自动归到「临时」' },
+              h('input', {
+                className: 'csb-in', value: editing.category, list: 'csb-cat-list',
+                onChange: (e) => setEditing({ ...editing, category: e.target.value }),
+              }),
+              h('datalist', { id: 'csb-cat-list' }, categories.map((c) => h('option', { key: c.name ?? c, value: c.name ?? c })))),
+            h(Field, { label: '标签', hint: '用逗号分隔' },
+              h('input', {
+                className: 'csb-in', value: editing.tags,
+                onChange: (e) => setEditing({ ...editing, tags: e.target.value }),
+              })),
+            h(Field, { label: '正文', hint: '支持 {{date}} 和 {{time}}，注入时会自动替换成当天日期和时间' },
+              h('textarea', {
+                className: 'csb-ta',
+                style: { minHeight: 220, fontFamily: 'ui-monospace,monospace' },
+                value: editing.body,
+                onChange: (e) => setEditing({ ...editing, body: e.target.value }),
+              })),
+            h(Field, { label: '启用状态', hint: '停用后不再出现在列表里，也不会被注入' },
+              h('label', { style: { display: 'flex', gap: 6, alignItems: 'center' } },
+                h('input', {
+                  type: 'checkbox', checked: editing.enabled !== false,
+                  onChange: (e) => setEditing({ ...editing, enabled: e.target.checked }),
+                }), '启用')))
+          : null,
+
+        confirmDel
+          ? h(ConfirmModal, {
+              title: '删除这条提示词？',
+              message: `「${confirmDel.name}」删除后无法恢复。如果只是暂时不用，可以改成「停用」。`,
+              danger: true,
+              confirmText: '删除',
+              onCancel: () => setConfirmDel(null),
+              onConfirm: () => {
+                call('/prompts/remove', { method: 'POST', body: { id: confirmDel.id, expectedRev: confirmDel.rev } })
+                  .then(() => { setConfirmDel(null); reload() })
+                  .catch((e) => { setConfirmDel(null); setErr(e.message) })
+              },
+            })
+          : null)
+    }
+
+    /** 提示词分类管理（「未分类」是兜底，不能删）。 */
+    function PromptCatsModal({ categories, onClose, onDone, onError }) {
+      const [name, setName] = useState('')
+      const [err, setErr] = useState(null)
+      const [busy, setBusy] = useState(false)
+
+      const add = async () => {
+        const n = name.trim()
+        if (!n) return
+        setBusy(true)
+        setErr(null)
+        try {
+          await call('/prompts/categories/add', { method: 'POST', body: { name: n } })
+          setName('')
+          onDone(`已添加分类「${n}」`)
+        } catch (e) {
+          setErr(e.message)
+        } finally {
+          setBusy(false)
+        }
+      }
+
+      const remove = async (cat) => {
+        setErr(null)
+        try {
+          await call('/prompts/categories/remove', { method: 'POST', body: { name: cat.name ?? cat } })
+          onDone(`已删除分类「${cat.name ?? cat}」，里面的提示词会移到「未分类」`)
+        } catch (e) {
+          setErr(e.message)
+        }
+      }
+
+      return h(Modal, {
+        title: '提示词分类',
+        onClose,
+        footer: [h('button', { key: 'c', className: 'csb-btn', onClick: onClose }, '关闭')],
+      },
+        h('div', { className: 'csb-bar' },
+          h('input', {
+            className: 'csb-in csb-grow', placeholder: '新分类名…（回车添加）',
+            value: name, onChange: (e) => setName(e.target.value),
+            onKeyDown: (e) => e.key === 'Enter' && add(),
+          }),
+          h('button', { className: 'csb-btn csb-btn-p', disabled: busy || !name.trim(), onClick: add }, '添加')),
+        h(Notice, { kind: 'err', onClose: () => setErr(null) }, err),
+        h('div', { className: 'csb-list', style: { marginTop: 8 } },
+          (categories ?? []).map((c) => {
+            const nm = c.name ?? c
+            const cnt = c.count ?? 0
+            const protectedCat = c.protected === true || nm === '未分类'
+            return h('div', { key: nm, className: 'csb-card' },
+              h('div', { className: 'csb-card-main' },
+                h('div', { className: 'csb-card-t' }, nm),
+                h('div', { className: 'csb-card-m' },
+                  h('span', { className: 'csb-b' }, `${cnt} 条`),
+                  protectedCat ? h('span', { className: 'csb-b csb-b-idle' }, '兜底分类，不能删') : null,
+                  c.builtin ? h('span', { className: 'csb-b' }, '系统自带') : null)),
+              protectedCat
+                ? null
+                : h('button', { className: 'csb-btn csb-btn-s csb-btn-d', onClick: () => remove(c) }, '删除'))
+          })))
+    }
+
+    // ── 纪律 ────────────────────────────────────────────────────────────────
+    const DISC_SCOPES = [
+      { id: 'global', label: '全局', hint: '所有 Bot、所有项目都遵守' },
+      { id: 'workspace', label: '工作区', hint: '只在指定工作目录里生效' },
+      { id: 'room', label: '房间', hint: '只在这个房间的协作里生效' },
+      { id: 'bot', label: '单个 Bot', hint: '只对某一个 Bot 生效' },
+    ]
+    const DISC_KINDS = [
+      { id: 'rule', label: '纪律', hint: '硬规矩，必须遵守' },
+      { id: 'requirement', label: '要求', hint: '交付标准' },
+      { id: 'principle', label: '原则', hint: '判断依据' },
+      { id: 'style', label: '风格', hint: '说话/写作方式' },
+    ]
+
+    function DisciplineTab() {
+      const [scope, setScope] = useState('')
+      const qs = new URLSearchParams()
+      if (scope) qs.set('scope', scope)
+      const { data, loading, error, reload } = useApi(`/disciplines?${qs.toString()}`, [scope])
+      const [editing, setEditing] = useState(null)
+      const [err, setErr] = useState(null)
+      const [ok, setOk] = useState(null)
+      const [confirmDel, setConfirmDel] = useState(null)
+      const [preview, setPreview] = useState(null)
+
+      const items = data?.items ?? []
+      const blank = { scope: 'global', scopeId: '', kind: 'rule', title: '', content: '', priority: 0, enabled: true }
+
+      const save = async () => {
+        const body = {
+          scope: editing.scope,
+          scopeId: editing.scope === 'global' ? null : (editing.scopeId || null),
+          kind: editing.kind,
+          title: editing.title,
+          content: editing.content,
+          priority: Number(editing.priority) || 0,
+          enabled: editing.enabled !== false,
+        }
+        try {
+          if (editing.id) {
+            await call('/disciplines/update', {
+              method: 'POST',
+              body: { ...body, id: editing.id, expectedRev: editing.rev },
+            })
+          } else {
+            await call('/disciplines', { method: 'POST', body })
+          }
+          setEditing(null)
+          setOk('已保存')
+          reload()
+        } catch (e) {
+          setErr(e.message)
+        }
+      }
+
+      const grouped = DISC_SCOPES.map((s) => ({ ...s, rows: items.filter((i) => i.scope === s.id) }))
+
+      return h('div', { className: 'csb-wrap' },
+        h(Section, {
+          title: '纪律与要求',
+          desc: '把规矩分四层写：全局 → 工作区 → 房间 → 单个 Bot。越具体的越优先，'
+            + '同一条规矩写在不同层时，只保留最具体的那条。',
+        }),
+        h('div', { className: 'csb-bar', style: { marginTop: 12 } },
+          h('select', {
+            className: 'csb-sel', style: { width: 150 }, value: scope,
+            onChange: (e) => setScope(e.target.value),
+          },
+          h('option', { value: '' }, '全部层级'),
+          DISC_SCOPES.map((s) => h('option', { key: s.id, value: s.id }, s.label))),
+          h('span', { className: 'csb-spacer' }),
+          h('button', {
+            className: 'csb-btn csb-btn-s',
+            onClick: () => call('/disciplines/resolve').then(setPreview).catch((e) => setErr(e.message)),
+          }, '看看实际会执行哪些'),
+          h('button', { className: 'csb-btn csb-btn-p', onClick: () => setEditing({ ...blank }) }, '＋ 新建纪律')),
+
+        h(Notice, { kind: 'ok', onClose: () => setOk(null) }, ok),
+        h(Notice, { kind: 'err', onClose: () => setErr(null) }, err),
+        error ? h('div', { className: 'csb-err' }, error) : null,
+        loading ? h(Skeleton, { n: 3 }) : null,
+        !loading && items.length === 0
+          ? h(Empty, {
+              icon: '§',
+              title: '还没有任何纪律',
+              hint: '先写一条「全局」的，比如「结论先行，给证据」——所有 Bot 都会遵守。',
+            })
+          : null,
+
+        grouped.map((g) => g.rows.length === 0 ? null : h('div', { key: g.id, style: { marginTop: 18 } },
+          h('div', { className: 'csb-hint', style: { marginLeft: 0, marginBottom: 8 } }, `${g.label} · ${g.hint}`),
+          h('div', { className: 'csb-list' }, g.rows.map((d) => h('div', { key: d.id, className: 'csb-card' },
+            h('div', { className: 'csb-card-main' },
+              h('div', { className: 'csb-card-t2' }, d.title),
+              h('div', { className: 'csb-card-m' },
+                h('span', { className: 'csb-b' }, (DISC_KINDS.find((k) => k.id === d.kind) ?? {}).label ?? d.kind),
+                d.priority ? h('span', { className: 'csb-b' }, `优先级 ${d.priority}`) : null,
+                d.enabled === false ? h('span', { className: 'csb-b csb-b-idle' }, '已停用') : null,
+                d.scopeId ? h('span', { className: 'csb-b' }, d.scopeId) : null),
+              h('div', {
+                style: { marginTop: 6, fontSize: 12, color: 'var(--dsw-alias-label-secondary)' },
+              }, d.content.slice(0, 140) + (d.content.length > 140 ? '…' : ''))),
+            h('div', { style: { display: 'flex', gap: 6, flex: 'none' } },
+              h('button', {
+                className: 'csb-btn csb-btn-s',
+                onClick: () => call('/disciplines/update', {
+                  method: 'POST',
+                  body: { id: d.id, expectedRev: d.rev, enabled: d.enabled === false },
+                }).then(reload).catch((e) => setErr(e.message)),
+              }, d.enabled === false ? '启用' : '停用'),
+              h('button', { className: 'csb-btn csb-btn-s', onClick: () => setEditing({ ...d }) }, '改'),
+              h('button', { className: 'csb-btn csb-btn-s csb-btn-d', onClick: () => setConfirmDel(d) }, '删'))))))),
+
+        editing
+          ? h(Modal, {
+              title: editing.id ? '修改纪律' : '新建纪律',
+              wide: true,
+              onClose: () => setEditing(null),
+              footer: [
+                h('button', { key: 'c', className: 'csb-btn', onClick: () => setEditing(null) }, '取消'),
+                h('button', { key: 's', className: 'csb-btn csb-btn-p', onClick: save }, '保存'),
+              ],
+            },
+            h(Field, { label: '管到哪一层' },
+              h('select', {
+                className: 'csb-sel', value: editing.scope,
+                onChange: (e) => setEditing({ ...editing, scope: e.target.value }),
+              }, DISC_SCOPES.map((s) => h('option', { key: s.id, value: s.id }, `${s.label}——${s.hint}`)))),
+            editing.scope !== 'global'
+              ? h(Field, {
+                  label: editing.scope === 'workspace' ? '工作目录' : (editing.scope === 'room' ? '房间 ID' : 'Bot ID'),
+                  hint: '留空表示这条先不绑定具体对象',
+                },
+                h('input', {
+                  className: 'csb-in', value: editing.scopeId ?? '',
+                  onChange: (e) => setEditing({ ...editing, scopeId: e.target.value }),
+                }))
+              : null,
+            h(Field, { label: '属于哪一类' },
+              h('select', {
+                className: 'csb-sel', value: editing.kind,
+                onChange: (e) => setEditing({ ...editing, kind: e.target.value }),
+              }, DISC_KINDS.map((k) => h('option', { key: k.id, value: k.id }, `${k.label}——${k.hint}`)))),
+            h(Field, { label: '一句话标题', hint: '短标题，用来去重：同名时只保留最具体那条' },
+              h('input', {
+                className: 'csb-in', autoFocus: true, value: editing.title,
+                onChange: (e) => setEditing({ ...editing, title: e.target.value }),
+              })),
+            h(Field, { label: '具体内容' },
+              h('textarea', {
+                className: 'csb-ta', style: { minHeight: 140 }, value: editing.content,
+                onChange: (e) => setEditing({ ...editing, content: e.target.value }),
+              })),
+            h(Field, { label: '优先级', hint: '数字越大越靠前；一般留 0 就行' },
+              h('input', {
+                className: 'csb-in', type: 'number', value: editing.priority,
+                onChange: (e) => setEditing({ ...editing, priority: e.target.value }),
+              })))
+          : null,
+
+        preview
+          ? h(Modal, {
+              title: '实际会执行的纪律',
+              wide: true,
+              onClose: () => setPreview(null),
+              footer: [h('button', { key: 'c', className: 'csb-btn', onClick: () => setPreview(null) }, '关闭')],
+            },
+            h('p', { style: { color: 'var(--dsw-alias-label-secondary)', fontSize: 12 } },
+              `合并后共 ${preview.items?.length ?? 0} 条`
+              + (preview.dropped ? `，有 ${preview.dropped} 条因同名或超预算被折叠` : '')
+              + (preview.truncated ? '（已按预算裁剪）' : '')),
+            h('pre', {
+              style: {
+                whiteSpace: 'pre-wrap', fontFamily: 'ui-monospace,monospace', fontSize: 12,
+                background: 'var(--dsw-alias-bg-layer-2)', padding: 12, borderRadius: 8,
+                maxHeight: '50vh', overflow: 'auto',
+              },
+            }, preview.text || '（当前没有任何生效的纪律）'))
+          : null,
+
+        confirmDel
+          ? h(ConfirmModal, {
+              title: '删除这条纪律？',
+              message: `「${confirmDel.title}」删除后无法恢复。如果只是暂时不用，可以点「停用」。`,
+              danger: true,
+              confirmText: '删除',
+              onCancel: () => setConfirmDel(null),
+              onConfirm: () => {
+                call('/disciplines/remove', { method: 'POST', body: { id: confirmDel.id, expectedRev: confirmDel.rev } })
+                  .then(() => { setConfirmDel(null); reload() })
+                  .catch((e) => { setConfirmDel(null); setErr(e.message) })
+              },
+            })
+          : null)
+    }
+
     // ── 主面板 ──────────────────────────────────────────────────────────────
 
+    /**
+     * 页签结构 —— **严格对齐原架构（v0.1.1）：7 个页签，不新增**。
+     *
+     * 为什么 v2 的能力不各开一个页签（这条写死在这里，防止以后又长回去）：
+     *   原架构的页签只有两种：①**协作对象**（任务/Bot/房间）——多个、有生命周期、
+     *   要点进去看详情；②**配置资产**（技能库/工作流库/设置）——配一次、被多处引用。
+     *   待办/便签/纪律/提示词都不是独立对象，而是既有对象的**视图或属性**，
+     *   所以只能挂在既有页签下做子视图。
+     *
+     * 归并口径（一句人话）：
+     *   任务   = 要做的活（看板=协作单元，待办=个人备忘，便签=随手记）
+     *   Bot    = 谁来做
+     *   房间   = 在哪商量
+     *   记忆   = AI 该知道什么（记忆=事实，纪律=规矩，提示词=指令模板）
+     *   技能库 = 怎么做
+     *   工作流 = 按什么步骤做
+     *   设置   = 平台怎么跑
+     *
+     * `subs` 为空 = 单页（不渲染子页签行）；长度 > 1 才显示子页签。
+     */
     const TABS = [
-      { id: 'tasks', label: '任务', Comp: TasksTab },
+      {
+        id: 'tasks', label: '任务',
+        subs: [
+          { id: 'board', label: '协作看板', Comp: TasksTab },
+          { id: 'todo', label: '我的待办', Comp: TodoTab },
+          { id: 'scratch', label: '便签', Comp: ScratchTab },
+        ],
+      },
       { id: 'bots', label: 'Bot', Comp: BotsTab },
       { id: 'rooms', label: '房间', Comp: RoomsTab },
-      { id: 'memory', label: '记忆', Comp: MemoryTab },
+      {
+        id: 'memory', label: '记忆',
+        subs: [
+          { id: 'facts', label: '事实与偏好', Comp: MemoryTab },
+          { id: 'rules', label: '纪律与要求', Comp: DisciplineTab },
+          { id: 'prompts', label: '提示词', Comp: PromptsTab },
+        ],
+      },
       { id: 'skills', label: '技能库', Comp: SkillsTab },
       { id: 'workflows', label: '工作流库', Comp: WorkflowsTab },
       { id: 'settings', label: '设置', Comp: SettingsBody },
     ]
 
+    /** 取某个页签的视图清单（单页页签返回 [自身]）。 */
+    function viewsOf(tab) {
+      return tab.subs && tab.subs.length ? tab.subs : [{ id: tab.id, label: tab.label, Comp: tab.Comp }]
+    }
+
     function Workbench() {
       const [tab, setTab] = useState('tasks')
+      const [view, setView] = useState(null)
       const current = TABS.find((t) => t.id === tab) ?? TABS[0]
-      const Comp = current.Comp
+      const views = viewsOf(current)
+      const activeView = views.find((v) => v.id === view) ?? views[0]
+      const Comp = activeView.Comp
+
+      // 切主页签时把子视图重置为该页签的第一个，避免"停在任务→便签，切到记忆还是便签"
+      const goTab = (id) => {
+        setTab(id)
+        setView(null)
+      }
+
       return h('div', { className: 'csb' },
         h('div', { className: 'csb-head' },
           h('div', { className: 'csb-hrow' },
             h('h2', null, '协作平台'),
-            h('span', { className: 'csb-hint' }, '任务 · Bot · 房间 · 记忆 · 技能 · 工作流')),
+            h('span', { className: 'csb-hint' }, '任务 · Bot · 房间 · 记忆 · 技能 · 工作流 · 设置')),
           h('div', { className: 'csb-tabs', role: 'tablist' },
             TABS.map((t) =>
               h('button', {
                 key: t.id, role: 'tab', 'aria-selected': t.id === tab,
                 className: `csb-tab${t.id === tab ? ' csb-tab-on' : ''}`,
-                onClick: () => setTab(t.id),
-              }, t.label)))),
+                onClick: () => goTab(t.id),
+              }, t.label))),
+          views.length > 1
+            ? h('div', { className: 'csb-subtabs', role: 'tablist' },
+                views.map((v) =>
+                  h('button', {
+                    key: v.id, role: 'tab', 'aria-selected': v.id === activeView.id,
+                    className: `csb-subtab${v.id === activeView.id ? ' csb-subtab-on' : ''}`,
+                    onClick: () => setView(v.id),
+                  }, v.label)))
+            : null),
         h('div', { className: 'csb-body' },
-          h(Boundary, { tab: current.label }, h(Comp, { key: current.id }))))
+          h(Boundary, { tab: `${current.label}/${activeView.label}` },
+            h(Comp, { key: `${current.id}:${activeView.id}` }))))
     }
 
     function PanelIcon() {
@@ -2077,6 +3784,10 @@ window.__ModuleLoader__.load({
     exports.SkillsTab = SkillsTab
     exports.WorkflowsTab = WorkflowsTab
     exports.SettingsBody = SettingsBody
+    exports.TodoTab = TodoTab
+    exports.ScratchTab = ScratchTab
+    exports.PromptsTab = PromptsTab
+    exports.DisciplineTab = DisciplineTab
     exports.BotProfileDrawer = BotProfileDrawer
     exports.DirPicker = DirPicker
     exports.Modal = Modal
