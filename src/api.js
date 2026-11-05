@@ -246,8 +246,14 @@ export function installApi(ctx, { warn } = {}) {
       if (request.method === 'GET' && path === '/tasks') {
         const status = qp(url, 'status')
         const onlyReady = qp(url, 'ready') === '1'
+        const attention = qp(url, 'attention') === '1'
+        const priority = qn(url, 'priority')
+        const source = qp(url, 'source')
+        const sort = qp(url, 'sort')
+        const byId = qp(url, 'byId')
+        const opts = { status: status ?? undefined, attention: attention || undefined, priority: priority ?? undefined, source: source ?? undefined, sort: sort ?? undefined, byId }
         const tasks = await withService(services, 'board', (b) =>
-          onlyReady ? b.ready() : b.list(status ? { status } : {}),
+          onlyReady ? b.ready() : b.list(opts),
         )
         sendJson(response, 200, { ok: true, tasks })
         return
@@ -452,7 +458,37 @@ export function installApi(ctx, { warn } = {}) {
         const message = await withService(services, 'room', (r) =>
           r.post({ ...body, from: body.from ?? 'ui' }),
         )
-        sendJson(response, 200, { ok: true, message })
+
+        // ── 发言后自动唤醒房间内的 Bot ──
+        //
+        // 为什么需要这步：主管报"我在群聊里说话，Bot 没有反应"。
+        // 根因是 /rooms/post 只落消息、不做任何投递，房间变成"死信箱"——
+        // 消息写进去了，但没有任何机制告诉 Bot "有人在说话"。
+        //
+        // 唤醒策略（与 dispatcher 的 dedupKey 一致）：
+        //   - 只唤醒**非本人**的成员（不唤醒发送者自己）；
+        //   - 房间设置 `allowBotAutoPost` 为 false 时跳过（给用户关开关的权利）；
+        //   - dedupKey 用消息 ID，天然幂等，同一消息不会重复唤醒；
+        //   - dispatcher 缺失时降级为「只落消息不唤醒」，不抛错。
+        const room = await withService(services, 'room', (r) => r.get(message.roomId))
+        const senderSession = body.from ?? 'ui'
+        const members = room?.members ?? []
+        const skipSelf = (senderSession !== 'ui' && senderSession)
+        const toWake = members.filter((m) => m !== skipSelf)
+        if (toWake.length > 0 && room?.settings?.allowBotAutoPost !== false) {
+          for (const target of toWake) {
+            await withService(services, 'dispatcher', (d) => d.notify({
+              target,
+              reason: 'room-message',
+              dedupKey: `room-msg:${message.id}:${target}`,
+              text: `[房间「${room.name ?? message.roomId}」有新消息] ${message.text.slice(0, 200)}`,
+            })).catch(() => {
+              // dispatcher 降级：唤醒失败不影响消息已落盘的事实
+            })
+          }
+        }
+
+        sendJson(response, 200, { ok: true, message, wakes: toWake.length })
         return
       }
 
@@ -1069,6 +1105,16 @@ export function installApi(ctx, { warn } = {}) {
           l.scanSkillsDir({ dir: body.dir }),
         )
         sendJson(response, 200, { ok: true, ...result })
+        return
+      }
+      if (request.method === 'GET' && path === '/library/skills/detail') {
+        const id = qp(url, 'id')
+        if (!id) {
+          sendJson(response, 400, { ok: false, reason: 'id 必填' })
+          return
+        }
+        const skill = await withService(services, 'library', (l) => l.getSkill(id))
+        sendJson(response, 200, { ok: true, skill })
         return
       }
       if (request.method === 'GET' && path === '/library/skills/export') {

@@ -80,6 +80,19 @@ import {
   writeJsonAtomic,
 } from './store.js'
 
+// ── store.appendAudit 软导入（P1-D §4）───────────────────────────────────────
+// 软用：拿不到就只 warn 一次 + 计数，绝不阻断主流程，也绝不自己另造审计格式。
+// 用顶层 await 一次性判定（memory.js 已是 ESM + 顶层 await），commit() 里同步判定。
+let storeAppendAudit = /** @type {null | ((dir: string, entry: object) => unknown)} */ (null)
+let storeAuditMissing = false
+try {
+  const storeMod = await import('./store.js')
+  if (typeof storeMod.appendAudit === 'function') storeAppendAudit = storeMod.appendAudit
+  else storeAuditMissing = true
+} catch {
+  storeAuditMissing = true
+}
+
 // ── kernel 惰性桥（见文件头「为什么是动态导入」）──────────────────────────────
 
 /** @type {object | null} */
@@ -581,6 +594,8 @@ export function createMemory(ctx, config = {}) {
     replayedEvents: 0,
     badLines: 0,
     snapshotWriteFailures: 0,
+    auditWriteFailures: 0,
+    auditWarnedOnce: false,
     searchBackend: /** @type {'fts5'|'includes'} */ ('includes'),
     searchBackendReason: /** @type {string} */ ('未初始化'),
     ftsTokenize: /** @type {string|null} */ (null),
@@ -728,6 +743,38 @@ export function createMemory(ctx, config = {}) {
     if (!writeJsonAtomic(snapPath, snapshot())) {
       diagnostics.snapshotWriteFailures += 1
       warn(`[cs-bots/memory] 快照写入失败（${snapPath}）——事件流已落盘，replay() 可完整恢复`)
+    }
+    // ── 审计接线（P1-D §4）────────────────────────────────────────────────
+    // 软用 store.appendAudit：拿不到/写失败 → 只 warn 一次 + 计数，绝不阻断主流程。
+    if (storeAuditMissing) {
+      diagnostics.auditWriteFailures += 1
+      if (!diagnostics.auditWarnedOnce) {
+        diagnostics.auditWarnedOnce = true
+        warn('[cs-bots/memory] store.appendAudit 尚不可用 → 审计接线跳过；主流程不受影响')
+      }
+    } else {
+      try {
+        const digest = (e) => (e
+          ? { id: e.id, layer: e.layer ?? null, rev: e.rev, source: e.source ?? null }
+          : null)
+        const result = storeAppendAudit(stateDir, {
+          ts: at, actor: byId, action, target: id, before: digest(before), after: digest(after),
+        })
+        const failed = result === false || Boolean(result && typeof result === 'object' && result.ok === false)
+        if (failed) {
+          diagnostics.auditWriteFailures += 1
+          if (!diagnostics.auditWarnedOnce) {
+            diagnostics.auditWarnedOnce = true
+            warn('[cs-bots/memory] store.appendAudit 返回失败——主流程不受影响')
+          }
+        }
+      } catch (error) {
+        diagnostics.auditWriteFailures += 1
+        if (!diagnostics.auditWarnedOnce) {
+          diagnostics.auditWarnedOnce = true
+          warn(`[cs-bots/memory] store.appendAudit 抛错：${error?.message ?? error}——主流程不受影响`)
+        }
+      }
     }
     return clone(after)
   }

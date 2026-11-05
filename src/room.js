@@ -117,6 +117,21 @@ import {
 } from './store.js'
 import * as kernel from './kernel.js'
 
+// ── store.appendAudit 软导入（P1-D §4）───────────────────────────────────────
+// 软用：拿不到就只 warn 一次 + 计数，绝不阻断主流程，也绝不自己另造审计格式。
+// 为什么用动态 `await import` 而不是具名静态 import：store.js 正被另一工程师并行改，
+// 静态具名 import 在对方重构掉该导出时会变成**加载期**失败（整个服务起不来）；
+// 动态判定只是「审计少一条」，主流程不受影响。顶层 await 一次性判定 ⇒ commit 内同步。
+let storeAppendAudit = /** @type {null | ((dir: string, entry: object) => unknown)} */ (null)
+let storeAuditMissing = false
+try {
+  const storeMod = await import('./store.js')
+  if (typeof storeMod.appendAudit === 'function') storeAppendAudit = storeMod.appendAudit
+  else storeAuditMissing = true
+} catch {
+  storeAuditMissing = true
+}
+
 // ── 常量 ────────────────────────────────────────────────────────────────────
 
 /** `notice` 上限（§3.2）。 */
@@ -581,6 +596,8 @@ export function createRoom(ctx, config = {}) {
     orphanRoomDirs: 0,
     snapshotWriteFailures: 0,
     relayResultAppendFailures: 0,
+    auditWriteFailures: 0,
+    auditWarnedOnce: false,
     lastReplayAt: /** @type {number|undefined} */ (undefined),
   }
 
@@ -767,6 +784,38 @@ export function createRoom(ctx, config = {}) {
     // 名字索引随房间状态一起维护（改名/归档都走这里 —— 保持单一维护点，避免索引漂移）
     if (after?.name) nameIndex.set(nameKey(after.name), roomId)
     snapshotIndex()
+    // ── 审计接线（P1-D §4）────────────────────────────────────────────────
+    // 软用 store.appendAudit：拿不到/写失败 → 只 warn 一次 + 计数，绝不阻断主流程。
+    if (storeAuditMissing) {
+      diagnostics.auditWriteFailures += 1
+      if (!diagnostics.auditWarnedOnce) {
+        diagnostics.auditWarnedOnce = true
+        warn('[cs-bots/room] store.appendAudit 尚不可用 → 审计接线跳过；主流程不受影响')
+      }
+    } else {
+      try {
+        const digest = (r) => (r
+          ? { id: r.id, name: r.name ?? null, rev: r.rev, mode: r.mode ?? null, members: Array.isArray(r.members) ? r.members.length : 0 }
+          : null)
+        const result = storeAppendAudit(stateDir, {
+          ts: at, actor: byId, action: type, target: roomId, before: digest(before), after: digest(after),
+        })
+        const failed = result === false || Boolean(result && typeof result === 'object' && result.ok === false)
+        if (failed) {
+          diagnostics.auditWriteFailures += 1
+          if (!diagnostics.auditWarnedOnce) {
+            diagnostics.auditWarnedOnce = true
+            warn('[cs-bots/room] store.appendAudit 返回失败——主流程不受影响')
+          }
+        }
+      } catch (error) {
+        diagnostics.auditWriteFailures += 1
+        if (!diagnostics.auditWarnedOnce) {
+          diagnostics.auditWarnedOnce = true
+          warn(`[cs-bots/room] store.appendAudit 抛错：${error?.message ?? error}——主流程不受影响`)
+        }
+      }
+    }
     return clone(after)
   }
 

@@ -118,7 +118,10 @@ function applyInner(ctx, config, { log, warn }) {
   }
 
   try {
-    services.board = createBoard(ctx, { stateDir: config.stateDir, leaseMs: settings.defaultLeaseMs })
+    // ⚠️ 2026-11-05（P0）：createBoard 必须拿到 settings —— wipLimitPerBot（WIP 上限）
+    //   与 requireTriageForReady（Ready 闸门）都从 config.settings 读。只传 stateDir 会让
+    //   平台设置对任务板静默失效（永远退回代码内默认值），且用户改了设置看不到任何变化。
+    services.board = createBoard(ctx, { stateDir: config.stateDir, leaseMs: settings.defaultLeaseMs, settings })
     log(`[cs-bots] BoardService 就绪（stateDir=${services.board.paths?.stateDir ?? '?'}）`)
     // ⚠️ 修复（2026-11-04 测试，P1-4）：expireLeases 之前无任何调用者，
     //   owner 崩溃/失联后任务永久停在 in_progress（连"重启时回收"都不做）。
@@ -154,7 +157,16 @@ function applyInner(ctx, config, { log, warn }) {
   }
 
   try {
-    services.memory = createMemory(ctx, { stateDir: config.stateDir, entryMax: settings.memoryEntryMax, splitOnOverflow: settings.memorySplitOnOverflow })
+    services.memory = createMemory(ctx, {
+      stateDir: config.stateDir,
+      entryMax: settings.memoryEntryMax,
+      splitOnOverflow: settings.memorySplitOnOverflow,
+      progressiveDisclosure: settings.keyProgressiveDisclosure,
+      fullInjectThreshold: settings.keyFullInjectThreshold,
+      fullInjectCharLimit: settings.keyFullInjectCharLimit,
+      entryDatePrefix: settings.entryDatePrefix,
+      perTurnWrites: settings.perTurnWrites,
+    })
     log(`[cs-bots] MemoryService 就绪（stateDir=${services.memory.paths?.stateDir ?? '?'}）`)
   } catch (error) {
     warn(`[cs-bots] MemoryService 装配失败 → 降级（无分层记忆）：${error?.message ?? error}`)
@@ -186,7 +198,11 @@ function applyInner(ctx, config, { log, warn }) {
 
   // ── 技能库 / 工作流库（全局可复用资产，Bot 与任务可关联）──────────────
   try {
-    services.library = createLibrary(ctx, { stateDir: config.stateDir ?? kernelStateDir() })
+    services.library = createLibrary(ctx, {
+      stateDir: config.stateDir ?? kernelStateDir(),
+      skillMaxBytes: settings.skillMaxBytes,
+      skillReviewEnabled: settings.skillReviewEnabled,
+    })
     log('[cs-bots] library 就绪')
   } catch (error) {
     warn(`[cs-bots] library 装配失败（技能库/工作流库不可用）：${error?.message ?? error}`)
@@ -238,7 +254,11 @@ function applyInner(ctx, config, { log, warn }) {
       stateDir: config.stateDir ?? kernelStateDir(),
       memory: services.memory,
       suggest: services.suggest,
-      interval: config.reviewInterval,
+      interval: settings.reviewInterval,
+      enabled: settings.reviewEnabled,
+      mode: settings.reviewMode,
+      writeGuard: settings.perTurnWriteGuard,
+      writeGuardThreshold: settings.writeGuardThreshold,
     })
     log(`[cs-bots] reviewer 就绪（每 ${services.reviewer.status?.().interval ?? '?'} 回合）`)
   } catch (error) {

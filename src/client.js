@@ -59,7 +59,13 @@ window.__ModuleLoader__.load({
       } catch {
         throw new Error(`接口返回非 JSON（HTTP ${res.status}）`)
       }
-      if (!data || data.ok === false) throw new Error(data?.reason ?? data?.message ?? `HTTP ${res.status}`)
+      if (!data || data.ok === false) {
+        const err = new Error(data?.reason ?? data?.message ?? `HTTP ${res.status}`)
+        // 后端 code 必须带出来：humanizeError 靠它映射「人话 + 下一步」
+        if (data?.code) err.code = data.code
+        if (data?.details) err.details = data.details
+        throw err
+      }
       return data
     }
 
@@ -85,6 +91,10 @@ window.__ModuleLoader__.load({
 .csb-subtab:hover{color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-2)}
 .csb-subtab-on{color:var(--dsw-alias-label-primary);font-weight:500;
   background:var(--dsw-alias-bg-layer-2);border-color:var(--dsw-alias-border-l2)}
+.csb-room-split{display:flex;gap:16px;align-items:flex-start}
+.csb-room-chat{flex:1;min-width:0}
+.csb-room-side{width:280px;flex-shrink:0}
+@media(max-width:900px){.csb-room-split{flex-direction:column}.csb-room-side{width:100%}}
 .csb-body{flex:1;overflow-y:auto;padding:20px 24px 56px;min-height:0}
 .csb-wrap{max-width:920px;margin:0 auto}
 
@@ -165,6 +175,17 @@ window.__ModuleLoader__.load({
 .csb-empty-i{font-size:24px;opacity:.32;line-height:1}
 .csb-empty-t{font-size:13px;color:var(--dsw-alias-label-secondary)}
 .csb-empty-h{font-size:11.5px;color:var(--dsw-alias-label-secondary);max-width:400px;line-height:1.7}
+.csb-empty-a{margin-top:2px}
+
+/* 可读错误框：人话正文 + 后端原文（折叠）+ 下一步按钮 */
+.csb-err-box{padding:10px 12px;border-radius:10px;font-size:12.5px;margin-bottom:14px;line-height:1.6;
+  color:var(--dsw-alias-state-error-primary);background:var(--dsw-alias-bg-layer-1);
+  border:1px solid color-mix(in srgb,var(--dsw-alias-state-error-primary) 40%,transparent)}
+.csb-err-text{font-weight:500}
+.csb-err-raw{margin-top:8px}
+.csb-err-raw summary{cursor:pointer;font-size:11.5px;color:var(--dsw-alias-label-secondary)}
+.csb-err-raw pre{margin:6px 0 0;font-size:11px;color:var(--dsw-alias-label-secondary);white-space:pre-wrap;wordBreak:break-all}
+.csb-err-box .csb-btn{margin-top:8px}
 .csb-sk{height:56px;border-radius:12px;border:1px solid var(--dsw-alias-border-l1);
   background:linear-gradient(90deg,var(--dsw-alias-bg-layer-1) 25%,var(--dsw-alias-bg-layer-2) 37%,var(--dsw-alias-bg-layer-1) 63%);
   background-size:400% 100%;animation:csb-sk 1.3s ease-in-out infinite;margin-bottom:8px}
@@ -331,17 +352,173 @@ window.__ModuleLoader__.load({
     function Skeleton({ n }) {
       return h('div', null, Array.from({ length: n ?? 3 }, (_, i) => h('div', { key: i, className: 'csb-sk' })))
     }
-    function Empty({ icon, title, hint }) {
+    /**
+     * 空状态：icon + title + hint + 可选的「去建一个」CTA。
+     *
+     * 为什么必须有 action：只有提示没有按钮的空态等于把用户卡住 ——
+     * 他知道该建，但不知道去哪儿建。CTA 直接打开本页的创建表单。
+     */
+    function Empty({ icon, title, hint, action }) {
       return h('div', { className: 'csb-empty' },
         icon ? h('div', { className: 'csb-empty-i' }, icon) : null,
         h('div', { className: 'csb-empty-t' }, title),
-        hint ? h('div', { className: 'csb-empty-h' }, hint) : null)
+        hint ? h('div', { className: 'csb-empty-h' }, hint) : null,
+        action
+          ? h('button', {
+              className: 'csb-btn csb-btn-p csb-empty-a',
+              onClick: action.onClick,
+            }, (action.icon ?? '＋') + ' ' + action.label)
+          : null)
     }
+
+    /**
+     * 错误码 → 人话 + 下一步建议（详见 design/UX-实现规格-v1.md §8）。
+     *
+     * 8 个 code 全部覆盖；`actionLabel` 是按钮文字，`hint` 是展开后的后端原文说明。
+     * 未在表内的 code 走兜底：显示后端原文，不猜建议。
+     */
+    const ERROR_MAP = {
+      BOARD_WIP_EXCEEDED: {
+        actionLabel: '查看我的任务',
+        text: '你已经在管 N 个任务了（上限 M），先完成或释放一些再接新的',
+        hint: 'WIP 超限：同一 Bot 名下进行中的任务数达到上限',
+      },
+      BOARD_LEASE_HELD: {
+        actionLabel: '查看持有者',
+        text: '这个任务正由另一个 Bot 在做，等它完成或租约过期',
+        hint: '租约被占用：任务上有未过期的租约，持有者不是当前操作者',
+      },
+      BOARD_NOT_READY: {
+        actionLabel: '查看前置任务',
+        text: '这个任务的前置任务还没做完，等前置完成才能开始',
+        hint: '依赖未完成：blockedBy 里还有未 completed 的任务',
+      },
+      BOARD_ALREADY_COMPLETED: {
+        actionLabel: null,
+        text: '这个任务已经完成了，不用再操作',
+        hint: '任务已完成：已完成/已删除的任务不能再 claim/complete/block',
+      },
+      BOARD_DEPENDENCY_CYCLE: {
+        actionLabel: '查看依赖图',
+        text: '任务之间的依赖关系成了环，检查一下谁依赖谁',
+        hint: '依赖成环：blockedBy 构成环，任务永远等不到完成',
+      },
+      BOARD_REV_CONFLICT: {
+        actionLabel: '刷新',
+        text: '这个任务刚被别人改过，刷新一下再操作',
+        hint: 'rev 不匹配：expectedRev 与当前 rev 不一致（CAS 拒绝静默覆盖）',
+      },
+      CAS_MISMATCH: {
+        actionLabel: '刷新',
+        text: '这个任务刚被别人改过，刷新一下再操作',
+        hint: 'rev 不匹配：expectedRev 与当前 rev 不一致（CAS 拒绝静默覆盖）',
+      },
+      BOARD_TASK_DELETED: {
+        actionLabel: null,
+        text: '这个任务已经被删除了',
+        hint: '任务已删除：已删除（tombstone）的任务不能再操作',
+      },
+      BOARD_APPEND_FAILED: {
+        actionLabel: null,
+        text: '写入失败了，可能是磁盘或权限问题，请检查状态目录',
+        hint: '事件追加失败：拒绝「只改内存不落盘」',
+      },
+    }
+
+    /**
+     * 错误可读映射：后端 code → 人话 + 下一步建议。
+     *
+     * 为什么：后端 message 只描述「发生了什么」（还夹着 id/rev），
+     * 用户看完仍然不知道**接下来该做什么**。高频冲突（WIP 超限、租约占用、
+     * rev 冲突）恰恰是最需要下一步的，所以按 code 映射。
+     *
+     * 后端 message 仍保留在 hint 里 —— 定位信息（哪个任务 / 哪个 Bot）不能丢。
+     *
+     * `handlers` 由调用点按上下文注入（每个页签的「下一步」不一样：
+     * TasksTab 的「查看我的任务」是清除过滤，TaskDrawer 的「刷新」是 reload）。
+     */
+    function humanizeError(e, handlers, prefix) {
+      const code = e?.code ?? e?.data?.code ?? null
+      const detail = e?.message ?? e?.data?.reason ?? e?.reason ?? String(e ?? '未知错误')
+      const hit = ERROR_MAP[code]
+      const out = {
+        code: code ?? 'UNKNOWN',
+        text: hit ? hit.text : `出错了：${detail}`,
+        hint: hit ? hintOf(hit, e) : detail,
+        actionLabel: hit?.actionLabel ?? null,
+      }
+      if (prefix) out.text = `${prefix}${out.text}`
+      if (hit?.actionLabel && handlers) {
+        const fn = handlers[code]
+        if (typeof fn === 'function') out.action = { label: hit.actionLabel, onClick: fn }
+      }
+      return out
+    }
+
+    /** 把后端 details 拼成一行定位信息（如「当前 2 个 / 上限 1 个」）。 */
+    function hintOf(hit, e) {
+      const d = e?.data?.details ?? e?.details
+      if (!d) return hit.hint
+      const parts = []
+      if (d.limit !== undefined && d.current !== undefined) parts.push(`当前 ${d.current} 个 / 上限 ${d.limit} 个`)
+      if (d.ownerId) parts.push(`持有者 ${d.ownerId}`)
+      if (d.expectedRev !== undefined && d.rev !== undefined) parts.push(`期望 rev=${d.expectedRev}，实际 rev=${d.rev}`)
+      if (d.taskId) parts.push(`任务 ${d.taskId}`)
+      return parts.length ? `${hit.hint}（${parts.join('，')}）` : hit.hint
+    }
+
+    /** 可读错误框：人话正文 + 后端原文（可展开）+ 下一步按钮。 */
+    function ErrBox({ humanized, onAction }) {
+      return h('div', { className: 'csb-err-box' },
+        h('div', { className: 'csb-err-text' }, humanized.text),
+        humanized.hint ? h('details', { className: 'csb-err-raw' },
+          h('summary', null, '后端原文'),
+          h('pre', null, humanized.hint)) : null,
+        humanized.action
+          ? h('button', { className: 'csb-btn csb-btn-s', onClick: () => onAction?.(humanized.code) ?? humanized.action.onClick?.() }, humanized.action.label)
+          : null)
+    }
+
     function Section({ title, desc, children }) {
       return h('div', { className: 'csb-sec' },
         h('h4', null, title),
         desc ? h('p', null, desc) : null,
         children)
+    }
+
+    /** 复制文本（带降级）。失败要**显式告知**，不许静默假装复制成功。 */
+    function copyText(text) {
+      try {
+        if (navigator.clipboard?.writeText) {
+          return navigator.clipboard.writeText(text).then(
+            () => true,
+            () => {
+              try {
+                const ta = document.createElement('textarea')
+                ta.value = text
+                ta.style.position = 'fixed'
+                ta.style.opacity = '0'
+                document.body.appendChild(ta)
+                ta.select()
+                const ok = document.execCommand('copy')
+                document.body.removeChild(ta)
+                return ok
+              } catch { return false }
+            },
+          )
+        }
+        try {
+          const ta = document.createElement('textarea')
+          ta.value = text
+          ta.style.position = 'fixed'
+          ta.style.opacity = '0'
+          document.body.appendChild(ta)
+          ta.select()
+          const ok = document.execCommand('copy')
+          document.body.removeChild(ta)
+          return Promise.resolve(ok)
+        } catch { return Promise.resolve(false) }
+      } catch { return Promise.resolve(false) }
     }
 
     /** 站内弹窗：**取代 window.confirm**（沙箱里 confirm 被静默屏蔽）。 */
@@ -612,6 +789,14 @@ window.__ModuleLoader__.load({
       const [abortReason, setAbortReason] = useState('需求取消')
       const task = data?.task
       const history = data?.history ?? []
+      // 「下一步」按钮的落点（spec §8）
+      const errHandlers = {
+        BOARD_REV_CONFLICT: reload,
+        CAS_MISMATCH: reload,
+        BOARD_LEASE_HELD: () => {},
+        BOARD_NOT_READY: () => {},
+        BOARD_DEPENDENCY_CYCLE: () => {},
+      }
       const act = async (fn, label) => {
         setErr(null)
         try {
@@ -619,7 +804,7 @@ window.__ModuleLoader__.load({
           reload()
           onChange?.()
         } catch (e) {
-          setErr(`${label}失败：${e.message}`)
+          setErr(humanizeError(e, errHandlers, `${label}失败：`))
         }
       }
       const upd = (action, extra) =>
@@ -628,41 +813,29 @@ window.__ModuleLoader__.load({
       return h(Drawer, { title: task?.subject ?? id, onClose },
         loading ? h(Skeleton, { n: 2 }) : null,
         error ? h('div', { className: 'csb-err' }, error) : null,
-        err ? h('div', { className: 'csb-err' }, err) : null,
+        err ? h(ErrBox, { humanized: err, onAction: (c) => errHandlers[c]?.() }) : null,
         task ? h('div', null,
           h('div', { className: 'csb-kv' },
+            // ── 5W：谁建的 / 是什么 / 何时 / 在哪做 / 为什么 ──
+            h('span', { className: 'csb-k' }, '谁建的'), h('span', { className: 'csb-v' }, task.createdBy ? botName(bots, task.createdBy) : task.createdBy),
+            h('span', { className: 'csb-k' }, '来源'), h('span', { className: 'csb-v' }, task.source === 'ai' ? '智能体自动派发' : '人建的'),
+            h('span', { className: 'csb-k' }, '优先级'), h('span', { className: 'csb-v' }, task.priority !== undefined ? `${task.priority}（${task.priority >= 8 ? '紧急' : '一般'}）` : '未设'),
+            h('span', { className: 'csb-k' }, '截止'), h('span', { className: 'csb-v' }, task.dueAt ? fmt(task.dueAt) : '未设'),
             h('span', { className: 'csb-k' }, '状态'), h('span', { className: 'csb-v' }, h(Badge, { status: task.status })),
             h('span', { className: 'csb-k' }, '任务编号'), h('span', { className: 'csb-v csb-mono' }, task.id),
             h('span', { className: 'csb-k' }, '谁在做'), h('span', { className: 'csb-v' }, task.ownerId ? botName(bots, task.ownerId) : '还没人领'),
+            h('span', { className: 'csb-k' }, '在哪做'), h('span', { className: 'csb-v' }, (task.writeScopes ?? []).join('、') || '不限'),
             h('span', { className: 'csb-k' }, '完成前必须先'), h('span', { className: 'csb-v' }, (task.blockedBy ?? []).length ? task.blockedBy.join('、') : '无'),
             h('span', { className: 'csb-k' }, '交付物'), h('span', { className: 'csb-v' }, (task.artifacts ?? []).join('、') || '—'),
-            h('span', { className: 'csb-k' }, '验收结果'), h('span', { className: 'csb-v' }, task.acceptance ? `${task.acceptance.result === 'pass' ? '通过' : '打回'} · ${task.acceptance.by}` : '未验收'),
+            h('span', { className: 'csb-k' }, '验收结果'), h('span', { className: 'csb-v' }, task.acceptance ? `${task.acceptance.result === 'pass' ? '通过' : '打回'} · ${task.acceptance.by}` : task.status === 'completed' ? '待验收' : '—'),
             task.blockedReason ? h('span', { className: 'csb-k' }, '终止原因') : null,
             task.blockedReason ? h('span', { className: 'csb-v' }, task.blockedReason) : null),
           task.description ? h('div', { className: 'csb-pre', style: { marginBottom: 4 } }, task.description) : null,
 
-          h(Section, { title: '可以做什么', desc: '只有和当前状态相符的动作才会显示。' }),
+          h(Section, { title: '可以做什么', desc: '指派、完成、验收是 Bot 的职责，不由你操作。这里只有需要你拍板的动作。' }),
           h('div', { className: 'csb-bar', style: { marginTop: 10 } },
-            h('select', {
-              className: 'csb-sel', style: { width: 200 }, value: '',
-              onChange: (e) => {
-                const ownerId = e.target.value
-                if (!ownerId) return
-                act(() => call('/tasks/assign', { method: 'POST', body: { id: task.id, expectedRev: task.rev, ownerId } }), '指派')
-                e.target.value = ''
-              },
-            },
-              h('option', { value: '' }, '指派给某个 Bot…'),
-              (bots ?? []).filter((b) => b.state !== 'retired').map((b) =>
-                h('option', { key: b.id, value: b.sessionId }, b.name))),
             task.status === 'pending'
-              ? h('button', { className: 'csb-btn csb-btn-p', onClick: () => act(() => upd('claim'), '领取') }, '我来做（领取）')
-              : null,
-            task.status === 'in_progress'
-              ? h('button', { className: 'csb-btn csb-btn-p', onClick: () => { setArtifacts(''); setPicking('complete') } }, '标记完成')
-              : null,
-            task.status === 'completed'
-              ? h('button', { className: 'csb-btn csb-btn-p', onClick: () => act(() => call('/tasks/accept', { method: 'POST', body: { id: task.id, result: 'pass' } }), '验收') }, '验收通过')
+              ? h('button', { className: 'csb-btn csb-btn-p', onClick: () => act(() => upd('claim'), '领取') }, '我来管（领取）')
               : null,
             task.status === 'blocked' ? h('button', { className: 'csb-btn', onClick: () => act(() => upd('reopen'), '重开') }, '重新打开') : null,
             task.status !== 'blocked' && task.status !== 'deleted'
@@ -689,33 +862,6 @@ window.__ModuleLoader__.load({
         ) : null,
 
         // 完成 / 终止 的站内弹窗（取代 prompt）
-        picking === 'complete'
-          ? h(Modal, {
-              title: '标记完成',
-              onClose: () => setPicking(null),
-              footer: [
-                h('button', { key: 'c', className: 'csb-btn', onClick: () => setPicking(null) }, '取消'),
-                h('button', {
-                  key: 'o', className: 'csb-btn csb-btn-p',
-                  onClick: async () => {
-                    const list = artifacts.split(',').map((s) => s.trim()).filter(Boolean)
-                    if (!list.length) return setErr('必须填写交付物 —— 完成要留证据')
-                    setPicking(null)
-                    await act(() => upd('complete', { artifacts: list }), '完成')
-                  },
-                }, '确认完成'),
-              ],
-            },
-            h('div', { className: 'csb-fld' },
-              h('label', null, '交付物（必填）'),
-              h('input', {
-                className: 'csb-in', placeholder: '例如 src/api.js, test/api.test.mjs',
-                value: artifacts, onChange: (e) => setArtifacts(e.target.value),
-                autoFocus: true,
-              }),
-              h('div', { className: 'csb-fld-h' }, '多个用英文逗号分隔。这是强制的：不留交付物就不算完成。')))
-          : null,
-
         picking === 'abort'
           ? h(Modal, {
               title: '终止任务',
@@ -749,14 +895,30 @@ window.__ModuleLoader__.load({
       const [openId, setOpenId] = useState(null)
       const [busy, setBusy] = useState(false)
       const [err, setErr] = useState(null)
-      const [completing, setCompleting] = useState(null)
-      const [artifacts, setArtifacts] = useState('')
-      const { data, loading, error, reload } = useApi(`/tasks${filter ? `?status=${filter}` : ''}`, [filter])
+      // 默认只看「需要我管的」；点「看全部」才显示 AI 派发的和已完成的
+      const [attentionOnly, setAttentionOnly] = useState(true)
+      const subjectRef = useRef(null)
+      const q = new URLSearchParams()
+      if (filter) q.set('status', filter)
+      if (attentionOnly) q.set('attention', '1')
+      const qs = q.toString()
+      const { data, loading, error, reload } = useApi(`/tasks${qs ? `?${qs}` : ''}`, [filter, attentionOnly])
       const { data: rosterData } = useApi('/roster')
       const { data: wfData } = useApi('/library/workflows')
       const bots = rosterData?.bots ?? []
       const workflows = wfData?.workflows ?? []
       const tasks = data?.tasks ?? []
+
+      // 「下一步」按钮的落点（spec §8）：按错误码给可执行动作
+      const errActions = {
+        BOARD_WIP_EXCEEDED: () => { setFilter(''); setAttentionOnly(true) },
+        BOARD_REV_CONFLICT: reload,
+        CAS_MISMATCH: reload,
+        // 查看持有者 / 前置任务 / 依赖图 → 打开任务详情抽屉
+        BOARD_LEASE_HELD: (t) => setOpenId(t?.id ?? openId),
+        BOARD_NOT_READY: (t) => setOpenId(t?.id ?? openId),
+        BOARD_DEPENDENCY_CYCLE: (t) => setOpenId(t?.id ?? openId),
+      }
 
       const create = async () => {
         const s = subject.trim()
@@ -768,7 +930,7 @@ window.__ModuleLoader__.load({
           setSubject('')
           reload()
         } catch (e) {
-          setErr(e.message)
+          setErr(humanizeError(e, errActions))
         } finally {
           setBusy(false)
         }
@@ -780,7 +942,7 @@ window.__ModuleLoader__.load({
           await call('/tasks/update', { method: 'POST', body: { id: t.id, expectedRev: t.rev, action, ...(extra ?? {}) } })
           reload()
         } catch (e) {
-          setErr(e.message)
+          setErr(humanizeError(e, { ...errActions, BOARD_LEASE_HELD: () => setOpenId(t.id), BOARD_NOT_READY: () => setOpenId(t.id), BOARD_DEPENDENCY_CYCLE: () => setOpenId(t.id) }))
         } finally {
           setBusy(false)
         }
@@ -789,13 +951,20 @@ window.__ModuleLoader__.load({
       return h('div', { className: 'csb-wrap' },
         h(Section, {
           title: '任务板',
-          desc: '跨会话共享的一块板：任何会话、任何 Bot 看到的都是同一批任务。完成必须填交付物，否则不算完成。',
+          desc: attentionOnly
+            ? '只看需要你管的（卡住 / 高优先 / 逾期 / 待验收 / 你建的）。AI 自己派发的任务不在这里，点下方「看全部」穿透查看。'
+            : '全部任务（含 AI 自己派发的）。点下方回到「只看需要我管的」。',
         }),
+        h('div', { className: 'csb-bar', style: { marginTop: 8 } },
+          attentionOnly
+            ? h('button', { className: 'csb-btn csb-btn-s', onClick: () => setAttentionOnly(false) }, '看全部任务')
+            : h('button', { className: 'csb-btn csb-btn-s', onClick: () => setAttentionOnly(true) }, '只看需要我管的')),
         h('div', { className: 'csb-bar', style: { marginTop: 12 } },
           h('input', {
             className: 'csb-in csb-grow', placeholder: '要做什么？（例如：实现登录接口。回车创建）',
             value: subject, onChange: (e) => setSubject(e.target.value),
             onKeyDown: (e) => e.key === 'Enter' && create(),
+            ref: subjectRef,
           }),
           h('button', { className: 'csb-btn csb-btn-p', disabled: busy || !subject.trim(), onClick: create }, '创建任务'),
           h('select', { className: 'csb-sel', style: { width: 116 }, value: filter, onChange: (e) => setFilter(e.target.value) },
@@ -804,13 +973,14 @@ window.__ModuleLoader__.load({
             h('option', { value: 'in_progress' }, '进行中'),
             h('option', { value: 'completed' }, '已完成'),
             h('option', { value: 'blocked' }, '已终止'))),
-        err ? h('div', { className: 'csb-err' }, err) : null,
+        err ? h(ErrBox, { humanized: err, onAction: (c) => errActions[c]?.() }) : null,
         error ? h('div', { className: 'csb-err' }, error) : null,
         loading ? h(Skeleton, { n: 3 }) : null,
         !loading && !error && tasks.length === 0
           ? h(Empty, {
               icon: '◫', title: '还没有任务',
               hint: '在上面输入一句话就能建任务。建好后可以指派给某个 Bot，也可以自己领取来做。',
+              action: { label: '新建任务', icon: '✎', onClick: () => subjectRef.current?.focus() },
             })
           : null,
         h('div', { className: 'csb-list' }, tasks.map((t) =>
@@ -825,47 +995,9 @@ window.__ModuleLoader__.load({
                 h('span', null, ` · 第 ${t.rev} 版`))),
             h('div', { style: { display: 'flex', gap: 6, flex: 'none' }, onClick: (e) => e.stopPropagation() },
               t.status === 'pending'
-                ? h('button', { className: 'csb-btn csb-btn-s', disabled: busy, onClick: () => quick(t, 'claim') }, '我来做')
-                : null,
-              t.status === 'in_progress'
-                ? h('button', {
-                    className: 'csb-btn csb-btn-s csb-btn-p', disabled: busy,
-                    onClick: () => { setCompleting(t); setArtifacts('') },
-                  }, '完成')
-                : null,
-              t.status === 'completed'
-                ? h('button', {
-                    className: 'csb-btn csb-btn-s', disabled: busy,
-                    onClick: () => call('/tasks/accept', { method: 'POST', body: { id: t.id, result: 'pass' } }).then(reload).catch((e) => setErr(e.message)),
-                  }, '验收')
+                ? h('button', { className: 'csb-btn csb-btn-s', disabled: busy, onClick: () => quick(t, 'claim') }, '我来管')
                 : null)))),
-        openId ? h(TaskDrawer, { id: openId, bots, workflows, onClose: () => setOpenId(null), onChange: reload }) : null,
-        completing
-          ? h(Modal, {
-              title: `完成：${completing.subject}`,
-              onClose: () => setCompleting(null),
-              footer: [
-                h('button', { key: 'c', className: 'csb-btn', onClick: () => setCompleting(null) }, '取消'),
-                h('button', {
-                  key: 'o', className: 'csb-btn csb-btn-p',
-                  onClick: async () => {
-                    const list = artifacts.split(',').map((s) => s.trim()).filter(Boolean)
-                    if (!list.length) return setErr('必须填写交付物')
-                    const t = completing
-                    setCompleting(null)
-                    await quick(t, 'complete', { artifacts: list })
-                  },
-                }, '确认完成'),
-              ],
-            },
-            h('div', { className: 'csb-fld' },
-              h('label', null, '交付物（必填）'),
-              h('input', {
-                className: 'csb-in', placeholder: '例如 src/api.js, test/api.test.mjs',
-                value: artifacts, onChange: (e) => setArtifacts(e.target.value), autoFocus: true,
-              }),
-              h('div', { className: 'csb-fld-h' }, '多个用英文逗号分隔。')) )
-          : null)
+        openId ? h(TaskDrawer, { id: openId, bots, workflows, onClose: () => setOpenId(null), onChange: reload }) : null)
     }
 
     // ── 技能库 / 工作流库 ───────────────────────────────────────────────────
@@ -876,6 +1008,28 @@ window.__ModuleLoader__.load({
       { id: 'project', label: '项目级' },
       { id: 'bundled', label: '系统自带' },
     ]
+
+    /** 技能内容查看弹窗：读 SKILL.md 全文，让用户能直接看到「这个技能到底写了什么」。 */
+    function SkillReadModal({ skillId, onClose }) {
+      const { data, loading, error } = useApi(`/library/skills/detail?id=${encodeURIComponent(skillId)}`)
+      const skill = data?.skill
+      return h(Modal, {
+        title: skill?.name ?? '技能内容',
+        wide: true,
+        onClose,
+        footer: [h('button', { key: 'c', className: 'csb-btn', onClick: onClose }, '关闭')],
+        children: [
+          loading ? h(Skeleton, { n: 2 }) : null,
+          error ? h('div', { className: 'csb-err' }, error) : null,
+          skill ? h('div', null,
+            h('div', { className: 'csb-kv', style: { marginBottom: 10 } },
+              h('span', { className: 'csb-k' }, '描述'), h('span', { className: 'csb-v' }, skill.description || '—'),
+              h('span', { className: 'csb-k' }, '来源'), h('span', { className: 'csb-v' }, skill.source === 'bundled' ? '系统自带' : skill.source === 'custom' ? '自建' : skill.source === 'user' ? '用户级' : '项目级')),
+            h('div', { className: 'csb-pre', style: { maxHeight: 400, overflow: 'auto' } }, skill.body || '（空）'))
+            : null,
+        ],
+      })
+    }
 
     function SkillsTab() {
       const [source, setSource] = useState('')
@@ -888,6 +1042,7 @@ window.__ModuleLoader__.load({
       const [ok, setOk] = useState(null)
       const [importing, setImporting] = useState(null)
       const [showDirs, setShowDirs] = useState(false)
+      const [reading, setReading] = useState(null)
       const skills = data?.skills ?? []
 
       const toggleEnabled = async (s) => {
@@ -928,6 +1083,9 @@ window.__ModuleLoader__.load({
         !loading && skills.length === 0
           ? h(Empty, { icon: '◇', title: '技能库是空的', hint: '一个技能就是一段说明：这个 Bot 遇到某类任务时应该怎么做。写一次，多个 Bot 都能用。' })
           : null,
+        reading
+          ? h(SkillReadModal, { skillId: reading, onClose: () => setReading(null) })
+          : null,
         h('div', { className: 'csb-list' }, skills.map((s) =>
           h('div', { key: s.id, className: 'csb-card' },
             h('div', { className: 'csb-card-main' },
@@ -938,6 +1096,11 @@ window.__ModuleLoader__.load({
                 s.description ? h('span', null, s.description) : h('span', null, '（无说明）'),
                 h('span', null, `· 第 ${s.rev} 版`))),
             h('div', { style: { display: 'flex', gap: 6, flex: 'none' } },
+              h('button', {
+                className: 'csb-btn csb-btn-s',
+                title: '查看 SKILL.md 内容',
+                onClick: () => setReading(s.id),
+              }, '看内容'),
               h('button', { className: 'csb-btn csb-btn-s', onClick: () => toggleEnabled(s) }, s.enabled === false ? '启用' : '停用'),
               h('button', { className: 'csb-btn csb-btn-s', onClick: () => setEditing(s) }, '编辑'),
               h('button', { className: 'csb-btn csb-btn-s csb-btn-d', onClick: () => setConfirmDel(s) }, '删除'))))),
@@ -1425,6 +1588,8 @@ window.__ModuleLoader__.load({
       const [renaming, setRenaming] = useState(null)
       const [renameTo, setRenameTo] = useState('')
       const [retiring, setRetiring] = useState(null)
+      const [sessionPicker, setSessionPicker] = useState(null)
+      const nameRef = useRef(null)
 
       const presets = presetData?.presets ?? []
       const defaultPreset = presetData?.defaultId ?? ''
@@ -1458,16 +1623,59 @@ window.__ModuleLoader__.load({
           setErr(e.message)
         }
       }
-      const openSession = (bot) => {
+      /**
+       * 打开 Bot 的会话。
+       *
+       * 为什么不要只甩一句「不支持跳转」：那等于告诉用户「你用不了」，
+       * 但实际用户**能**用——只是要自己找。所以：
+       *   ① 宿主支持 → 直接跳；
+       *   ② 宿主不支持 → 弹窗给出「会话 ID + 怎么复制 + 左侧搜什么」，
+       *      并给「复制会话 ID」按钮，让查找变成一步操作。
+       */
+      const openSession = async (bot) => {
+        setErr(null)
         try {
-          if (!hostUiWorkspace?.openSession) return setErr('当前环境不支持跳转到会话，可在左侧会话列表里找它的名字')
-          hostUiWorkspace.openSession({ sessionId: bot.sessionId })
+          if (hostUiWorkspace?.openSession) {
+            hostUiWorkspace.openSession({ sessionId: bot.sessionId })
+            return
+          }
+          const copied = await copyText(bot.sessionId)
+          setSessionPicker({
+            bot,
+            copied,
+            hint: copied
+              ? '已复制会话 ID。在左侧会话列表里输入它就能定位到这个 Bot。'
+              : '浏览器不允许自动复制，请手动选中下面的 ID 复制。',
+            done: () => setSessionPicker(null),
+          })
         } catch (e) {
           setErr(`无法打开会话：${e.message}`)
         }
       }
 
       return h('div', { className: 'csb-wrap' },
+        sessionPicker
+          ? h(Modal, {
+              title: `打开「${sessionPicker.bot.name}」的对话`,
+              onClose: () => setSessionPicker(null),
+              footer: [
+                h('button', {
+                  key: 'c', className: 'csb-btn',
+                  onClick: async () => {
+                    const ok = await copyText(sessionPicker.bot.sessionId)
+                    setSessionPicker((sp) => sp && { ...sp, copied: ok, hint: ok ? '已复制会话 ID。' : '请手动选中复制。' })
+                  },
+                }, sessionPicker.copied ? '再复制一次' : '复制会话 ID'),
+                h('button', { key: 'x', className: 'csb-btn csb-btn-p', onClick: () => setSessionPicker(null) }, '知道了'),
+              ],
+            },
+            h('p', { className: 'csb-field-h' }, sessionPicker.hint),
+            h('div', { className: 'csb-mono', style: { padding: 10, background: 'var(--dsw-alias-bg-layer-2)', borderRadius: 8, wordBreak: 'break-all' } },
+              sessionPicker.bot.sessionId),
+            h('p', { className: 'csb-field-h' },
+              '它能做的文件范围（工作目录）是：',
+              h('span', { className: 'csb-mono' }, sessionPicker.bot.cwd || '—')))
+          : null,
         h(Section, {
           title: 'Bot 是什么',
           desc: '一个 Bot = 一个长期存在的成员：有自己的会话、自己的工作目录（决定了它能改哪些文件）、自己的身份和经验。只有「需要长期存在 + 需要独立目录」的角色才值得建 Bot。',
@@ -1479,6 +1687,7 @@ window.__ModuleLoader__.load({
           h('input', {
             className: 'csb-in', style: { maxWidth: 260 }, placeholder: '例如：后端、前端、测试',
             value: form.name, onChange: (e) => setForm({ ...form, name: e.target.value }),
+            ref: nameRef,
           })),
         h('div', { className: 'csb-fld' },
           h('label', null, '工作目录'),
@@ -1509,7 +1718,10 @@ window.__ModuleLoader__.load({
         loading ? h(Skeleton, { n: 2 }) : null,
         error ? h('div', { className: 'csb-err' }, error) : null,
         !loading && bots.length === 0
-          ? h(Empty, { icon: '⬡', title: '还没有 Bot', hint: '先在上面建一个。如果只是临时分工，不用建 Bot —— 直接建任务指派给人就行。' })
+          ? h(Empty, {
+              icon: '⬡', title: '还没有 Bot', hint: '先在上面建一个。如果只是临时分工，不用建 Bot —— 直接建任务指派给人就行。',
+              action: { label: '新建 Bot', icon: '✎', onClick: () => nameRef.current?.focus() },
+            })
           : null,
         h('div', { className: 'csb-list', style: { marginTop: 12 } }, bots.map((b) =>
           h('div', { key: b.id, className: 'csb-card' },
@@ -1590,6 +1802,7 @@ window.__ModuleLoader__.load({
       const [busy, setBusy] = useState(false)
       const [skillInput, setSkillInput] = useState('')
       const [memInput, setMemInput] = useState('')
+      const [memPicker, setMemPicker] = useState(null)
 
       useEffect(() => {
         if (data && draft === null) {
@@ -1781,26 +1994,69 @@ window.__ModuleLoader__.load({
             }, '添加'),
             h('button', {
               className: 'csb-btn',
-              title: '把记忆库里已有的条目挑出来，一键加入这个 Bot 的预制记忆',
+              title: '把记忆库里已有的条目挑出来，勾选后加入这个 Bot 的预制记忆',
               onClick: async () => {
                 setErr(null)
+                setMemPicker({ loading: true, rows: [], chosen: new Set(), err: null })
                 try {
                   const d = await call('/memory?layer=L2')
                   const rows = (d.entries ?? []).map((e) => e.content).filter(Boolean)
+                  // 已在 draft 里的，默认灰掉不可选
                   const key = (x) => String(x).trim().replace(/\s+/g, ' ').toLowerCase()
                   const existing = new Set(draft.memory.map(key))
-                  const add = rows.filter((r) => !existing.has(key(r)))
-                  if (add.length === 0) {
-                    setMsg('记忆库里没有新的条目可导入')
-                    return
-                  }
-                  setDraft({ ...draft, memory: [...draft.memory, ...add] })
-                  setMsg(`已从记忆库导入 ${add.length} 条（去重后）`)
+                  const fresh = rows.map((r) => ({ text: r, dup: existing.has(key(r)) }))
+                  setMemPicker({ loading: false, rows: fresh, chosen: new Set(), err: null })
                 } catch (e) {
-                  setErr(e.message)
+                  setMemPicker({ loading: false, rows: [], chosen: new Set(), err: e.message })
                 }
               },
             }, '从记忆库导入')),
+
+          // 记忆导入选择弹窗（原来一键全量导入，用户没有选择权 —— 现在必须自己挑）
+          memPicker
+            ? h(Modal, {
+                title: '从记忆库挑几条给这个 Bot',
+                wide: true,
+                onClose: () => setMemPicker(null),
+                footer: [
+                  h('button', { key: 'c', className: 'csb-btn', onClick: () => setMemPicker(null) }, '取消'),
+                  h('button', {
+                    key: 'ok', className: 'csb-btn csb-btn-p',
+                    disabled: memPicker.chosen.size === 0,
+                    onClick: () => {
+                      const chosen = [...memPicker.chosen]
+                      setDraft({ ...draft, memory: [...draft.memory, ...chosen] })
+                      setMsg(`已加入 ${chosen.length} 条预制记忆`)
+                      setMemPicker(null)
+                    },
+                  }, `加入选中的 ${memPicker.chosen.size} 条`),
+                ],
+              },
+                memPicker.loading
+                  ? h(Skeleton, { n: 3 })
+                  : (memPicker.err
+                      ? h(Notice, { kind: 'err', onClose: () => setMemPicker(null) }, memPicker.err)
+                      : memPicker.rows.length === 0
+                        ? h(Empty, { icon: '⌸', title: '记忆库里没有条目', hint: '先去「记忆」页加几条，这里才有东西可挑。' })
+                        : h('div', { style: { maxHeight: 320, overflowY: 'auto' } },
+                            memPicker.rows.map((r, i) =>
+                              h('label', {
+                                key: i,
+                                className: 'csb-check',
+                                style: r.dup ? { opacity: 0.5 } : {},
+                              },
+                                h('input', {
+                                  type: 'checkbox',
+                                  disabled: r.dup,
+                                  checked: !r.dup && memPicker.chosen.has(r.text),
+                                  onChange: (e) => {
+                                    const next = new Set(memPicker.chosen)
+                                    if (e.target.checked) next.add(r.text); else next.delete(r.text)
+                                    setMemPicker({ ...memPicker, chosen: next })
+                                  },
+                                }),
+                                h('span', { className: 'csb-check-t' }, r.text.length > 90 ? `${r.text.slice(0, 90)}…` : r.text),
+                                r.dup ? h('span', { className: 'csb-b csb-b-idle' }, '已在预制记忆里') : null))))) : null,
 
           data.managedText
             ? h('div', null,
@@ -1826,6 +2082,7 @@ window.__ModuleLoader__.load({
       const [confirmDel, setConfirmDel] = useState(null)
       const [showBody, setShowBody] = useState(null)
       const endRef = useRef(null)
+      const roomNameRef = useRef(null)
 
       const bots = rosterData?.bots ?? []
       const rooms = data?.rooms ?? []
@@ -1907,6 +2164,7 @@ window.__ModuleLoader__.load({
             className: 'csb-in csb-grow', placeholder: '新建房间…（例如：发布协调群。回车创建）',
             value: roomName, onChange: (e) => setRoomName(e.target.value),
             onKeyDown: (e) => e.key === 'Enter' && create(),
+            ref: roomNameRef,
           }),
           h('button', {
             className: `csb-btn csb-btn-s${showArchived ? ' csb-btn-p' : ''}`,
@@ -1919,7 +2177,11 @@ window.__ModuleLoader__.load({
         error ? h('div', { className: 'csb-err' }, error) : null,
         loading ? h(Skeleton, { n: 2 }) : null,
         !loading && rooms.length === 0
-          ? h(Empty, { icon: '◌', title: '还没有房间', hint: '建一个房间，然后把 Bot 拉进来，它们就能在同一个消息流里对话。' })
+          ? h(Empty, {
+              icon: '◌', title: '还没有房间',
+              hint: '建一个房间，然后把 Bot 拉进来，它们就能在同一个消息流里对话。',
+              action: { label: '新建房间', icon: '✎', onClick: () => roomNameRef.current?.focus() },
+            })
           : null,
 
         h('div', { className: 'csb-list' }, rooms.map((r) =>
@@ -1950,56 +2212,72 @@ window.__ModuleLoader__.load({
               }, '删除'))))),
 
         current
-          ? h('div', null,
-              h(Section, {
-                title: `消息 · ${current.name}`,
-                desc: `${msgs.length} 条。发帖者必须是成员；你是超级管理员，可以直接看全部内容。`,
-              }),
-              current.purpose ? h('div', { className: 'csb-note', style: { marginTop: 10 } }, `用途：${current.purpose}`) : null,
-              current.notice ? h('div', { className: 'csb-note', style: { marginTop: 10 } }, current.notice) : null,
-              h('div', { style: { maxHeight: 460, overflowY: 'auto', margin: '12px 0' } },
-                msgs.length === 0 ? h(Empty, { title: '还没有消息' }) : null,
-                msgs.slice(-120).map((m) => {
-                  const body = m.body ?? m.text ?? ''
-                  const long = body.length > 300
-                  return h('div', { key: m.id, className: `csb-msg${m.from === 'user' || m.from === 'ui' ? ' csb-msg-me' : ''}` },
-                    h('div', { className: 'csb-msg-h' },
-                      h('span', null, `#${m.seq}`),
-                      h('span', null, botName(bots, m.from)),
-                      m.bodyRef ? h('span', { className: 'csb-b' }, '长正文') : null,
-                      m.bodyError ? h('span', { className: 'csb-b csb-b-err' }, '正文读取失败') : null,
-                      long
-                        ? h('button', {
-                            className: 'csb-btn csb-btn-s', style: { marginLeft: 'auto' },
-                            onClick: () => setShowBody(m),
-                          }, '看全文')
-                        : null),
-                    h('div', { className: 'csb-msg-b' }, long ? `${body.slice(0, 300)}…` : body))
+          ? h('div', { className: 'csb-room-split' },
+              // ── 中栏：聊天 ──
+              h('div', { className: 'csb-room-chat' },
+                h(Section, {
+                  title: `消息 · ${current.name}`,
+                  desc: `${msgs.length} 条全部显示。发帖者必须是成员；你是超级管理员，可以直接看全部内容。`,
                 }),
-                h('div', { ref: endRef })),
-              h('div', { className: 'csb-bar' },
-                h('input', {
-                  className: 'csb-in csb-grow', placeholder: '说点什么…（回车发送）',
-                  value: text, onChange: (e) => setText(e.target.value),
-                  onKeyDown: (e) => e.key === 'Enter' && post(),
-                }),
-                h('button', { className: 'csb-btn csb-btn-p', disabled: !text.trim(), onClick: post }, '发送')),
-              h(Section, { title: '成员', desc: '勾选要拉进来的 Bot；勾掉就是移出。' }),
-              h('div', { className: 'csb-pick', style: { marginTop: 10 } },
-                bots.filter((b) => b.state !== 'retired').length === 0
-                  ? h('div', { className: 'csb-set-d', style: { padding: '8px 9px' } }, '还没有 Bot —— 先去「Bot」页建一个')
-                  : bots.filter((b) => b.state !== 'retired').map((b) => {
-                      const inRoom = (current.members ?? []).includes(b.sessionId)
-                      const role = (current.roles ?? {})[b.sessionId]
-                      return h('label', { key: b.id, className: 'csb-pick-i' },
-                        h('input', {
-                          type: 'checkbox', checked: inRoom,
-                          onChange: (e) => member(e.target.checked ? 'join' : 'leave', b.sessionId),
-                        }),
-                        h('span', null, b.name),
-                        h('span', { className: 'csb-set-d' },
-                          inRoom ? `已在房间${role ? ` · ${role === 'admin' ? '管理员' : role === 'observer' ? '旁听' : '成员'}` : ''}` : '未加入'))
-                    })))
+                current.purpose ? h('div', { className: 'csb-note', style: { marginTop: 10 } }, `用途：${current.purpose}`) : null,
+                current.notice ? h('div', { className: 'csb-note', style: { marginTop: 10 } }, current.notice) : null,
+                h('div', { style: { maxHeight: 460, overflowY: 'auto', margin: '12px 0' } },
+                  msgs.length === 0 ? h(Empty, { title: '还没有消息' }) : null,
+                  msgs.map((m) => {
+                    const body = m.body ?? m.text ?? ''
+                    const long = body.length > 300
+                    return h('div', { key: m.id, className: `csb-msg${m.from === 'user' || m.from === 'ui' ? ' csb-msg-me' : ''}` },
+                      h('div', { className: 'csb-msg-h' },
+                        h('span', null, `#${m.seq}`),
+                        h('span', null, botName(bots, m.from)),
+                        m.bodyRef ? h('span', { className: 'csb-b' }, '长正文') : null,
+                        m.bodyError ? h('span', { className: 'csb-b csb-b-err' }, '正文读取失败') : null,
+                        long
+                          ? h('button', {
+                              className: 'csb-btn csb-btn-s', style: { marginLeft: 'auto' },
+                              onClick: () => setShowBody(m),
+                            }, '看全文')
+                          : null),
+                      h('div', { className: 'csb-msg-b' }, long ? `${body.slice(0, 300)}…` : body))
+                  }),
+                  h('div', { ref: endRef }))),
+                h('div', { className: 'csb-bar' },
+                  h('input', {
+                    className: 'csb-in csb-grow', placeholder: '说点什么…（回车发送）',
+                    value: text, onChange: (e) => setText(e.target.value),
+                    onKeyDown: (e) => e.key === 'Enter' && post(),
+                  }),
+                  h('button', { className: 'csb-btn csb-btn-p', disabled: !text.trim(), onClick: post }, '发送')),
+              // ── 右栏：管理 ──
+              h('div', { className: 'csb-room-side' },
+                h(Section, { title: '房间信息', desc: '基本信息和设置' }),
+                h('div', { className: 'csb-kv', style: { marginTop: 8 } },
+                  h('span', { className: 'csb-k' }, '名称'), h('span', { className: 'csb-v' }, current.name),
+                  h('span', { className: 'csb-k' }, '模式'), h('span', { className: 'csb-v' }, current.mode === 'admin' ? '管理员模式' : '自由发言'),
+                  h('span', { className: 'csb-k' }, '成员'), h('span', { className: 'csb-v' }, `${(current.members ?? []).length} 人`),
+                  h('span', { className: 'csb-k' }, '消息数'), h('span', { className: 'csb-v' }, msgs.length),
+                  h('span', { className: 'csb-k' }, '管理员'), h('span', { className: 'csb-v' }, current.adminId ? botName(bots, current.adminId) : '—')),
+                current.settings?.allowBotAutoPost !== false
+                  ? h('div', { className: 'csb-note', style: { marginTop: 8 } }, '✅ 发言后自动唤醒房间内 Bot')
+                  : h('div', { className: 'csb-note', style: { marginTop: 8 } }, '⏸️ 已关闭自动唤醒'),
+                h('div', { className: 'csb-bar', style: { marginTop: 8 } },
+                  h('button', { className: 'csb-btn csb-btn-s', onClick: () => setEditing(current) }, '编辑设置')),
+                h(Section, { title: '成员管理', desc: '勾选要拉进来的 Bot' }),
+                h('div', { className: 'csb-pick', style: { marginTop: 8 } },
+                  bots.filter((b) => b.state !== 'retired').length === 0
+                    ? h('div', { className: 'csb-set-d', style: { padding: '8px 9px' } }, '还没有 Bot —— 先去「Bot」页建一个')
+                    : bots.filter((b) => b.state !== 'retired').map((b) => {
+                        const inRoom = (current.members ?? []).includes(b.sessionId)
+                        const role = (current.roles ?? {})[b.sessionId]
+                        return h('label', { key: b.id, className: 'csb-pick-i' },
+                          h('input', {
+                            type: 'checkbox', checked: inRoom,
+                            onChange: (e) => member(e.target.checked ? 'join' : 'leave', b.sessionId),
+                          }),
+                          h('span', null, b.name),
+                          h('span', { className: 'csb-set-d' },
+                            inRoom ? `已在房间${role ? ` · ${role === 'admin' ? '管理员' : role === 'observer' ? '旁听' : '成员'}` : ''}` : '未加入'))
+                        }))))
           : null,
 
         // 长正文全文
@@ -2340,6 +2618,7 @@ window.__ModuleLoader__.load({
               hint: showArchived
                 ? '归档的记忆不参与注入，但随时可以恢复。'
                 : '把「以后一直有用的事实和规矩」写进来（比如：本项目用 pnpm）。一次性的笔记放 L4。',
+              action: showArchived ? null : { label: '新建记忆', icon: '✎', onClick: () => setAdding(true) },
             })
           : null,
 
@@ -2564,6 +2843,17 @@ window.__ModuleLoader__.load({
       k1Enabled: { label: '禁止 Bot 阻塞式提问', help: 'Bot 会话里禁用「停下来等人回答」的工具，避免整条消息链被卡住。排查问题时才临时关。' },
     }
 
+    /** 下拉选择行：用于 options 类型的设置项（如渐进式披露）。 */
+    function SelectRow({ id, spec, value, onChange }) {
+      return h(Field, { label: spec.label },
+        h('select', {
+          className: 'csb-sel', style: { width: 180 }, value: String(value),
+          onChange: (e) => onChange(e.target.value),
+        },
+        spec.options.map((o) =>
+          h('option', { key: o, value: o }, o))))
+    }
+
     function NumberRow({ id, spec, value, onChange }) {
       const meta = NUM_META[id] ?? { scale: 1, unit: '', step: 1 }
       const disp = Math.round(Number(value) / meta.scale)
@@ -2702,6 +2992,7 @@ window.__ModuleLoader__.load({
 
       const TASK_KEYS = ['defaultLeaseMs', 'throttleMs', 'maxWakesPerTarget', 'wakeTtlMs']
       const MEM_KEYS = ['memoryEntryMax', 'memorySplitOnOverflow', 'k1Enabled']
+      const MEM_ADV_KEYS = ['reviewEnabled', 'reviewInterval', 'reviewMode', 'skillReviewEnabled', 'skillMaxBytes', 'entryDatePrefix', 'keyProgressiveDisclosure', 'keyFullInjectThreshold', 'keyFullInjectCharLimit', 'perTurnWrites', 'writeGuardThreshold', 'perTurnWriteGuard']
 
       return h('div', { className: 'csb-wrap' },
         loading ? h(Skeleton, { n: 3 }) : null,
@@ -2765,6 +3056,17 @@ window.__ModuleLoader__.load({
           specs[k].bool
             ? h(BoolRow, { key: k, id: k, spec: specs[k], value: val(k), onChange: (v) => setDraft({ ...draft, [k]: v }) })
             : h(NumberRow, { key: k, id: k, spec: specs[k], value: val(k), onChange: (v) => setDraft({ ...draft, [k]: v }) })),
+
+        h(Section, {
+          title: '记忆自审与进化',
+          desc: '对照记忆进化的能力逐项补齐。改完保存即生效。',
+        }),
+        h('div', { style: { marginTop: 12 } },
+          MEM_ADV_KEYS.filter((k) => specs[k]).map((k) => {
+            if (specs[k].bool) return h(BoolRow, { key: k, id: k, spec: specs[k], value: val(k), onChange: (v) => setDraft({ ...draft, [k]: v }) })
+            if (specs[k].options) return h(SelectRow, { key: k, id: k, spec: specs[k], value: val(k), onChange: (v) => setDraft({ ...draft, [k]: v }) })
+            return h(NumberRow, { key: k, id: k, spec: specs[k], value: val(k), onChange: (v) => setDraft({ ...draft, [k]: v }) })
+          })),
 
         h('div', { className: 'csb-bar', style: { marginTop: 20 } },
           h('button', { className: 'csb-btn csb-btn-p', disabled: !dirty || busy, onClick: save }, busy ? '保存中…' : dirty ? '保存改动' : '没有改动'),
@@ -2975,6 +3277,7 @@ window.__ModuleLoader__.load({
               icon: '☑',
               title: `「${TRACKS.find((t) => t.id === track)?.label}」这类还没有待办`,
               hint: '点右上角「＋ 新建待办」记一件要做的事。逾期的会排在前面。',
+              action: { label: '新建待办', icon: '✎', onClick: () => setAdding(true) },
             })
           : null,
 
@@ -3277,6 +3580,7 @@ window.__ModuleLoader__.load({
               icon: '⌘',
               title: '还没有提示词',
               hint: '把「你每次都要说一遍的要求」存成提示词，以后一键注入，不用重复打字。',
+              action: { label: '新建提示词', icon: '✎', onClick: () => setEditing({ ...blank }) },
             })
           : null,
 
@@ -3511,6 +3815,7 @@ window.__ModuleLoader__.load({
               icon: '§',
               title: '还没有任何纪律',
               hint: '先写一条「全局」的，比如「结论先行，给证据」——所有 Bot 都会遵守。',
+              action: { label: '新建纪律', icon: '✎', onClick: () => setEditing({ ...blank }) },
             })
           : null,
 

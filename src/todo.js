@@ -64,6 +64,20 @@ try {
   kernelError = error
 }
 
+// ── store.appendAudit 软导入（P1-D §4）───────────────────────────────────────
+// 软用：拿不到就只 warn 一次 + 计数，绝不阻断主流程，也绝不自己另造审计格式。
+// 动态 `await import` 而非具名静态 import：store.js 正被并行修改，静态具名 import 在
+// 对方重构掉该导出时是**加载期**失败（整个服务起不来）；动态判定只少一条审计。
+let storeAppendAudit = /** @type {null | ((dir: string, entry: object) => unknown)} */ (null)
+let storeAuditMissing = false
+try {
+  const storeMod = await import('./store.js')
+  if (typeof storeMod.appendAudit === 'function') storeAppendAudit = storeMod.appendAudit
+  else storeAuditMissing = true
+} catch {
+  storeAuditMissing = true
+}
+
 // ── 常量（契约冻结）─────────────────────────────────────────────────────────
 
 /** 四轨：生活 / 工作 / 本项目 / 每日。 */
@@ -591,6 +605,8 @@ export function createTodo(ctx, config = {}) {
     replayedEvents: 0,
     badLines: 0,
     snapshotWriteFailures: 0,
+    auditWriteFailures: 0,
+    auditWarnedOnce: false,
     lastReplayAt: /** @type {number|undefined} */ (undefined),
   }
 
@@ -659,6 +675,38 @@ export function createTodo(ctx, config = {}) {
     if (!writeJsonAtomic(snapPath, snapshot())) {
       diagnostics.snapshotWriteFailures += 1
       warn(`[cs-bots/todo] 快照写入失败（${snapPath}）——事件流已落盘，replay() 可完整恢复`)
+    }
+    // ── 审计接线（P1-D §4）────────────────────────────────────────────────
+    // 软用 store.appendAudit：拿不到/写失败 → 只 warn 一次 + 计数，绝不阻断主流程。
+    if (storeAuditMissing) {
+      diagnostics.auditWriteFailures += 1
+      if (!diagnostics.auditWarnedOnce) {
+        diagnostics.auditWarnedOnce = true
+        warn('[cs-bots/todo] store.appendAudit 尚不可用 → 审计接线跳过；主流程不受影响')
+      }
+    } else {
+      try {
+        const digest = (t) => (t
+          ? { id: t.id, track: t.track ?? null, rev: t.rev, status: t.status ?? null }
+          : null)
+        const result = storeAppendAudit(stateDir, {
+          ts: at, actor: byId, action, target: todoId, before: digest(before), after: digest(after),
+        })
+        const failed = result === false || Boolean(result && typeof result === 'object' && result.ok === false)
+        if (failed) {
+          diagnostics.auditWriteFailures += 1
+          if (!diagnostics.auditWarnedOnce) {
+            diagnostics.auditWarnedOnce = true
+            warn('[cs-bots/todo] store.appendAudit 返回失败——主流程不受影响')
+          }
+        }
+      } catch (error) {
+        diagnostics.auditWriteFailures += 1
+        if (!diagnostics.auditWarnedOnce) {
+          diagnostics.auditWarnedOnce = true
+          warn(`[cs-bots/todo] store.appendAudit 抛错：${error?.message ?? error}——主流程不受影响`)
+        }
+      }
     }
     return after ? clone(after) : null
   }

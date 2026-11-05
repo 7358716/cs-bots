@@ -179,6 +179,16 @@ commit(id, action, by, at, before, after) {
 所有可变对象带 `rev`；更新必须带 `expectedRev`，不匹配抛 `*_REV_CONFLICT`。
 **绝不静默覆盖**。缺 `expectedRev` 时按模块契约：必填的抛 `MISSING_EXPECTED_REV`。
 
+| 服务 | 变更入口的 `expectedRev` | 冲突错误码 |
+|---|---|---|
+| `room` | **可选**（不传即不拦，兼容 §3.2 冻结签名）：`update` / `join` / `leave` / `archiveRoom` / `unarchiveRoom` / `removeRoom` / `setMemberRole` / `kickMember` | `ROOM_REV_CONFLICT` |
+| `memory` | **必填**（`update`/`remove`）：`update` / `remove`；**可选**：`archive` / `purge` / `restore` | `MEMORY_CAS_CONFLICT` |
+| `todo` | **必填**：`updateTodo` / `removeTodo` | `TODO_REV_CONFLICT` |
+| `roster` | **必填**：`rename` / `setCwd` / `setProfile` / `addProfileMemory` / `linkSkills` / `claim` / `release` / `heartbeat`；**无 CAS**：`retire`（签名无该参数，但拒绝重复退役） | `ROSTER_REV_CONFLICT` |
+
+每次成功变更后，四个服务都调用 `store.appendAudit(stateDir, {ts,actor,action,target,before,after})`
+（软用：拿不到/写失败只 `warn` 一次 + 计入 `diagnostics.auditWriteFailures`，绝不阻断主流程）。
+
 ### 6.3 错误码
 `<DOMAIN>_<KIND>`：`MEMORY_CAS_CONFLICT` / `TODO_CWD_REQUIRED` / `ROOM_NOT_EMPTY` /
 `LIB_BAD_DIR` / `SUGGEST_ASYNC_APPLY` / `REVIEW_BAD_INTERVAL` …

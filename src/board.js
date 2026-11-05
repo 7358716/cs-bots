@@ -61,6 +61,22 @@ try {
   kernelError = error
 }
 
+// ── store.appendAudit 软导入（P0-B §5）──────────────────────────────────────
+// 另一位工程师正在 store.js 加 appendAudit（与 board.js 并行）。我们必须**软用**：
+// 拿不到就只 warn 一次并计入 diagnostics，绝不阻断主流程，也绝不自己另造审计格式。
+// 用顶层 await 一次性判定（board.js 已经是 ESM + 顶层 await 的写法，见 kernel 桥），
+// 这样 commit() 里是同步判定，diagnostics 计数不会因异步竞态而不确定。
+let storeAppendAudit = /** @type {null | ((dir: string, entry: object) => unknown)} */ (null)
+let storeAuditMissing = false
+try {
+  const storeMod = await import('./store.js')
+  if (typeof storeMod.appendAudit === 'function') storeAppendAudit = storeMod.appendAudit
+  else storeAuditMissing = true
+} catch {
+  storeAuditMissing = true
+}
+
+
 // ── 常量 ────────────────────────────────────────────────────────────────────
 
 /** `description` 上限（§3.3）。 */
@@ -78,9 +94,17 @@ const PATCH_FIELDS = [
   'subject', 'description', 'blockedBy', 'writeScopes', 'priority', 'dueAt',
   // 复杂度路由标注（2026-11-04 新增，契约 §6）—— 见文件头「路由标签」说明
   'expectedComplexity', 'requiresPaid',
+  // P0-B 新增可选字段
+  'labels', 'milestone', 'cycle', 'estimate', 'assignee', 'reviewer',
+  'startedAt', 'completedAt', 'archivedAt', 'triaged', 'progress',
+]
+/** P0-B 新增可选字段（create/edit/set 三条入口共用同一套校验）。 */
+const NEW_FIELD_NAMES = [
+  'labels', 'milestone', 'cycle', 'estimate', 'assignee', 'reviewer',
+  'startedAt', 'completedAt', 'archivedAt', 'triaged', 'progress',
 ]
 /** 事件动作集合。 */
-const ACTIONS = ['create', 'edit', 'claim', 'release', 'heartbeat', 'complete', 'reopen', 'block', 'unblock', 'set', 'delete', 'accept', 'lease_expired']
+const ACTIONS = ['create', 'edit', 'claim', 'release', 'heartbeat', 'complete', 'reopen', 'block', 'unblock', 'set', 'delete', 'accept', 'lease_expired', 'triage']
 
 // ── 错误 ────────────────────────────────────────────────────────────────────
 
@@ -281,6 +305,89 @@ function normalizeRequiresPaid(value, where) {
   return out
 }
 
+/** labels 归一：必须是字符串数组（可选；undefined ⇒ 不写字段）。 */
+function normalizeLabels(value, where) {
+  if (value === undefined || value === null) return undefined
+  if (!Array.isArray(value)) {
+    throw new BoardError(
+      `board.${where}：字段 labels 类型错误（要求字符串数组，收到 ${JSON.stringify(value)}）`,
+      'BOARD_BAD_FIELD', { field: 'labels', where },
+    )
+  }
+  const out = []
+  for (const item of value) {
+    if (typeof item !== 'string') {
+      throw new BoardError(
+        `board.${where}：labels 元素必须是字符串，收到 ${JSON.stringify(item)}`,
+        'BOARD_BAD_FIELD', { field: 'labels', where },
+      )
+    }
+    out.push(item)
+  }
+  return out
+}
+
+/** 可选字符串字段。 */
+function normalizeOptionalString(value, field, where) {
+  if (value === undefined || value === null) return undefined
+  if (typeof value !== 'string') {
+    throw new BoardError(
+      `board.${where}：字段 ${field} 类型错误（要求字符串，收到 ${JSON.stringify(value)}）`,
+      'BOARD_BAD_FIELD', { field, where },
+    )
+  }
+  return value
+}
+
+/** estimate 归一：≥0 有限数。 */
+function normalizeEstimate(value, where) {
+  if (value === undefined || value === null) return undefined
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    throw new BoardError(
+      `board.${where}：字段 estimate 类型错误（要求有限数字，收到 ${JSON.stringify(value)}）`,
+      'BOARD_BAD_FIELD', { field: 'estimate', where },
+    )
+  }
+  if (value < 0) {
+    throw new BoardError(
+      `board.${where}：字段 estimate 必须 ≥ 0，收到 ${value}`,
+      'BOARD_BAD_FIELD', { field: 'estimate', where },
+    )
+  }
+  return value
+}
+
+/** progress 归一：0-100 有限数。 */
+function normalizeProgress(value, where) {
+  if (value === undefined || value === null) return undefined
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    throw new BoardError(
+      `board.${where}：字段 progress 类型错误（要求有限数字，收到 ${JSON.stringify(value)}）`,
+      'BOARD_BAD_FIELD', { field: 'progress', where },
+    )
+  }
+  if (value < 0 || value > 100) {
+    throw new BoardError(
+      `board.${where}：字段 progress 必须在 0-100 之间，收到 ${value}`,
+      'BOARD_BAD_FIELD', { field: 'progress', where },
+    )
+  }
+  return value
+}
+
+/** triaged 归一：严格布尔。 */
+function normalizeTriaged(value, where) {
+  if (value === undefined || value === null) return undefined
+  if (typeof value !== 'boolean') {
+    throw new BoardError(
+      `board.${where}：字段 triaged 类型错误（要求 boolean，收到 ${JSON.stringify(value)}）`,
+      'BOARD_BAD_FIELD', { field: 'triaged', where },
+    )
+  }
+  return value
+}
+
+
 // ── 工厂 ────────────────────────────────────────────────────────────────────
 
 /**
@@ -316,6 +423,11 @@ export function createBoard(ctx, config = {}) {
   const leaseMsDefault = Number.isFinite(config.leaseMs) && config.leaseMs > 0
     ? config.leaseMs
     : DEFAULT_LEASE_MS
+  const settings = (config && typeof config.settings === 'object' && config.settings !== null) ? config.settings : {}
+  const wipLimitPerBot = Number.isFinite(settings.wipLimitPerBot) && settings.wipLimitPerBot >= 1
+    ? settings.wipLimitPerBot
+    : (Number.isFinite(config.wipLimitPerBot) && config.wipLimitPerBot >= 1 ? config.wipLimitPerBot : 2)
+  const requireTriageForReady = settings.requireTriageForReady === true || config.requireTriageForReady === true
 
   const jsonlPath = statePath(stateDir, 'board.jsonl')
   const snapPath = statePath(stateDir, 'board.snap.json')
@@ -346,6 +458,8 @@ export function createBoard(ctx, config = {}) {
     badLines: 0,
     snapshotWriteFailures: 0,
     lastReplayAt: /** @type {number|undefined} */ (undefined),
+    auditWriteFailures: 0,
+    auditWarnedOnce: false,
   }
 
   // ── 持久化 ────────────────────────────────────────────────────────────────
@@ -400,6 +514,42 @@ export function createBoard(ctx, config = {}) {
       diagnostics.snapshotWriteFailures += 1
       warn(`[cs-bots/board] 快照写入失败（${snapPath}）——事件流已落盘，replay() 可完整恢复`)
     }
+    // ── 审计接线（P0-B §5）────────────────────────────────────────────────
+    // 软用 store.appendAudit：拿不到/写失败 → 只 warn 一次 + 计数，**绝不阻断**主流程
+    //（事件流 board.jsonl 已是本模块自己的真相源，审计是补充，不是必需品）。
+    if (storeAuditMissing) {
+      diagnostics.auditWriteFailures += 1
+      if (!diagnostics.auditWarnedOnce) {
+        diagnostics.auditWarnedOnce = true
+        warn('[cs-bots/board] store.appendAudit 尚不可用（另一侧未合并）→ 审计接线跳过；主流程不受影响')
+      }
+    } else {
+      try {
+        const digest = (t) => (t
+          ? { id: t.id, status: t.status, rev: t.rev, subject: t.subject, assignee: t.assignee ?? null, progress: t.progress ?? 0, triaged: t.triaged === true }
+          : null)
+        const result = storeAppendAudit(stateDir, {
+          ts: at, actor: byId, action, target: taskId, before: digest(before), after: digest(after),
+        })
+        // appendAudit 的失败约定兼容两种形态：`false`（布尔）与 `{ok:false,reason}`（对象）。
+        // 抛错同样按失败计。**任何形态都只 warn 一次，不阻断。**
+        const failed = result === false || Boolean(result && typeof result === 'object' && result.ok === false)
+        if (failed) {
+          diagnostics.auditWriteFailures += 1
+          if (!diagnostics.auditWarnedOnce) {
+            diagnostics.auditWarnedOnce = true
+            const reason = result && typeof result === 'object' ? (result.reason ?? '未知原因') : '返回 false'
+            warn(`[cs-bots/board] store.appendAudit 返回失败：${reason}——主流程不受影响`)
+          }
+        }
+      } catch (error) {
+        diagnostics.auditWriteFailures += 1
+        if (!diagnostics.auditWarnedOnce) {
+          diagnostics.auditWarnedOnce = true
+          warn(`[cs-bots/board] store.appendAudit 抛错：${error?.message ?? error}——主流程不受影响`)
+        }
+      }
+    }
     return clone(after)
   }
 
@@ -433,6 +583,9 @@ export function createBoard(ctx, config = {}) {
           const t = clone(raw)
           if (!Array.isArray(t.blockedBy)) t.blockedBy = []
           if (!Array.isArray(t.writeScopes)) t.writeScopes = []
+          if (!Array.isArray(t.labels)) t.labels = []
+          if (t.triaged !== true && t.triaged !== false) t.triaged = false
+          if (typeof t.progress !== 'number' || !Number.isFinite(t.progress)) t.progress = 0
           tasks.set(t.id, t)
           idCounter = Math.max(idCounter, idNumber(t.id))
           if (t.sourceSeq) sourceSeqIndex.set(t.sourceSeq, t.id)
@@ -463,6 +616,9 @@ export function createBoard(ctx, config = {}) {
       const t = clone(ev.after)
       if (!Array.isArray(t.blockedBy)) t.blockedBy = []
       if (!Array.isArray(t.writeScopes)) t.writeScopes = []
+      if (!Array.isArray(t.labels)) t.labels = []
+      if (t.triaged !== true && t.triaged !== false) t.triaged = false
+      if (typeof t.progress !== 'number' || !Number.isFinite(t.progress)) t.progress = 0
       tasks.set(ev.taskId, t)
       events.push(clone(ev))
       idCounter = Math.max(idCounter, idNumber(ev.taskId))
@@ -568,8 +724,27 @@ export function createBoard(ctx, config = {}) {
    * @param {{ status?: string }} [options]
    * @returns {object[]}
    */
+  /**
+   * 「需要人管」的判定（与 todo 的四象限同思路，但对象是协作任务）：
+   *   - blocked（卡住了，需要人判断怎么办）
+   *   - 高优先级（priority >= 8，紧急）
+   *   - 已逾期（dueAt 在过去且仍未完成）
+   *   - 待验收（completed 但还没验收）
+   *   - 我建的、还没做完
+   * 没有「重要/紧急」字段 —— 那是待办的概念；协作任务用 priority + dueAt 表达。
+   */
+  function needsAttention(task, mySession) {
+    if (task.status === 'deleted') return false
+    if (task.status === 'blocked') return true
+    if (task.priority !== undefined && task.priority >= 8) return true
+    if (task.dueAt && task.status !== 'completed' && task.dueAt < Date.now()) return true
+    if (task.status === 'completed' && task.accepted !== true) return true
+    if (mySession && task.createdBy === mySession && !['completed', 'deleted'].includes(task.status)) return true
+    return false
+  }
+
   function list(options = {}) {
-    const { status } = options ?? {}
+    const { status, attention, priority, dueAt, source, sort, triaged } = options ?? {}
     if (status !== undefined && status !== null) {
       if (!STATUSES.includes(status)) {
         throw new BoardError(
@@ -580,12 +755,33 @@ export function createBoard(ctx, config = {}) {
       }
     }
     const out = []
+    const mySession = options?.byId
     for (const t of tasks.values()) {
       if (status) {
-        if (t.status === status) out.push(clone(t))
-      } else if (t.status !== 'deleted') {
-        out.push(clone(t))
+        if (t.status !== status) continue
+      } else if (t.status === 'deleted') {
+        continue
       }
+      if (attention === true || attention === '1') {
+        if (!needsAttention(t, mySession)) continue
+      }
+      if (priority !== undefined && priority !== null) {
+        if (t.priority !== priority) continue
+      }
+      if (dueAt !== undefined && dueAt !== null) {
+        if (t.dueAt !== dueAt) continue
+      }
+      if (source !== undefined && source !== null) {
+        if (t.source !== source) continue
+      }
+      if (triaged !== undefined && triaged !== null) {
+        const want = triaged === true || triaged === '1' || triaged === 'true'
+        if ((t.triaged === true) !== want) continue
+      }
+      out.push(clone(t))
+    }
+    if (sort === 'priority' || attention === true || attention === '1') {
+      out.sort((a, b) => (b.priority ?? 0) - (a.priority ?? 0))
     }
     return out
   }
@@ -595,12 +791,19 @@ export function createBoard(ctx, config = {}) {
    * 纯读操作，不做租约回收（租约回收请显式调用 `expireLeases()`）。
    * @returns {object[]} 创建序
    */
-  function ready() {
+  function ready(options = {}) {
+    const strict = options?.strict === true || requireTriageForReady
     const out = []
     for (const t of tasks.values()) {
       if (t.status !== 'pending') continue
+      if (strict) {
+        if (t.triaged !== true) continue
+        if (typeof t.assignee !== 'string' || t.assignee.trim() === '') continue
+      }
       if (unfinishedDeps(t).length === 0) out.push(clone(t))
     }
+    // 文档承诺「按优先级降序」，这里落实（否则只是「创建序」，与承诺不符）
+    out.sort((a, b) => (b.priority ?? 0) - (a.priority ?? 0))
     return out
   }
 
@@ -625,9 +828,14 @@ export function createBoard(ctx, config = {}) {
   function create(input = {}) {
     const {
       subject, description, blockedBy, writeScopes, priority, dueAt, byId, sourceSeq, now,
-      expectedComplexity, requiresPaid,
+      expectedComplexity, requiresPaid, source,
+      labels, milestone, cycle, estimate, assignee, reviewer, progress, triaged,
     } = input ?? {}
     const by = requireString(byId, 'byId', 'create')
+    // 来源判定：显式传了 source 就采信；否则按 byId 推断
+    // （'ui'/'user' → 人；其他（会话 ID/Bot ID）→ 智能体）
+    const src = source === 'human' || source === 'ai' ? source
+      : (by === 'ui' || by === 'user' ? 'human' : 'ai')
     const subj = requireString(subject, 'subject', 'create')
     const desc = normalizeDescription(description, 'create')
     const deps = stringList(blockedBy, 'blockedBy', 'create')
@@ -640,6 +848,15 @@ export function createBoard(ctx, config = {}) {
     const seq = sourceSeq === undefined || sourceSeq === null
       ? undefined
       : requireString(sourceSeq, 'sourceSeq', 'create')
+    // P0-B 新增可选字段（全部「可选 + 回放补默认」，老数据不受影响）
+    const labelsNorm = normalizeLabels(labels, 'create')
+    const milestoneNorm = normalizeOptionalString(milestone, 'milestone', 'create')
+    const cycleNorm = normalizeOptionalString(cycle, 'cycle', 'create')
+    const estimateNorm = normalizeEstimate(estimate, 'create')
+    const assigneeNorm = normalizeOptionalString(assignee, 'assignee', 'create')
+    const reviewerNorm = normalizeOptionalString(reviewer, 'reviewer', 'create')
+    const progressNorm = normalizeProgress(progress, 'create')
+    const triagedNorm = normalizeTriaged(triaged, 'create')
 
     // ── 幂等（校验全部通过后再判定，避免校验失败污染幂等键）──
     if (seq !== undefined) {
@@ -667,7 +884,7 @@ export function createBoard(ctx, config = {}) {
     /** @type {Record<string, unknown>} */
     const task = {
       id: taskId,
-      rev: 1,
+      rev: 1, source: src,
       subject: subj,
       description: desc,
       status: 'pending',
@@ -675,12 +892,24 @@ export function createBoard(ctx, config = {}) {
       writeScopes: scopes,
       createdAt: at,
       createdBy: by,
+      // P0-B：老数据回放补默认；新建任务也直接带上，保证 replay 深比较一致
+      labels: [],
+      triaged: false,
+      progress: 0,
     }
     if (prio !== undefined) task.priority = prio
     if (due !== undefined) task.dueAt = due
     if (seq !== undefined) task.sourceSeq = seq
     if (complexity !== undefined) task.expectedComplexity = complexity
     if (paid !== undefined) task.requiresPaid = paid
+    if (labelsNorm !== undefined) task.labels = labelsNorm
+    if (milestoneNorm !== undefined) task.milestone = milestoneNorm
+    if (cycleNorm !== undefined) task.cycle = cycleNorm
+    if (estimateNorm !== undefined) task.estimate = estimateNorm
+    if (assigneeNorm !== undefined) task.assignee = assigneeNorm
+    if (reviewerNorm !== undefined) task.reviewer = reviewerNorm
+    if (progressNorm !== undefined) task.progress = progressNorm
+    if (triagedNorm !== undefined) task.triaged = triagedNorm
 
     idCounter = nextCounter
     try {
@@ -752,6 +981,29 @@ export function createBoard(ctx, config = {}) {
     // 不给「脏输入被静默忽略」的口子（那样路由就不可追溯了）。
     const patchComplexity = normalizeComplexity(fields.expectedComplexity, `update/${action}`)
     const patchRequiresPaid = normalizeRequiresPaid(fields.requiresPaid, `update/${action}`)
+    /**
+     * 把 P0-B 新增可选字段落到 next 上（`null` = 清除）。
+     * 与 create 共用同一套校验函数 —— 同一字段两条入口不得有两套规则。
+     * @param {object} nextTask @param {object} src @param {string} where
+     */
+    const applyNewFields = (nextTask, src, where) => {
+      const setOrDelete = (key, normalized) => {
+        if (normalized === undefined) delete nextTask[key]
+        else nextTask[key] = normalized
+      }
+      if (src.labels !== undefined) setOrDelete('labels', normalizeLabels(src.labels, where))
+      if (src.milestone !== undefined) setOrDelete('milestone', normalizeOptionalString(src.milestone, 'milestone', where))
+      if (src.cycle !== undefined) setOrDelete('cycle', normalizeOptionalString(src.cycle, 'cycle', where))
+      if (src.estimate !== undefined) setOrDelete('estimate', normalizeEstimate(src.estimate, where))
+      if (src.assignee !== undefined) setOrDelete('assignee', normalizeOptionalString(src.assignee, 'assignee', where))
+      if (src.reviewer !== undefined) setOrDelete('reviewer', normalizeOptionalString(src.reviewer, 'reviewer', where))
+      if (src.progress !== undefined) setOrDelete('progress', normalizeProgress(src.progress, where))
+      if (src.triaged !== undefined) setOrDelete('triaged', normalizeTriaged(src.triaged, where))
+      if (src.startedAt !== undefined) setOrDelete('startedAt', optionalNumber(src.startedAt, 'startedAt', where))
+      if (src.completedAt !== undefined) setOrDelete('completedAt', optionalNumber(src.completedAt, 'completedAt', where))
+      if (src.archivedAt !== undefined) setOrDelete('archivedAt', optionalNumber(src.archivedAt, 'archivedAt', where))
+    }
+
     /** 把（可选）路由标签落到 next 上；`null` = 清除该标注。@param {object} nextTask */
     const applyRoutingLabels = (nextTask) => {
       if (fields.expectedComplexity !== undefined) {
@@ -807,6 +1059,8 @@ export function createBoard(ctx, config = {}) {
           if (fields.dueAt === null) delete next.dueAt
           else next.dueAt = optionalNumber(fields.dueAt, 'dueAt', 'update')
         }
+        // P0-B 新增字段（null = 清除该字段，与 priority/dueAt 同语义）
+        applyNewFields(next, fields, `update/edit`)
         applyRoutingLabels(next)
         break
       }
@@ -851,9 +1105,22 @@ export function createBoard(ctx, config = {}) {
             )
           }
         }
+        // WIP 上限（P0-B §2）：同 bot 名下 in_progress 任务数 >= 上限 → 拒
+        const wipActive = [...tasks.values()].filter(
+          (t) => t.status === 'in_progress' && t.ownerId === by,
+        )
+        if (wipActive.length >= wipLimitPerBot) {
+          throw new BoardError(
+            `board.claim：WIP 超限 —— bot ${by} 当前在 ${wipActive.length} 个 in_progress 任务上（上限 ${wipLimitPerBot}），`
+            + `拒绝再领 ${taskId}`,
+            'BOARD_WIP_EXCEEDED',
+            { botId: by, limit: wipLimitPerBot, current: wipActive.length, taskId },
+          )
+        }
         next.status = 'in_progress'
         next.ownerId = by
         next.lease = { ownerId: by, expiresAt: at + ttl, heartbeatAt: at }
+        if (next.startedAt === undefined) next.startedAt = at
         // claim 也可顺带纠正路由标注（规划 Agent 领活时补/改 expectedComplexity 的路径）
         applyRoutingLabels(next)
         break
@@ -1013,7 +1280,10 @@ export function createBoard(ctx, config = {}) {
             { id: taskId, patchable: PATCH_FIELDS },
           )
         }
+        // P0-B 新增字段：走统一校验后落值（不许经 raw 赋值绕过 progress/labels 校验）
+        applyNewFields(next, fields, 'set')
         for (const k of fieldsGiven) {
+          if (NEW_FIELD_NAMES.includes(k)) continue
           if (k === 'status') {
             if (!['pending', 'blocked', 'in_progress'].includes(fields.status)) {
               throw new BoardError(
@@ -1043,6 +1313,46 @@ export function createBoard(ctx, config = {}) {
         break
       }
 
+      // ── Triage 闸门（P0-B §3）───────────────────────────────────────────
+      // 语义：把「创建时随手记下的一条」变成「可以派给人干的一条」。
+      // 这一步才允许指定 assignee / priority / dueAt / labels —— 未 triage 的任务
+      // 不进 ready()（见 requireTriageForReady），避免「没想清楚就派活」。
+      case 'triage': {
+        if (isDead(current.status)) {
+          throw new BoardError(`board.triage：任务 ${taskId} 已删除，不能 triage`, 'BOARD_TASK_DELETED', { id: taskId })
+        }
+        if (current.status !== 'pending') {
+          throw new BoardError(
+            `board.triage：任务 ${taskId} 当前状态是 ${current.status}，只有 pending 才能 triage`,
+            'BOARD_BAD_STATE',
+            { id: taskId, status: current.status, expected: 'pending' },
+          )
+        }
+        if (current.triaged === true) {
+          throw new BoardError(
+            `board.triage：任务 ${taskId} 已 triage 过（rev=${current.rev}）——要改派/改优先级请走 edit`,
+            'BOARD_ALREADY_TRIAGED',
+            { id: taskId },
+          )
+        }
+        next.triaged = true
+        // 顺手可写：assignee / priority / dueAt / labels（同一套校验，不另开规则）
+        if (fields.assignee !== undefined) {
+          if (fields.assignee === null) delete next.assignee
+          else next.assignee = normalizeOptionalString(fields.assignee, 'assignee', 'triage')
+        }
+        if (fields.priority !== undefined && fields.priority !== null) {
+          next.priority = optionalNumber(fields.priority, 'priority', 'triage')
+        }
+        if (fields.dueAt !== undefined && fields.dueAt !== null) {
+          next.dueAt = optionalNumber(fields.dueAt, 'dueAt', 'triage')
+        }
+        if (fields.labels !== undefined && fields.labels !== null) {
+          next.labels = normalizeLabels(fields.labels, 'triage')
+        }
+        break
+      }
+
       // ── 删除（tombstone，不物理删除）─────────────────────────────────────
       case 'delete': {
         if (isDead(current.status)) {
@@ -1061,6 +1371,7 @@ export function createBoard(ctx, config = {}) {
         }
         next.status = 'deleted'
         next.deletedAt = at
+        next.deletedBy = by
         delete next.lease
         break
       }
@@ -1221,6 +1532,36 @@ export function createBoard(ctx, config = {}) {
     }
   }
 
+  /**
+   * 软删除墓碑清理（P0-B §4）：把 deleted 且 deletedAt 早于阈值的任务从内存与快照移除。
+   * 事件流**仍保留墓碑**（append-only 真相源），所以 `replay()` 后这些任务会重新出现；
+   * purge 是内存/快照层的 housekeeping，不是审计 deletion。
+   * @param {{ olderThanMs?: number, now?: number }} [options]
+   * @returns {string[]} 被移除的 taskId
+   */
+  function purgeDeleted(options = {}) {
+    const at = normalizeNow(options?.now, 'purgeDeleted')
+    const threshold = Number.isFinite(options?.olderThanMs) && options.olderThanMs >= 0
+      ? at - options.olderThanMs
+      : at
+    const removed = []
+    for (const [id, t] of [...tasks.entries()]) {
+      if (t.status !== 'deleted') continue
+      if (typeof t.deletedAt !== 'number' || !Number.isFinite(t.deletedAt)) continue
+      if (t.deletedAt < threshold) {
+        tasks.delete(id)
+        removed.push(id)
+      }
+    }
+    if (removed.length > 0) {
+      if (!writeJsonAtomic(snapPath, snapshot())) {
+        diagnostics.snapshotWriteFailures += 1
+        warn(`[cs-bots/board] purgeDeleted 快照写入失败（${snapPath}）——事件流仍保留墓碑，replay() 可恢复`)
+      }
+    }
+    return removed
+  }
+
   /** 首次构造即回放，保证 `list()` 在重启后马上可用。 */
   hydrate()
 
@@ -1253,6 +1594,8 @@ export function createBoard(ctx, config = {}) {
     list,
     update,
     ready,
+    needsAttention,
+    purgeDeleted,
     expireLeases,
     accept,
     replay,

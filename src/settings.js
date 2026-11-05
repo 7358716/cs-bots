@@ -29,6 +29,36 @@ export const SETTING_SPECS = Object.freeze({
   memorySplitOnOverflow: { def: true, bool: true, label: '记忆超长自动切分' },
   /** K1 闸门：Bot 会话禁用 ask_user_question。关掉会让投递链有被堵风险。 */
   k1Enabled: { def: true, bool: true, label: 'K1：Bot 禁阻塞式提问' },
+  // ── 记忆进化对等配置（2026-11-05，主管要求逐项核对）──
+  /** 记忆审查调度：每 N 回合提醒模型做记忆自检。 */
+  reviewEnabled: { def: true, bool: true, label: '记忆自审：启用' },
+  /** 自审间隔（用户回合数）。 */
+  reviewInterval: { def: 10, min: 1, max: 1000, label: '记忆自审间隔（回合）' },
+  /** 自审模式：suggest=只提议，auto=自动执行（更安全）。 */
+  reviewMode: { def: 'suggest', label: '记忆自审模式', options: ['suggest', 'auto'] },
+  /** 技能审查：是否定期检查技能是否过期。 */
+  skillReviewEnabled: { def: false, bool: true, label: '技能审查' },
+  /** 技能单文件大小上限（字节）。 */
+  skillMaxBytes: { def: 65536, min: 1024, max: 512 * 1024, label: '技能大小上限（字节）' },
+  /** 记忆条目是否带日期前缀。 */
+  entryDatePrefix: { def: true, bool: true, label: '记忆条目带日期前缀' },
+  /** 渐进式披露：摘要模式 vs 全文模式。 */
+  keyProgressiveDisclosure: { def: 'off', label: '渐进式披露', options: ['off', 'auto', 'on'] },
+  /** auto 模式全量注入的条目数阈值。 */
+  keyFullInjectThreshold: { def: 3, min: 1, max: 100, label: '全量注入条目数阈值' },
+  /** auto 模式全量注入的字符阈值。 */
+  keyFullInjectCharLimit: { def: 1500, min: 200, max: 10000, label: '全量注入字符阈值' },
+  /** 每回合写入 duty 提醒：是否提醒模型该写记忆了。 */
+  perTurnWrites: { def: true, bool: true, label: '每回合写入提醒' },
+  /** 写入看门狗：连续 N 轮未写记忆时提醒。 */
+  writeGuardThreshold: { def: 2, min: 1, max: 20, label: '写入看门狗阈值（轮）' },
+  /** 写入看门狗开关。 */
+  perTurnWriteGuard: { def: false, bool: true, label: '写入看门狗' },
+  // ── P0-A：WIP 与 Feature Flag ──
+  /** 每 Bot 同时 in_progress 任务上限。 */
+  wipLimitPerBot: { def: 2, min: 1, max: 10, label: '每 Bot WIP 上限' },
+  /** Feature Flag 集合：plain object，每个 value 必须是 boolean。 */
+  featureFlags: { def: {}, object: true, label: 'Feature Flags' },
 })
 
 /** 默认设置。 */
@@ -45,9 +75,30 @@ export function defaultSettings() {
 export function validateSetting(key, raw) {
   const spec = SETTING_SPECS[key]
   if (!spec) return { ok: false, reason: `未知设置项：${key}` }
+  // options 类型：字符串值，必须在白名单里
+  if (spec.options) {
+    if (typeof raw !== 'string') return { ok: false, reason: `${key} 必须是字符串` }
+    if (!spec.options.includes(raw)) return { ok: false, reason: `${key} 非法：${raw}（可选：${spec.options.join(' | ')}）` }
+    return { ok: true, value: raw }
+  }
   if (spec.bool) {
     if (typeof raw !== 'boolean') return { ok: false, reason: `${key} 必须是布尔值` }
     return { ok: true, value: raw }
+  }
+  if (spec.object) {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+      return { ok: false, reason: `${key} 必须是 plain object` }
+    }
+    // 原型链检查：必须是 plain object
+    if (Object.getPrototypeOf(raw) !== Object.prototype && Object.getPrototypeOf(raw) !== null) {
+      return { ok: false, reason: `${key} 必须是 plain object` }
+    }
+    for (const [k, v] of Object.entries(raw)) {
+      if (typeof v !== 'boolean') {
+        return { ok: false, reason: `${key}.${k} 必须是 boolean，得到 ${typeof v}` }
+      }
+    }
+    return { ok: true, value: { ...raw } }
   }
   const n = Number(raw)
   if (!Number.isFinite(n)) return { ok: false, reason: `${key} 必须是数字` }
