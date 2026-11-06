@@ -320,6 +320,10 @@ window.__ModuleLoader__.load({
 /* 房间消息气泡 hover 才出现「⇢ 建任务」（契约 §3.4） */
 .csb-msg-task{opacity:0;transition:opacity .12s}
 .csb-msg-row:hover .csb-msg-task{opacity:1}
+
+/* 唤醒失败后的可操作按钮（契约 bots05 §3.2） */
+.csb-wake{margin-bottom:10px}
+.csb-wake .csb-notice{margin-bottom:6px}
 `
 
     function installStyles() {
@@ -1098,6 +1102,21 @@ window.__ModuleLoader__.load({
     //     补充说明走 /tasks/note 追加，永不覆盖目标 —— 这正是「长任务不失真」的落点。
     // ══════════════════════════════════════════════════════════════════════
 
+    /**
+     * 唤醒失败原因 → 人话（契约 CONTRACT-bots05 §3.1）。
+     *
+     * `agent-not-live` 是「dsh-web 重启后会话没被加载进宿主 live 注册表」，
+     * 不是派活失败 —— 原文直译会让用户以为任务没派出去。`resume-failed:*`
+     * 是尝试自动复活时 resume 抛错。其余原因保持后端原文（不猜测）。
+     */
+    function wakeReasonText(reason) {
+      const r = String(reason ?? '')
+      if (!r) return ''
+      if (r.startsWith('agent-not-live')) return '该 Bot 会话当时没在运行'
+      if (r.startsWith('resume-failed')) return '该 Bot 会话启动失败'
+      return r
+    }
+
     /** 唤醒结果 → 人话（sent / skipped / pending / failed 全覆盖，失败带原因）。 */
     function wakeLabel(wake) {
       if (!wake) return '未请求唤醒'
@@ -1108,15 +1127,114 @@ window.__ModuleLoader__.load({
         pending: '已排队，稍后送达',
         failed: '唤醒失败',
       }[result] ?? `唤醒结果：${result}`
-      const reason = wake.reason ? `（原因：${wake.reason}）` : ''
+      const reason = wake.reason ? `（原因：${wakeReasonText(wake.reason)}）` : ''
       return base + reason
     }
 
-    /** 唤醒结果提示条（失败不静默）。 */
-    function WakeNotice({ wake, prefix }) {
-      if (!wake) return null
-      const bad = wake.ok === false || wake.result === 'failed'
-      return h(Notice, { kind: bad ? 'err' : 'ok' }, `${prefix ?? ''}${wakeLabel(wake)}`)
+    // ── 会话启动（契约 bots05 §2.2 / §3.3）────────────────────────────────────
+
+    /**
+     * 启动一个 Bot 会话：`POST /bots/revive`。
+     * target 三选一：`{botId}` / `{sessionId}` / `{all:true}`。
+     * 后端约定 `ok:true` 只表示「请求已处理」，是否真的活着看 `live` / `revived` / `reason`。
+     */
+    async function reviveSession(target) {
+      let body = null
+      if (target?.all) body = { all: true }
+      else if (target?.botId) body = { botId: target.botId }
+      else if (target?.sessionId) body = { sessionId: target.sessionId }
+      if (!body) throw new Error('缺少 Bot 标识（botId 或 sessionId），无法启动会话')
+      return call('/bots/revive', { method: 'POST', body })
+    }
+
+    /** 单个启动结果 → 人话（live / revived / reason 都显式显示，不静默）。 */
+    function reviveResultText(d) {
+      if (!d) return '启动会话：无响应'
+      if (d.live) return d.revived ? '该 Bot 会话已启动' : '该 Bot 会话已在线'
+      return `启动失败（${d.reason ?? '未知原因'}）`
+    }
+
+    /** 全部启动结果 → 人话（复活 N 个 / 已在线 M 个 / 失败 K 个（原因））。 */
+    function reviveAllText(d) {
+      const revived = d?.revived?.length ?? 0
+      const live = d?.live?.length ?? 0
+      const failed = d?.failed ?? []
+      const reasons = failed.map((f) => `${f?.sessionId ?? '?'}: ${f?.reason ?? '未知原因'}`).join('；')
+      return `复活 ${revived} 个 / 已在线 ${live} 个 / 失败 ${failed.length} 个${reasons ? `（${reasons}）` : ''}`
+    }
+
+    /**
+     * 唤醒结果提示条（失败不静默）。改造05：当失败原因是 `agent-not-live*`，
+     * 额外给两个可操作按钮（契约 §3.2）：
+     *   · 「启动该 Bot 会话」→ POST /bots/revive（botId 优先，其次 sessionId）
+     *   · 「重试唤醒」→ POST /tasks/wake {id}（或调用方自定义 onRetry）
+     * 响应 `revived === true`（后端自动复活成功）→ 成功提示追加「（已自动启动该 Bot 会话）」。
+     */
+    function WakeNotice({ wake, prefix, revived, botId, sessionId, taskId, onRetry }) {
+      const [busy, setBusy] = useState(null) // 'revive' | 'retry'
+      const [curWake, setCurWake] = useState(null)
+      const [retryRevived, setRetryRevived] = useState(false)
+      const [extra, setExtra] = useState(null)
+      if (!wake && !curWake) return null
+      const shown = curWake ?? wake
+      const reason = String(shown?.reason ?? '')
+      const bad = shown?.ok === false || shown?.result === 'failed'
+      const notLive = bad && reason.startsWith('agent-not-live')
+      const autoRevived = !bad && (revived === true || retryRevived)
+
+      const doRevive = async () => {
+        if (busy) return
+        setBusy('revive')
+        setExtra(null)
+        try {
+          const d = await reviveSession(botId ? { botId } : { sessionId })
+          setExtra(reviveResultText(d))
+        } catch (e) {
+          setExtra(`启动会话失败：${e.message}`)
+        } finally {
+          setBusy(null)
+        }
+      }
+
+      const doRetry = async () => {
+        if (busy) return
+        setBusy('retry')
+        setExtra(null)
+        try {
+          let d
+          if (typeof onRetry === 'function') {
+            d = await onRetry()
+          } else {
+            if (!taskId) throw new Error('缺少任务 ID，无法重试唤醒')
+            d = await call('/tasks/wake', { method: 'POST', body: { id: taskId } })
+          }
+          if (d?.wake) setCurWake(d.wake)
+          if (d?.revived === true) setRetryRevived(true)
+          if (!d?.wake) setExtra('已请求重试唤醒，但没有拿到唤醒结果')
+        } catch (e) {
+          setExtra(`重试唤醒失败：${e.message}`)
+        } finally {
+          setBusy(null)
+        }
+      }
+
+      const label = `${prefix ?? ''}${wakeLabel(shown)}${autoRevived ? '（已自动启动该 Bot 会话）' : ''}`
+      return h('div', { className: 'csb-wake' },
+        h(Notice, { kind: bad ? 'err' : 'ok' }, label),
+        notLive
+          ? h('div', { className: 'csb-bar', style: { marginTop: 6 } },
+              h('button', {
+                className: 'csb-btn csb-btn-s',
+                disabled: busy === 'revive',
+                onClick: doRevive,
+              }, busy === 'revive' ? '启动中…' : '启动该 Bot 会话'),
+              h('button', {
+                className: 'csb-btn csb-btn-s csb-btn-p',
+                disabled: busy === 'retry',
+                onClick: doRetry,
+              }, busy === 'retry' ? '重试中…' : '重试唤醒'))
+          : null,
+        extra ? h('div', { className: 'csb-set-d', style: { marginTop: 6 } }, extra) : null)
     }
 
     /** 可折叠长文本（目标原文可能很长；等宽字体保留格式）。 */
@@ -1156,6 +1274,7 @@ window.__ModuleLoader__.load({
       const [busy, setBusy] = useState(false)
       const [err, setErr] = useState(null)
       const [wake, setWake] = useState(null)
+      const [revived, setRevived] = useState(false)
       const [saved, setSaved] = useState(null)
       const [copied, setCopied] = useState(null)
       const [jump, setJump] = useState(null)
@@ -1225,6 +1344,7 @@ window.__ModuleLoader__.load({
         setBusy(true)
         setErr(null)
         setWake(null)
+        setRevived(false)
         setSaved(null)
         setCopied(null)
         try {
@@ -1233,6 +1353,7 @@ window.__ModuleLoader__.load({
           const d = await call('/tasks/note', { method: 'POST', body })
           setNoteText('')
           setWake(d?.wake ?? null)
+          setRevived(d?.revived === true)
           if (!d?.wake) setSaved(hasOwner ? '补充已保存（本次没有唤醒）' : '补充已保存（未派活，不唤醒）')
           notesQ.reload()
           onChange?.()
@@ -1265,7 +1386,15 @@ window.__ModuleLoader__.load({
           h('button', { className: 'csb-btn csb-btn-s', onClick: gotoOwner }, '去对话'),
           copied ? h('span', { className: 'csb-set-d' }, copied) : null),
         err ? h('div', { className: 'csb-err' }, err) : null,
-        wake ? h(WakeNotice, { wake, prefix: '补充已保存 · ' }) : null,
+        wake
+          ? h(WakeNotice, {
+              wake,
+              revived,
+              prefix: '补充已保存 · ',
+              sessionId: ownerId,
+              taskId,
+            })
+          : null,
         !wake && saved ? h(Notice, { kind: 'ok', onClose: () => setSaved(null) }, saved) : null,
 
         h(Section, {
@@ -1356,7 +1485,12 @@ window.__ModuleLoader__.load({
             method: 'POST',
             body: { id: task?.id, ownerId: sessionId, expectedRev: task?.rev },
           })
-          setDone({ taskId: task?.id ?? assigned?.task?.id ?? '?', wake: assigned?.wake ?? null })
+          setDone({
+            taskId: task?.id ?? assigned?.task?.id ?? '?',
+            wake: assigned?.wake ?? null,
+            revived: assigned?.revived === true,
+            reviveReason: assigned?.reviveReason ?? null,
+          })
           setSubject('')
           setDesc('')
           setPriority('')
@@ -1404,7 +1538,21 @@ window.__ModuleLoader__.load({
           })),
         err ? h('div', { className: 'csb-err' }, err) : null,
         done
-          ? h('div', { className: 'csb-ok' }, `已建任务 ${done.taskId} 并派给「${bot?.name ?? sessionId}」 · ${wakeLabel(done.wake)}`)
+          ? h('div', null,
+              h('div', { className: 'csb-ok' }, `已建任务 ${done.taskId}，已派给「${bot?.name ?? sessionId}」`),
+              done.wake
+                ? h(WakeNotice, {
+                    wake: done.wake,
+                    revived: done.revived,
+                    botId: bot?.id,
+                    sessionId,
+                    taskId: done.taskId,
+                  })
+                : null,
+              done.reviveReason && !done.revived
+                ? h('div', { className: 'csb-set-d', style: { marginTop: 6 } },
+                    `会话没能自动启动：${wakeReasonText(done.reviveReason)}`)
+                : null)
           : null)
     }
 
@@ -1423,13 +1571,31 @@ window.__ModuleLoader__.load({
         setDone(null)
         try {
           const d = await call('/bots/message', { method: 'POST', body: { botId: bot?.id, text: t } })
-          setDone({ sessionId: d?.sessionId, wake: d?.wake ?? null })
+          setDone({
+            sessionId: d?.sessionId,
+            wake: d?.wake ?? null,
+            revived: d?.revived === true,
+            text: t,
+          })
           setText('')
         } catch (e) {
           setErr(`发送失败：${e.message}`)
         } finally {
           setBusy(false)
         }
+      }
+
+      /** 重试唤醒：消息接口没有 taskId，重发一次并换新的 dedupKey（否则同文重发会命中去重）。 */
+      const retrySend = async (info) => {
+        if (!info?.text) throw new Error('没有可重发的消息')
+        return call('/bots/message', {
+          method: 'POST',
+          body: {
+            botId: bot?.id,
+            text: info.text,
+            dedupKey: `ui-msg-retry:${bot?.id ?? 'unknown'}:${Date.now()}`,
+          },
+        })
       }
 
       return h(Modal, {
@@ -1452,10 +1618,20 @@ window.__ModuleLoader__.load({
           h('div', { className: 'csb-fld-h' },
             `等价于你在这个 Bot 的会话里发一条消息（会话 ${short(bot?.sessionId ?? '—', 18)}）。`)),
         err ? h('div', { className: 'csb-err' }, err) : null,
-        done
-          ? h('div', { className: 'csb-ok' },
-              `已送达（会话 ${short(done.sessionId ?? '—', 18)}）`,
-              done.wake ? ` · ${wakeLabel(done.wake)}` : '')
+        done && !done.wake
+          ? h('div', { className: 'csb-ok' }, `已送达（会话 ${short(done.sessionId ?? '—', 18)}）`)
+          : null,
+        done && done.wake
+          ? h(WakeNotice, {
+              wake: done.wake,
+              revived: done.revived,
+              prefix: (done.wake.ok === false || done.wake.result === 'failed')
+                ? '消息已提交，但 '
+                : `已送达（会话 ${short(done.sessionId ?? '—', 18)}） · `,
+              botId: bot?.id,
+              sessionId: bot?.sessionId,
+              onRetry: () => retrySend(done),
+            })
           : null)
     }
 
@@ -1601,13 +1777,19 @@ window.__ModuleLoader__.load({
                 method: 'POST',
                 body: { id: task.id, ownerId: assignee, expectedRev: task.rev },
               })
-              setOk(`任务 ${task.id} 已创建，并派给 ${botName(bots, assignee)} · ${wakeLabel(assigned?.wake)}`)
+              setOk({
+                text: `任务 ${task.id} 已创建，并派给 ${botName(bots, assignee)}`,
+                wake: assigned?.wake ?? null,
+                revived: assigned?.revived === true,
+                taskId: task.id,
+                sessionId: assignee,
+              })
               reload()
             } catch (e) {
               setErr(humanizeError(e, errActions, '任务已建，但派活失败：'))
             }
           } else {
-            setOk(task?.id ? `任务 ${task.id} 已创建` : '任务已创建')
+            setOk({ text: task?.id ? `任务 ${task.id} 已创建` : '任务已创建' })
           }
         } catch (e) {
           setErr(humanizeError(e, errActions))
@@ -1685,7 +1867,19 @@ window.__ModuleLoader__.load({
             h('option', { value: '' }, '全部负责人'),
             bots.map((b) => h('option', { key: b.id, value: b.sessionId }, b.name)))),
         err ? h(ErrBox, { humanized: err, onAction: (c) => errActions[c]?.() }) : null,
-        ok ? h(Notice, { kind: 'ok', onClose: () => setOk(null) }, ok) : null,
+        // 改造05：一步派活的唤醒失败 → 直接给「启动该 Bot 会话」「重试唤醒」，不用再翻日志
+        ok
+          ? h('div', null,
+              h(Notice, { kind: 'ok', onClose: () => setOk(null) }, ok.text),
+              ok.wake
+                ? h(WakeNotice, {
+                    wake: ok.wake,
+                    revived: ok.revived,
+                    taskId: ok.taskId,
+                    sessionId: ok.sessionId,
+                  })
+                : null)
+          : null,
         error ? h('div', { className: 'csb-err' }, error) : null,
         loading ? h(Skeleton, { n: 3 }) : null,
         !loading && !error && filtered.length === 0
@@ -2336,6 +2530,8 @@ window.__ModuleLoader__.load({
       // 改造04：Bot 卡片上的「派任务」「发消息」
       const [assignFor, setAssignFor] = useState(null)
       const [msgFor, setMsgFor] = useState(null)
+      // 改造05：会话启动结果（live / revived / reason 显式显示）
+      const [reviveMsg, setReviveMsg] = useState(null)
       const nameRef = useRef(null)
 
       const presets = presetData?.presets ?? []
@@ -2400,6 +2596,45 @@ window.__ModuleLoader__.load({
         }
       }
 
+      /**
+       * 启动单个 Bot 会话（契约 bots05 §3.3）：`POST /bots/revive {botId}`。
+       * 注意：后端 `ok:true` 只表示「请求已处理」，必须看 live / revived / reason。
+       */
+      const reviveOne = async (bot) => {
+        setErr(null)
+        setReviveMsg(null)
+        try {
+          const d = await reviveSession({ botId: bot.id })
+          setReviveMsg({
+            kind: d?.live ? 'ok' : 'err',
+            text: `「${bot.name}」：${reviveResultText(d)}`,
+          })
+          if (d?.live) reload()
+        } catch (e) {
+          setReviveMsg({ kind: 'err', text: `「${bot.name}」启动会话失败：${e.message}` })
+        }
+      }
+
+      /**
+       * 一键启动全部 Bot 会话（契约 bots05 §3.3）：重启 dsh-web 之后用。
+       * 后端串行 ensureLive，返回 revived / live / failed 三个清单。
+       */
+      const reviveAll = async () => {
+        setErr(null)
+        setReviveMsg(null)
+        setBusy(true)
+        try {
+          const d = await reviveSession({ all: true })
+          const failed = d?.failed ?? []
+          setReviveMsg({ kind: failed.length ? 'err' : 'ok', text: reviveAllText(d) })
+          if (d?.revived?.length) reload()
+        } catch (e) {
+          setReviveMsg({ kind: 'err', text: `全部启动失败：${e.message}` })
+        } finally {
+          setBusy(false)
+        }
+      }
+
       return h('div', { className: 'csb-wrap' },
         sessionPicker
           ? h(Modal, {
@@ -2427,6 +2662,15 @@ window.__ModuleLoader__.load({
           title: 'Bot 是什么',
           desc: '一个 Bot = 一个长期存在的成员：有自己的会话、自己的工作目录（决定了它能改哪些文件）、自己的身份和经验。只有「需要长期存在 + 需要独立目录」的角色才值得建 Bot。',
         }),
+
+        // 改造05 §3.3：重启 dsh-web 后一键把所有 Bot 会话拉起来（否则派活必报 agent-not-live）
+        h('div', { className: 'csb-bar', style: { marginTop: 8 } },
+          h('button', { className: 'csb-btn', disabled: busy, onClick: reviveAll }, busy ? '启动中…' : '全部启动'),
+          h('span', { className: 'csb-set-d' },
+            '重启 dsh-web 后点这里，一次性把全部 Bot 会话拉起来（否则派活/唤醒会报「会话当时没在运行」）')),
+        reviveMsg
+          ? h(Notice, { kind: reviveMsg.kind, onClose: () => setReviveMsg(null) }, reviveMsg.text)
+          : null,
 
         h(Section, { title: '新建 Bot' }),
         h('div', { className: 'csb-fld', style: { marginTop: 10 } },
@@ -2486,6 +2730,7 @@ window.__ModuleLoader__.load({
               b.state !== 'retired' ? h('button', { className: 'csb-btn csb-btn-s csb-btn-p', onClick: () => setProfileFor(b) }, '档案') : null,
               b.state !== 'retired' ? h('button', { className: 'csb-btn csb-btn-s', onClick: () => setAssignFor(b) }, '派任务') : null,
               b.state !== 'retired' ? h('button', { className: 'csb-btn csb-btn-s', onClick: () => setMsgFor(b) }, '发消息') : null,
+              b.state !== 'retired' ? h('button', { className: 'csb-btn csb-btn-s', onClick: () => reviveOne(b) }, '启动会话') : null,
               b.state !== 'retired' ? h('button', { className: 'csb-btn csb-btn-s', onClick: () => openSession(b) }, '打开会话') : null,
               b.state !== 'retired'
                 ? h('button', { className: 'csb-btn csb-btn-s', onClick: () => { setRenaming(b); setRenameTo(b.name) } }, '改名')
@@ -5080,6 +5325,11 @@ window.__ModuleLoader__.load({
     exports.CollapsibleText = CollapsibleText
     exports.WakeNotice = WakeNotice
     exports.wakeLabel = wakeLabel
+    // 改造05（CONTRACT-bots05 §3）：唤醒失败可操作化 / 会话启动
+    exports.wakeReasonText = wakeReasonText
+    exports.reviveSession = reviveSession
+    exports.reviveResultText = reviveResultText
+    exports.reviveAllText = reviveAllText
     exports.PANEL_ID = PANEL_ID
     exports.API = API
 

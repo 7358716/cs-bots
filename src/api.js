@@ -15,7 +15,7 @@
 import { readFileSync, readdirSync, statSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { join } from 'node:path'
-import { registerRoute, listPresets, defaultPreset } from './kernel.js'
+import { registerRoute, listPresets, defaultPreset, getAgent, resumeSession } from './kernel.js'
 import { createLibrary } from './library.js'
 import { createDirBrowser } from './dirbrowse.js'
 import { getServices } from './registry.js'
@@ -354,6 +354,54 @@ function buildTaskAnchorText(task, notes = []) {
   return lines.join('\n')
 }
 
+// ══════════════════════════════════════════════════════════════════════════════
+// bots改造05：唤醒前自动复活会话（修「派活报 agent-not-live」）
+//
+// 设计依据：`design/CONTRACT-bots05.md` §2（**已冻结**）。
+// 根因：dsh-web 重启后宿主不会自动把旧会话装载进 `agents` 注册表（懒加载），
+// 而 dispatcher 投递走 `kernel.followup` → `getAgent`；拿不到 agent 就是
+// `agent-not-live`。会话数据仍在磁盘上，`agents.resume({resumeSessionId})` 能救回来。
+// ══════════════════════════════════════════════════════════════════════════════
+
+/** `/bots/revive {all:true}` 单次最多处理的 Bot 数（契约 §2.2）。 */
+const REVIVE_MAX = 50
+
+/**
+ * 确保某个会话在宿主 `agents` 注册表里是 live 的；不在就尝试 resume。
+ *
+ * **绝不抛错**：复活失败必须让上层拿到 `reason`，由上层决定「继续投递并在
+ * wake 里如实报失败」还是「明确报错」。静默吞掉失败才是本平台最忌讳的。
+ *
+ * @param {object} ctx
+ * @param {string} sessionId
+ * @returns {Promise<{ ok: boolean, live: boolean, revived: boolean, reason?: string }>}
+ */
+async function ensureLive(ctx, sessionId) {
+  if (typeof sessionId !== 'string' || sessionId.trim() === '') {
+    return { ok: false, live: false, revived: false, reason: 'missing-session' }
+  }
+  const id = sessionId.trim()
+  // 已经 live：**什么都不做**（不得多出任何副作用，保证既有行为完全一致）。
+  if (getAgent(ctx, id)) return { ok: true, live: true, revived: false }
+  try {
+    await resumeSession(ctx, { resumeSessionId: id })
+    return { ok: true, live: true, revived: true }
+  } catch (error) {
+    return { ok: false, live: false, revived: false, reason: `resume-failed:${error?.message ?? error}` }
+  }
+}
+
+/**
+ * 把 `ensureLive` 结果压成响应新增字段：`revived:boolean` + 失败时 `reviveReason`。
+ * 原本就 live 时只多一个 `revived:false`（契约允许的新增字段），不产生任何副作用。
+ * @param {{ live?: boolean, revived?: boolean, reason?: string } | undefined} revive
+ */
+function reviveFields(revive) {
+  const out = { revived: Boolean(revive?.revived) }
+  if (revive && revive.live === false) out.reviveReason = revive.reason ?? 'revive-failed'
+  return out
+}
+
 /**
  * 注册全部 API 路由。
  *
@@ -643,20 +691,52 @@ export function installApi(ctx, { warn } = {}) {
         const members = room?.members ?? []
         const skipSelf = (senderSession !== 'ui' && senderSession)
         const toWake = members.filter((m) => m !== skipSelf)
+        const wakeByTarget = new Map()
         if (toWake.length > 0 && room?.settings?.allowBotAutoPost !== false) {
           for (const target of toWake) {
-            await withService(services, 'dispatcher', (d) => d.notify({
+            const result = await withService(services, 'dispatcher', (d) => d.notify({
               target,
               reason: 'room-message',
               dedupKey: `room-msg:${message.id}:${target}`,
               text: `[房间「${room.name ?? message.roomId}」有新消息] ${message.text.slice(0, 200)}`,
             })).catch(() => {
               // dispatcher 降级：唤醒失败不影响消息已落盘的事实
+              return undefined
             })
+            wakeByTarget.set(target, result)
           }
         }
 
-        sendJson(response, 200, { ok: true, message, wakes: toWake.length })
+        // ── 补投（契约 bots05 §2.5）：首轮投递失败的成员，先复活会话再用新
+        // dedupKey 重投一次（`room-msg-retry:<msgId>:<target>`）。
+        //
+        // 为什么只补投**首轮失败**的：首轮已成功（sent/pending）的成员若再投一次，
+        // 用户会收到同一消息的两次唤醒 —— 那是噪音，不是修复。
+        // 为什么只补投本平台注册的 Bot 会话：房间成员也可能是主对话/人类会话，
+        // 盲目 resume 会把非 Bot 会话拉起来（副作用不可控）。
+        const revives = []
+        for (const target of toWake) {
+          const first = wakeByTarget.get(target)
+          const firstFailed = !first || first.ok === false
+          if (!firstFailed) continue
+          if (!services.roster?.hasSession?.(target)) continue
+          const revive = await ensureLive(ctx, target)
+          const entry = { target, live: revive.live, revived: revive.revived, retried: false }
+          if (!revive.live) {
+            entry.reason = revive.reason ?? 'revive-failed'
+          } else {
+            entry.wake = await withService(services, 'dispatcher', (d) => d.notify({
+              target,
+              reason: 'room-message',
+              dedupKey: `room-msg-retry:${message.id}:${target}`,
+              text: `[房间「${room.name ?? message.roomId}」有新消息] ${message.text.slice(0, 200)}`,
+            })).catch((error) => ({ ok: false, result: 'failed', reason: String(error?.message ?? error) }))
+            entry.retried = true
+          }
+          revives.push(entry)
+        }
+
+        sendJson(response, 200, { ok: true, message, wakes: toWake.length, revives })
         return
       }
 
@@ -997,7 +1077,11 @@ export function installApi(ctx, { warn } = {}) {
         )
         // 指派后立刻定向唤醒（dedupKey 幂等：同任务同原因只唤一次）
         let wake
+        let revive
         if (services.dispatcher && body.wake !== false) {
+          // 契约 bots05 §2.3：投递前先确保会话 live（重启后宿主懒加载 → 否则必然
+          // agent-not-live）。复活失败**不阻断**：仍照原样 notify，让 wake 如实报 reason。
+          revive = await ensureLive(ctx, body.ownerId)
           wake = services.dispatcher.notify({
             target: body.ownerId,
             reason: 'task-assigned',
@@ -1005,7 +1089,7 @@ export function installApi(ctx, { warn } = {}) {
             text: `新任务 ${task.id}：${task.subject}\n${task.description ?? ''}`.trim(),
           })
         }
-        sendJson(response, 200, { ok: true, task, wake })
+        sendJson(response, 200, { ok: true, task, wake, ...reviveFields(revive) })
         return
       }
 
@@ -1135,7 +1219,10 @@ export function installApi(ctx, { warn } = {}) {
         }
 
         let wake = null
+        let revive
         if (shouldWake) {
+          // 契约 bots05 §2.3：投递前先确保 owner 会话 live（失败不阻断，wake 会如实报错）。
+          revive = await ensureLive(ctx, task.ownerId)
           // 唤醒文案 = 完整锚定文案（含刚追加的这条）+ 【新增补充说明】<text>
           // 这正是「长任务不失真」的落点：Bot 每次被唤醒都看到全量目标原文。
           const notes = readTaskNotes(services, task.id)
@@ -1146,7 +1233,7 @@ export function installApi(ctx, { warn } = {}) {
             text: `${buildTaskAnchorText(task, notes)}\n\n【新增补充说明】${note.text}`,
           })
         }
-        sendJson(response, 200, { ok: true, note, wake })
+        sendJson(response, 200, { ok: true, note, wake, ...reviveFields(revive) })
         return
       }
 
@@ -1163,6 +1250,50 @@ export function installApi(ctx, { warn } = {}) {
           return
         }
         sendJson(response, 200, { ok: true, taskId: task.id, notes: readTaskNotes(services, task.id) })
+        return
+      }
+
+      // ── 手动重试唤醒（契约 bots05 §2.4）：专治「重试看起来没反应」 ──────
+      //
+      // 为什么需要单独端点：/tasks/assign 的 dedupKey 是 `task-assigned:<id>:<rev>`，
+      // 重试时 rev 没变 ⇒ 命中去重 ⇒ skipped，人点「重试」看起来像没反应。
+      if (request.method === 'POST' && path === '/tasks/wake') {
+        const body = (await readBody(request)) ?? {}
+        if (!body.id) {
+          sendJson(response, 400, { ok: false, reason: 'id 必填' })
+          return
+        }
+        const task = await withService(services, 'board', (b) => b.get(body.id))
+        if (!task) {
+          sendJson(response, 404, { ok: false, reason: `任务 ${body.id} 不存在` })
+          return
+        }
+        if (!task.ownerId) {
+          sendJson(response, 400, { ok: false, reason: '任务没有负责人，无法唤醒' })
+          return
+        }
+        // dispatcher 缺失 → 503（先于复活副作用，避免「复活了却没地方投递」）。
+        const dispatcher = await withService(services, 'dispatcher', (d) => d)
+        const revive = await ensureLive(ctx, task.ownerId)
+        const force = body.force !== false
+        const dedupKey = typeof body.dedupKey === 'string' && body.dedupKey.trim()
+          ? body.dedupKey.trim()
+          : (force ? `task-wake:${task.id}:${Date.now()}` : `task-wake:${task.id}:${task.rev}`)
+        const wake = dispatcher.notify({
+          target: task.ownerId,
+          reason: 'task-assigned',
+          dedupKey,
+          text: buildTaskAnchorText(task, readTaskNotes(services, task.id)),
+        })
+        sendJson(response, 200, {
+          ok: true,
+          taskId: task.id,
+          ownerId: task.ownerId,
+          live: revive.live,
+          revived: revive.revived,
+          ...(revive.live ? {} : { reviveReason: revive.reason ?? 'revive-failed' }),
+          wake,
+        })
         return
       }
 
@@ -1213,13 +1344,69 @@ export function installApi(ctx, { warn } = {}) {
         const dedupKey = typeof body.dedupKey === 'string' && body.dedupKey.trim()
           ? body.dedupKey.trim()
           : `ui-msg:${hash}`
-        const wake = await withService(services, 'dispatcher', (d) => d.notify({
+        const dispatcher = await withService(services, 'dispatcher', (d) => d)
+        // 契约 bots05 §2.3：投递前先确保目标会话 live（失败不阻断，wake 会如实报错）。
+        const revive = await ensureLive(ctx, sessionId)
+        const wake = dispatcher.notify({
           target: sessionId,
           reason: 'room-message',
           dedupKey,
           text: deliveredText,
-        }))
-        sendJson(response, 200, { ok: true, sessionId, knownBot, wake, text: deliveredText })
+        })
+        sendJson(response, 200, {
+          ok: true,
+          sessionId,
+          knownBot,
+          wake,
+          text: deliveredText,
+          ...reviveFields(revive),
+        })
+        return
+      }
+
+      // ── 手动复活 Bot 会话（契约 bots05 §2.2）：重启 dsh-web 后一键拉起来 ──
+      if (request.method === 'POST' && path === '/bots/revive') {
+        const body = (await readBody(request)) ?? {}
+        // 批量：遍历未退役的 Bot，**串行** ensureLive（最多 REVIVE_MAX 个）。
+        if (body.all === true) {
+          const bots = await withService(services, 'roster', (r) => r.list())
+          const targets = bots.filter((b) => b?.state !== 'retired').slice(0, REVIVE_MAX)
+          const revived = []
+          const live = []
+          const failed = []
+          for (const bot of targets) {
+            const result = await ensureLive(ctx, bot.sessionId)
+            if (result.live) live.push(bot.sessionId)
+            if (result.revived) revived.push(bot.sessionId)
+            if (!result.live) failed.push({ sessionId: bot.sessionId, reason: result.reason })
+          }
+          sendJson(response, 200, { ok: true, total: targets.length, revived, live, failed })
+          return
+        }
+        // 单个：botId 解析出 sessionId（找不到 404），或直接给 sessionId。
+        let sessionId
+        if (body.botId) {
+          const bot = await withService(services, 'roster', (r) => r.get(body.botId))
+          if (!bot) {
+            sendJson(response, 404, { ok: false, reason: `Bot ${body.botId} 不存在` })
+            return
+          }
+          sessionId = bot.sessionId
+        } else if (typeof body.sessionId === 'string' && body.sessionId.trim()) {
+          sessionId = body.sessionId.trim()
+        } else {
+          sendJson(response, 400, { ok: false, reason: 'botId / sessionId / all 三选一必填' })
+          return
+        }
+        const revive = await ensureLive(ctx, sessionId)
+        // ok:true = 请求已处理；复活是否成功看 live（失败给 reason，不是 500）。
+        sendJson(response, 200, {
+          ok: true,
+          sessionId,
+          live: revive.live,
+          revived: revive.revived,
+          ...(revive.live ? {} : { reason: revive.reason ?? 'revive-failed' }),
+        })
         return
       }
 

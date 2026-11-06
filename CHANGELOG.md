@@ -13,6 +13,50 @@
 
 ---
 
+## [0.6.1] - 2026-11-06
+
+修「创建任务指派 Bot 报错」。一句话：**不是派活逻辑坏了，是重启后 Bot 会话没被加载**，
+现在投递前自动复活会话，并把 `agent-not-live` 从「红色报错」变成「可点的两个按钮」。
+
+### Fixed
+
+- **派活/发言/补充说明全部报 `agent-not-live`**
+  真实链路（有证据，不是推测）：任务建成了 → `board` 里 `claim` 成功（`rev 2 → in_progress`）→
+  但 `wakes.jsonl` 记录 `{"reason":"task-assigned","result":"failed","detail":"agent-not-live"}`。
+  根因：11:38 重启 dsh-web 后，宿主**不会**把旧会话自动加载进 `agents` live 注册表（懒加载），
+  而 cs-bots 侧的 `kernel.resumeSession` **全项目零调用**（只有定义）。
+  会话文件其实都在磁盘上（`~/.dsh/sessions/…/bot-…`），所以 resume 能救回来。
+  为什么这个 bug 危险：界面上它长成「派活报错」，会让人误以为任务没派出去，
+  而实际上任务已经派了、只是执行者不知道 —— 沉默的任务比报错更贵。
+
+- **房间发言的唤醒也全挂**（同一个根因）：`wakes.jsonl` 里 `room-message` 三条全 failed。
+
+### Added
+
+- **`ensureLive(ctx, sessionId)`**：已 live 直接返回（**零副作用**）；未 live 才 `agents.resume`；
+  resume 抛错只返回 `reason`，**绝不抛**（否则用户看到的会是 500 而不是原因）。
+- **投递前自动复活**：`/tasks/assign`、`/tasks/note`、`/bots/message` 三处在 `dispatcher.notify`
+  之前插入 `ensureLive`，响应新增 `revived` / `reviveReason`。原本就在线时行为**完全不变**。
+- **`POST /bots/revive`**：`{botId}` / `{sessionId}` / `{all:true}`。`all` 串行复活全部未退役 Bot，
+  返回 `{total, revived, live, failed:[{sessionId,reason}]}` —— 这是「重启后一键救场」。
+- **`POST /tasks/wake`**：手动重试唤醒。为什么必须单独一个端点：
+  `/tasks/assign` 的 dedupKey 是 `task-assigned:<id>:<rev>`，重试时 rev 没变 ⇒ 命中幂等 ⇒ 返回
+  `skipped`，人点「重试」看起来像没反应。`force`（缺省 true）换成 `task-wake:<id>:<timestamp>` 才真的再唤一次。
+- **前端**：`agent-not-live` → 「该 Bot 会话当时没在运行」（不再直译后端 reason）；
+  唤醒失败时给「启动该 Bot 会话」「重试唤醒」两个按钮；Bot 卡片加「启动会话」；
+  Bot 页头加「全部启动」（重启后一键拉起全部会话）；后端自动复活成功时提示「（已自动启动该 Bot 会话）」。
+
+### Tests
+
+- `test/api-revive.test.mjs`（16）：ensureLive 三态（已 live 绝不 resume / 未 live 会 resume /
+  resume 抛错不抛且有 reason）、三处投递点自动复活、原本在线行为不变、`{all:true}` 批量与部分失败、
+  `/tasks/wake` 的 400/404/force 换键/force:false 幂等。
+  测试里刻意把 Bot 从 live 集合里摘掉来**精确模拟重启后的冷会话**。
+- `test/client-revive.test.mjs`（11）：文案翻译、两个按钮存在且真的 POST 对应端点、Bot 页「全部启动」。
+- 基线：759 → **786**，全部通过（exit 0）；ci-zero-dep PASS。
+
+---
+
 ## [0.6.0] - 2026-11-06
 
 「一站式工作台」版。一句话：把**派活 / 补充 / 沟通 / 跳转**四件事全收进协作平台页面，

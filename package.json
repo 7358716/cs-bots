@@ -1,6 +1,6 @@
 {
   "name": "cs-bots",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "type": "module",
   "description": "DSH 多智能体协作平台：跨会话任务板、房间群聊、分层记忆与纪律、待办便签、可独立工作目录的 Bot 注册表（零第三方依赖）",
   "main": "src/index.js",
