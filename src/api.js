@@ -316,6 +316,159 @@ function nextTaskNoteId(rows) {
   return `n-${Math.max(max + 1, rows.length + 1)}`
 }
 
+// ══════════════════════════════════════════════════════════════════════════════
+// bots改造06：任务变更中心（重开纠错 / 派生优化单 / 转长任务 / 换负责人）
+//
+// 设计依据：`design/CONTRACT-bots06.md` §2（**已冻结**）。
+// 根因：`board.reopen` 会**清空** `artifacts` / `acceptance` / `completedAt`
+// （内核行为，board.js 冻结不能改），所以变更**前**必须先把「当时的样子」快照进
+// `task-meta.jsonl`（append-only）—— 这是「纠错不丢证据」的唯一保障，同时充当
+// 变更历史与长任务标记。
+// ══════════════════════════════════════════════════════════════════════════════
+
+/** 任务变更元数据文件（新建；append-only，一行一条）。 */
+const TASK_META_FILE = 'task-meta.jsonl'
+/** 变更说明长度上限（契约 §2.2：trim 后 1–4000）。 */
+const EVOLVE_NOTE_MAX = ANCHOR_TEXT_MAX
+/** evolve 支持的三种变更模式（契约 §2.2）。 */
+const EVOLVE_MODES = ['reopen', 'followup', 'longrun']
+/** 长任务阶段数上限 / 单项长度上限（契约 §2.2 longrun）。 */
+const LONGRUN_PHASES_MAX = 12
+const LONGRUN_PHASE_MAX = 200
+/** 长任务未给 phases 时的默认三阶段（契约 §2.2 longrun）。 */
+const LONGRUN_DEFAULT_PHASES = ['范围与验收标准确认', '执行与自测', '交付与复盘']
+
+/** task-meta.jsonl 路径（状态目录缺失时 undefined）。 */
+function taskMetaPath(services) {
+  const dir = anchorStateDir(services)
+  return dir ? statePath(dir, TASK_META_FILE) : undefined
+}
+
+/**
+ * 读某任务的全部变更记录（按 `at` 升序；同一毫秒按落盘顺序稳定排序）。
+ * 坏行由 readJsonl 计入 bad，不静默崩。
+ * @param {object} services
+ * @param {string} taskId
+ * @returns {object[]}
+ */
+function readTaskMeta(services, taskId) {
+  const file = taskMetaPath(services)
+  if (!file) return []
+  const { rows } = readJsonl(file)
+  return rows
+    .map((row, index) => ({ row, index }))
+    .filter(({ row }) => row && typeof row === 'object' && row.taskId === taskId)
+    .sort((a, b) => (Number(a.row.at) || 0) - (Number(b.row.at) || 0) || a.index - b.index)
+    .map(({ row }) => row)
+}
+
+/**
+ * 追加一条变更记录。
+ * 落盘失败**必须抛 503**：静默丢历史 = 丢证据，是本平台最忌讳的失败方式。
+ * @param {object} services
+ * @param {object} record
+ */
+function appendTaskMeta(services, record) {
+  const file = taskMetaPath(services)
+  if (!file) {
+    const error = new Error('状态目录不可用（task-meta.jsonl 无法落盘）')
+    error.status = 503
+    throw error
+  }
+  if (!appendJsonl(file, record)) {
+    const error = new Error(`变更记录落盘失败（${file}）`)
+    error.status = 503
+    throw error
+  }
+  return record
+}
+
+/** 取某任务最近一条 `kind:'longrun'` 记录（没有则 undefined）。 */
+function readLongrunMeta(services, taskId) {
+  const rows = readTaskMeta(services, taskId).filter(
+    (row) => row.kind === 'longrun' && Array.isArray(row.phases),
+  )
+  return rows.length ? rows[rows.length - 1] : undefined
+}
+
+/** 把 longrun 记录 / phases 数组归一成非空阶段清单。 */
+function longrunPhaseList(longrun) {
+  const list = Array.isArray(longrun)
+    ? longrun
+    : (Array.isArray(longrun?.phases) ? longrun.phases : [])
+  return list
+    .filter((phase) => typeof phase === 'string' && phase.trim() !== '')
+    .map((phase) => phase.trim())
+}
+
+/** 变更**前**的任务快照（契约 §2.2 reopen 步骤 1）。 */
+function buildTaskSnapshot(task) {
+  return {
+    kind: 'snapshot',
+    taskId: task.id,
+    at: Date.now(),
+    before: {
+      status: task.status,
+      artifacts: Array.isArray(task.artifacts) ? task.artifacts : [],
+      acceptance: task.acceptance === undefined ? null : task.acceptance,
+      completedAt: task.completedAt ?? null,
+      progress: task.progress ?? 0,
+      ownerId: task.ownerId ?? null,
+    },
+  }
+}
+
+/** 追加一条补充说明（append-only；长任务说明与 /tasks/note 共用同一份文件与编号规则）。 */
+function appendTaskNoteRow(services, taskId, text, by) {
+  const file = taskNotesPath(services)
+  if (!file) {
+    const error = new Error('状态目录不可用（task-notes.jsonl 无法落盘）')
+    error.status = 503
+    throw error
+  }
+  const { rows } = readJsonl(file)
+  const note = { id: nextTaskNoteId(rows), taskId, text, by, at: Date.now() }
+  if (!appendJsonl(file, note)) {
+    const error = new Error(`补充说明落盘失败（${file}）`)
+    error.status = 503
+    throw error
+  }
+  return note
+}
+
+/**
+ * 按契约 §2.2 的 reopen 流程：**先快照** → 再调内核 reopen → 记一条 reopen。
+ *
+ * 已 pending 且无租约时内核抛 `BOARD_NOTHING_TO_REOPEN` —— 契约明确「视为成功」，
+ * 不能把用户点「重开」当成报错（任务本来就是可做的）。
+ */
+async function reopenWithSnapshot(services, task, by, note) {
+  const snapshot = appendTaskMeta(services, buildTaskSnapshot(task))
+  let after = task
+  try {
+    after = await withService(services, 'board', (b) => b.update({
+      id: task.id,
+      expectedRev: task.rev,
+      action: 'reopen',
+      byId: by,
+    }))
+  } catch (error) {
+    if (error?.code !== 'BOARD_NOTHING_TO_REOPEN') throw error
+    after = (await withService(services, 'board', (b) => b.get(task.id))) ?? task
+  }
+  const change = appendTaskMeta(services, {
+    kind: 'reopen', taskId: task.id, note, by, at: Date.now(),
+  })
+  return { task: after, snapshot, change }
+}
+
+/** 派生任务标题前缀（契约 §2.2 followup：修复 > 优化 > 变更，先命中先算）。 */
+function evolvePrefixFor(note) {
+  if (/错|缺陷|bug|修复/i.test(note)) return '【修复】'
+  if (/优化|提升|改进/.test(note)) return '【优化】'
+  return '【变更】'
+}
+
 /**
  * 生成契约 §2.1 的固定锚定文案（**前端只展示/复制，不得改写**）。
  *
@@ -331,11 +484,22 @@ function nextTaskNoteId(rows) {
  * 补充说明（按时间，全部有效，不得忽略）：
  * - [<时间>] <text>
  * ```
+ *
+ * 改造06 追加（契约 bots06 §2.4，**只加不改**）：该任务在 `task-meta.jsonl` 里有
+ * `kind:'longrun'` 记录时，在「补充说明」**之前**插入阶段清单：
+ * ```
+ * 阶段（长任务，按序推进，不得跳步）：
+ * 1. <phase1>
+ * 2. <phase2>
+ * ```
+ * 没有 longrun 记录时输出**逐字不变**（既有测试对文案有逐行断言）。
+ *
  * @param {object} task
  * @param {{ at: number, text: string }[]} [notes]
+ * @param {{ phases?: string[] } | string[]} [longrun] 该任务的 longrun 记录（或阶段数组）
  * @returns {string}
  */
-function buildTaskAnchorText(task, notes = []) {
+function buildTaskAnchorText(task, notes = [], longrun = null) {
   const anchor = buildTaskAnchor(task)
   const desc = typeof anchor.description === 'string' ? anchor.description : ''
   const lines = [
@@ -346,8 +510,13 @@ function buildTaskAnchorText(task, notes = []) {
     `前置：${joinAnchorList(anchor.blockedBy, '（无）')}`,
     `进度：${anchor.progress}%`,
     `已交付：${joinAnchorList(anchor.artifacts, '（暂无）')}`,
-    '补充说明（按时间，全部有效，不得忽略）：',
   ]
+  const phases = longrunPhaseList(longrun)
+  if (phases.length > 0) {
+    lines.push('阶段（长任务，按序推进，不得跳步）：')
+    phases.forEach((phase, index) => lines.push(`${index + 1}. ${phase}`))
+  }
+  lines.push('补充说明（按时间，全部有效，不得忽略）：')
   for (const note of notes) {
     lines.push(`- [${formatAnchorTime(note?.at)}] ${note?.text ?? ''}`)
   }
@@ -1164,7 +1333,7 @@ export function installApi(ctx, { warn } = {}) {
           taskId: task.id,
           anchor: buildTaskAnchor(task),
           notes,
-          text: buildTaskAnchorText(task, notes),
+          text: buildTaskAnchorText(task, notes, readLongrunMeta(services, task.id)),
           note: '目标锚来自任务创建时的原文；补充说明另存，不会覆盖目标',
         })
         return
@@ -1230,7 +1399,7 @@ export function installApi(ctx, { warn } = {}) {
             target: task.ownerId,
             reason: 'task-assigned',
             dedupKey: `task-note:${task.id}:${note.id}`,
-            text: `${buildTaskAnchorText(task, notes)}\n\n【新增补充说明】${note.text}`,
+            text: `${buildTaskAnchorText(task, notes, readLongrunMeta(services, task.id))}\n\n【新增补充说明】${note.text}`,
           })
         }
         sendJson(response, 200, { ok: true, note, wake, ...reviveFields(revive) })
@@ -1283,7 +1452,7 @@ export function installApi(ctx, { warn } = {}) {
           target: task.ownerId,
           reason: 'task-assigned',
           dedupKey,
-          text: buildTaskAnchorText(task, readTaskNotes(services, task.id)),
+          text: buildTaskAnchorText(task, readTaskNotes(services, task.id), readLongrunMeta(services, task.id)),
         })
         sendJson(response, 200, {
           ok: true,
@@ -1293,6 +1462,318 @@ export function installApi(ctx, { warn } = {}) {
           revived: revive.revived,
           ...(revive.live ? {} : { reviveReason: revive.reason ?? 'revive-failed' }),
           wake,
+        })
+        return
+      }
+
+      // ══════════════════════════════════════════════════════════════════════
+      // 改造06 · 任务变更中心（契约 CONTRACT-bots06 §2）
+      //
+      // 用户原话：「完成的任务应该可以纠错或者优化或者更改或其他变更，变更成长任务」
+      //           「任务可以变更负责人」。
+      // 两条铁律：
+      //   · 变更必须有理由（note 必填）；没有理由的变更不许进历史。
+      //   · 证据不能丢（reopen 前先快照，见 reopenWithSnapshot）。
+      // ══════════════════════════════════════════════════════════════════════
+
+      // ── 换负责人（契约 §2.1）────────────────────────────────────────────
+      if (request.method === 'POST' && path === '/tasks/reassign') {
+        const body = (await readBody(request)) ?? {}
+        if (!body.id) {
+          sendJson(response, 400, { ok: false, reason: 'id 必填' })
+          return
+        }
+        if (!body.ownerId || typeof body.ownerId !== 'string' || !body.ownerId.trim()) {
+          sendJson(response, 400, { ok: false, reason: 'ownerId 必填' })
+          return
+        }
+        const ownerId = body.ownerId.trim()
+        const by = typeof body.byId === 'string' && body.byId.trim() ? body.byId.trim() : 'ui'
+        let task = await withService(services, 'board', (b) => b.get(body.id))
+        if (!task) {
+          sendJson(response, 404, { ok: false, reason: `任务 ${body.id} 不存在` })
+          return
+        }
+        // ② 已完成任务先拦：不让用户撞 board.claim 的 BOARD_ALREADY_COMPLETED，
+        //    而是给一条「接下来该点哪」的可操作提示。
+        if (task.status === 'completed') {
+          const error = new Error('任务已完成，请先「重开」或「派生优化单」再换负责人')
+          error.status = 400
+          error.code = 'TASK_COMPLETED'
+          throw error
+        }
+        // 前端会带 expectedRev（CAS）：先于任何变更校验，避免覆盖别人的改动。
+        if (body.expectedRev !== undefined && body.expectedRev !== null && task.rev !== body.expectedRev) {
+          const error = new Error(
+            `任务 ${task.id} 版本冲突：期望 rev=${body.expectedRev}，实际 rev=${task.rev} —— 请刷新后重试`,
+          )
+          error.status = 400
+          error.code = 'BOARD_REV_CONFLICT'
+          throw error
+        }
+        const from = task.ownerId ?? task.lease?.ownerId ?? null
+        // dispatcher 缺失时**先** 503（此操作无副作用）：避免「任务已换人但唤不醒」
+        // 或「租约已交还却换不了人」的半成品状态。
+        const shouldWake = body.wake !== false
+        const dispatcher = shouldWake
+          ? await withService(services, 'dispatcher', (d) => d)
+          : undefined
+        // ③ 原租约仍有效且持有人不是新负责人 → 以**原持有者身份**交还
+        //   （board.release 要求 byId === lease.ownerId，平台只是代为操作）。
+        const lease = task.lease
+        const leaseLive = Boolean(lease)
+          && Number.isFinite(Number(lease.expiresAt))
+          && Number(lease.expiresAt) > Date.now()
+        if (leaseLive && lease.ownerId && lease.ownerId !== ownerId) {
+          task = await withService(services, 'board', (b) => b.update({
+            id: task.id,
+            expectedRev: task.rev,
+            action: 'release',
+            byId: String(lease.ownerId),
+          }))
+        }
+        // ④ 以新负责人身份领取（force:true 绕过 blockedBy 未完成）。
+        let next
+        try {
+          next = await withService(services, 'board', (b) => b.update({
+            id: task.id,
+            expectedRev: task.rev,
+            action: 'claim',
+            byId: ownerId,
+            force: true,
+            ...(body.leaseMs !== undefined && body.leaseMs !== null ? { leaseMs: body.leaseMs } : {}),
+          }))
+        } catch (error) {
+          // WIP 超限：**原样回传内核错误码**，只补一句人话，绝不吞成「success」。
+          if (error?.code === 'BOARD_WIP_EXCEEDED' || error?.code === 'BOARD_WIP_LIMIT') {
+            const wrapped = new Error(
+              `${error.message}（提示：先让该 Bot 交付或释放已有任务，或在设置里调高 wipLimitPerBot 后再换负责人）`,
+            )
+            wrapped.status = 400
+            wrapped.code = error.code
+            throw wrapped
+          }
+          throw error
+        }
+        // ⑤ 唤醒：确保新负责人会话 live（失败不阻断，wake 会如实报错误原因）。
+        let wake = null
+        let revive
+        if (shouldWake) {
+          revive = await ensureLive(ctx, ownerId)
+          wake = dispatcher.notify({
+            target: ownerId,
+            reason: 'task-assigned',
+            dedupKey: `task-reassign:${next.id}:${next.rev}`,
+            text: buildTaskAnchorText(
+              next,
+              readTaskNotes(services, next.id),
+              readLongrunMeta(services, next.id),
+            ),
+          })
+        }
+        // ⑥ 变更历史（append-only；与快照/重开共用同一份 task-meta.jsonl）。
+        appendTaskMeta(services, {
+          kind: 'reassign', taskId: next.id, from, to: ownerId, by, at: Date.now(),
+        })
+        // ⑦ 回显：from/to 让前端能显示「已从 A 换到 B」。
+        sendJson(response, 200, {
+          ok: true,
+          task: next,
+          from,
+          to: ownerId,
+          wake,
+          ...reviveFields(revive),
+        })
+        return
+      }
+
+      // ── 变更中心（契约 §2.2）：reopen | followup | longrun ──────────────
+      if (request.method === 'POST' && path === '/tasks/evolve') {
+        const body = (await readBody(request)) ?? {}
+        if (!body.id) {
+          sendJson(response, 400, { ok: false, reason: 'id 必填' })
+          return
+        }
+        const mode = typeof body.mode === 'string' ? body.mode.trim() : ''
+        if (!EVOLVE_MODES.includes(mode)) {
+          const error = new Error(`mode 必须是 ${EVOLVE_MODES.join(' | ')}（收到 ${JSON.stringify(body.mode)}）`)
+          error.status = 400
+          error.code = 'EVOLVE_BAD_MODE'
+          throw error
+        }
+        // note 三种模式都必填：没有理由的变更不许进历史。
+        const note = typeof body.note === 'string' ? body.note.trim() : ''
+        if (!note) {
+          const error = new Error('变更说明不能为空（没有理由的变更不许进历史）')
+          error.status = 400
+          error.code = 'EVOLVE_NOTE_REQUIRED'
+          throw error
+        }
+        if (note.length > EVOLVE_NOTE_MAX) {
+          const error = new Error(`变更说明过长（最多 ${EVOLVE_NOTE_MAX} 字）`)
+          error.status = 400
+          error.code = 'EVOLVE_NOTE_TOO_LONG'
+          throw error
+        }
+        const by = typeof body.byId === 'string' && body.byId.trim() ? body.byId.trim() : 'ui'
+        const task = await withService(services, 'board', (b) => b.get(body.id))
+        if (!task) {
+          sendJson(response, 404, { ok: false, reason: `任务 ${body.id} 不存在` })
+          return
+        }
+
+        // mode=reopen（纠错 / 继续做）：快照 → 内核 reopen → 记历史。
+        if (mode === 'reopen') {
+          const { task: reopened, snapshot } = await reopenWithSnapshot(services, task, by, note)
+          sendJson(response, 200, {
+            ok: true,
+            task: reopened,
+            snapshot,
+            note: '已重开；上一轮交付物已存档，见 changes',
+          })
+          return
+        }
+
+        // mode=followup（优化 / 修复单）：原任务**保持已完成**，派生一张新任务。
+        if (mode === 'followup') {
+          const prefix = evolvePrefixFor(note)
+          // 幂等键：note 的 sha1 前缀 —— 连点两次同一说明只建一个；
+          // 不同说明是不同诉求，允许各建一张（不能用 task.rev，否则第二次派生
+          // 会静默命中第一张，用户看不到自己新写的理由）。
+          const seq = createHash('sha1').update(note).digest('hex').slice(0, 12)
+          const sourceSeq = `evolve:${task.id}:${seq}`
+          const originDesc = typeof task.description === 'string' ? task.description : ''
+          const description = [
+            originDesc.trim() ? originDesc : null,
+            `【变更说明】${note}`,
+            `【来源】原任务 ${task.id}：${task.subject}`,
+          ].filter((part) => part !== null).join('\n\n')
+          const createInput = {
+            subject: `${prefix}${task.subject}`,
+            description,
+            byId: by,
+            sourceSeq,
+          }
+          // priority 继承原任务；assignee 继承 assignee ?? ownerId（契约 §2.2）。
+          if (task.priority !== undefined) createInput.priority = task.priority
+          const assignee = task.assignee ?? task.ownerId
+          if (assignee) createInput.assignee = assignee
+          const created = await withService(services, 'board', (b) => b.create(createInput))
+          // 幂等命中（连点）时不重复记历史：同一条 followup 只留一行。
+          const already = readTaskMeta(services, task.id).some(
+            (row) => row.kind === 'followup' && row.newTaskId === created.id,
+          )
+          if (!already) {
+            appendTaskMeta(services, {
+              kind: 'followup',
+              taskId: task.id,
+              newTaskId: created.id,
+              note,
+              by,
+              at: Date.now(),
+            })
+          }
+          sendJson(response, 200, {
+            ok: true,
+            task: created,
+            origin: task.id,
+            prefix,
+            note: `已派生 ${created.id}（幂等键 ${sourceSeq}，重复点不会建两个）`,
+          })
+          return
+        }
+
+        // mode=longrun（转成长任务）：阶段清单进 task-meta，唤醒文案自动带上。
+        let phases
+        if (body.phases === undefined || body.phases === null
+          || (Array.isArray(body.phases) && body.phases.length === 0)) {
+          phases = [...LONGRUN_DEFAULT_PHASES]
+        } else {
+          if (!Array.isArray(body.phases)) {
+            const error = new Error('phases 必须是字符串数组')
+            error.status = 400
+            error.code = 'EVOLVE_BAD_PHASES'
+            throw error
+          }
+          if (body.phases.length > LONGRUN_PHASES_MAX) {
+            const error = new Error(`phases 最多 ${LONGRUN_PHASES_MAX} 项（收到 ${body.phases.length} 项）`)
+            error.status = 400
+            error.code = 'EVOLVE_BAD_PHASES'
+            throw error
+          }
+          phases = body.phases.map((phase, index) => {
+            if (typeof phase !== 'string') {
+              const error = new Error(`phases[${index}] 必须是字符串（收到 ${JSON.stringify(phase)}）`)
+              error.status = 400
+              error.code = 'EVOLVE_BAD_PHASES'
+              throw error
+            }
+            const text = phase.trim()
+            if (!text) {
+              const error = new Error(`phases[${index}] 不能为空`)
+              error.status = 400
+              error.code = 'EVOLVE_BAD_PHASES'
+              throw error
+            }
+            if (text.length > LONGRUN_PHASE_MAX) {
+              const error = new Error(`phases[${index}] 过长（最多 ${LONGRUN_PHASE_MAX} 字，收到 ${text.length} 字）`)
+              error.status = 400
+              error.code = 'EVOLVE_BAD_PHASES'
+              throw error
+            }
+            return text
+          })
+        }
+        // ① reopen:true 时按 reopen 流程重开（快照必须在内核清空 artifacts 之前落盘）。
+        let current = task
+        if (body.reopen === true) {
+          current = (await reopenWithSnapshot(services, task, by, note)).task
+        }
+        // ② 记 longrun（契约 §2.2 longrun 步骤 2；不动任务本体）。
+        appendTaskMeta(services, {
+          kind: 'longrun', taskId: task.id, phases, note, by, at: Date.now(),
+        })
+        // ③ 记一条补充说明，内容 = 【转长任务】 + note + 阶段清单（步骤 4）。
+        appendTaskNoteRow(
+          services,
+          task.id,
+          `【转长任务】${note}\n阶段清单：\n${phases.map((phase, index) => `${index + 1}. ${phase}`).join('\n')}`,
+          by,
+        )
+        sendJson(response, 200, {
+          ok: true,
+          task: current,
+          phases,
+          note: '已标记为长任务；后续每次唤醒都会带上阶段清单',
+        })
+        return
+      }
+
+      // ── 变更历史（契约 §2.3）：只读，按 at 升序 ─────────────────────────
+      if (request.method === 'GET' && path === '/tasks/changes') {
+        const id = qp(url, 'id')
+        if (!id) {
+          sendJson(response, 400, { ok: false, reason: 'id 必填' })
+          return
+        }
+        const task = await withService(services, 'board', (b) => b.get(id))
+        if (!task) {
+          sendJson(response, 404, { ok: false, reason: `任务 ${id} 不存在` })
+          return
+        }
+        const rows = readTaskMeta(services, task.id)
+        // 契约 §2.3 的条目只暴露 kind/at/...（taskId 由外层给，逐条不重复）。
+        const changes = rows.map(({ taskId, ...rest }) => rest)
+        const longrunRows = rows.filter((row) => row.kind === 'longrun' && Array.isArray(row.phases))
+        const lastLongrun = longrunRows.length ? longrunRows[longrunRows.length - 1] : null
+        const snapshotRows = rows.filter((row) => row.kind === 'snapshot' && row.before)
+        const lastSnapshot = snapshotRows.length ? snapshotRows[snapshotRows.length - 1] : null
+        sendJson(response, 200, {
+          ok: true,
+          taskId: task.id,
+          changes,
+          longrun: lastLongrun ? { phases: [...lastLongrun.phases], at: lastLongrun.at } : null,
+          latestSnapshot: lastSnapshot ? lastSnapshot.before : null,
         })
         return
       }
@@ -1334,7 +1815,7 @@ export function installApi(ctx, { warn } = {}) {
             sendJson(response, 404, { ok: false, reason: `任务 ${body.taskId} 不存在` })
             return
           }
-          prefix = `${buildTaskAnchorText(task, readTaskNotes(services, task.id))}\n\n`
+          prefix = `${buildTaskAnchorText(task, readTaskNotes(services, task.id), readLongrunMeta(services, task.id))}\n\n`
         }
         const deliveredText = prefix + text
         const hash = createHash('sha1')

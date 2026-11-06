@@ -945,7 +945,14 @@ window.__ModuleLoader__.load({
           // 改造04：目标锚（只读）+ 补充说明 + 补充历史 + 去对话 + 复制派发文案
           h(TaskAnchorPanel, { taskId: task.id, task, onChange }),
 
-          h(Section, { title: '可以做什么', desc: '指派、完成、验收是 Bot 的职责，不由你操作。这里只有需要你拍板的动作。' }),
+          h(Section, {
+            title: task.status === 'completed'
+              ? '已完成 · 要纠错/优化/变更从这里开始'
+              : '可以做什么',
+            desc: task.status === 'completed'
+              ? '已完成不是终点：下面的「变更」区可以重开接着做 / 派生优化单 / 转成长任务。'
+              : '指派、完成、验收是 Bot 的职责，不由你操作。这里只有需要你拍板的动作。',
+          }),
           h('div', { className: 'csb-bar', style: { marginTop: 10 } },
             task.status === 'pending'
               ? h('button', { className: 'csb-btn csb-btn-p', onClick: () => act(() => upd('claim'), '领取') }, '我来管（领取）')
@@ -954,6 +961,9 @@ window.__ModuleLoader__.load({
             task.status !== 'blocked' && task.status !== 'deleted'
               ? h('button', { className: 'csb-btn csb-btn-d', onClick: () => { setAbortReason('需求取消'); setPicking('abort') } }, '终止任务')
               : null),
+
+          // 改造06（CONTRACT-bots06 §3.1 / §3.3）：变更中心 —— 放在「可以做什么」之后
+          h(TaskEvolvePanel, { taskId: task.id, task, onChange }),
 
           // 高级：租约（原「续租」按钮，普通人看不懂，收进折叠并解释）
           h(Section, { title: '高级：租约', desc: '租约是「我先占着，别人别抢」的凭据。领取任务默认占 5 分钟，长任务需要隔一会儿点一次「延长」，否则会被自动释放回待办。' }),
@@ -1328,6 +1338,8 @@ window.__ModuleLoader__.load({
       const [saved, setSaved] = useState(null)
       const [copied, setCopied] = useState(null)
       const [jump, setJump] = useState(null)
+      // 改造06（CONTRACT-bots06 §3.2）：换负责人弹窗
+      const [reassignOpen, setReassignOpen] = useState(false)
 
       const brief = briefQ.data
       const anchor = brief?.anchor ?? {}
@@ -1443,7 +1455,13 @@ window.__ModuleLoader__.load({
           h('div', { className: 'csb-anchor-meta' },
             h('span', null, `边界：${writeScopes.length ? writeScopes.join('、') : '（未限定）'}`),
             h('span', null, `前置：${blockedBy.length ? blockedBy.join('、') : '（无）'}`),
-            h('span', null, `执行者：${hasOwner ? botName(bots, ownerId) : '未派活'}`))),
+            h('span', null,
+              `执行者：${hasOwner ? botName(bots, ownerId) : '未派活'}`,
+              h('button', {
+                className: 'csb-btn csb-btn-s',
+                style: { marginLeft: 8, height: 24, padding: '0 8px', fontSize: 11.5 },
+                onClick: () => setReassignOpen(true),
+              }, '换负责人')))),
 
         h('div', { className: 'csb-bar', style: { marginTop: 10 } },
           h('button', { className: 'csb-btn csb-btn-s', onClick: copyBrief }, '复制派发文案'),
@@ -1493,6 +1511,11 @@ window.__ModuleLoader__.load({
                     n.text ?? '',
                     h('span', { className: 'csb-set-d' }, `（${n.by ?? 'ui'}）`)))))),
 
+        // 改造06：换负责人弹窗（Bot 下拉 → POST /tasks/reassign）
+        reassignOpen
+          ? h(TaskReassignModal, { task, bots, onClose: () => setReassignOpen(false), onChange })
+          : null,
+
         jump
           ? h(Modal, {
               title: '去对话',
@@ -1514,6 +1537,292 @@ window.__ModuleLoader__.load({
               style: { padding: 10, background: 'var(--dsw-alias-bg-layer-2)', borderRadius: 8, wordBreak: 'break-all' },
             }, jump.id))
           : null)
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // 改造06：任务变更中心（契约 CONTRACT-bots06 §3）
+    //
+    // 用户原话：「完成的任务应该可以纠错或者优化或者更改或其他变更，变更成长任务」
+    //           「任务可以变更负责人」
+    //
+    // 设计铁律：
+    //   · **变更必须有理由**：note 必填（前端也拦，按钮禁用），没有理由的变更不进历史。
+    //   · **证据不能丢**：completed 任务 reopen 时内核会清空 artifacts —— 后端先把
+    //     「当时的样子」快照进 task-meta.jsonl，前端用 latestSnapshot 明确告诉用户
+    //     「上一轮交付物已存档，重开不会丢证据」。
+    //   · **已完成不是终点**：completed 时变更区默认展开、标题改成行动指引，
+    //     否则用户会以为只能新建任务（这正是用户这次提的问题）。
+    // ══════════════════════════════════════════════════════════════════════
+
+    /** 变更动作 → 人话（契约 §2.3 的 kind 全集）。 */
+    function evolveActionLabel(kind) {
+      switch (String(kind ?? '')) {
+        case 'snapshot': return '存档上一轮状态'
+        case 'reopen': return '重开'
+        case 'followup': return '派生优化单'
+        case 'longrun': return '转为长任务'
+        case 'reassign': return '换负责人'
+        default: return String(kind ?? '变更')
+      }
+    }
+
+    /**
+     * 一条变更记录 → `[时间] 动作 — 说明（by）`（契约 §3.1）。
+     * 快照记录没有 note：用「上一轮交付物 N 项」兜底，避免历史里出现空动作。
+     */
+    function evolveChangeText(ch) {
+      const label = evolveActionLabel(ch?.kind)
+      let note = typeof ch?.note === 'string' ? ch.note.trim() : ''
+      if (!note && ch?.kind === 'snapshot') {
+        const arts = Array.isArray(ch?.before?.artifacts) ? ch.before.artifacts : []
+        note = `上一轮交付物 ${arts.length} 项`
+      }
+      if (!note && ch?.kind === 'reassign') note = `${ch?.from ?? '?'} → ${ch?.to ?? '?'}`
+      const by = ch?.by ?? ch?.byId ?? 'ui'
+      return `[${fmt(ch?.at)}] ${label}${note ? ` — ${note}` : ''}（${by}）`
+    }
+
+    /** `POST /tasks/evolve`：三种 mode 的唯一入口（note 必填，前端先拦一次）。 */
+    async function postEvolve({ id, mode, note, reopen }) {
+      if (!id) throw new Error('缺少任务 ID，无法变更')
+      const text = String(note ?? '').trim()
+      if (!text) throw new Error('变更说明必填：没有理由的变更不许进历史')
+      if (text.length > 4000) throw new Error('变更说明最多 4000 字')
+      const body = { id, mode, note: text }
+      if (reopen === true) body.reopen = true
+      return call('/tasks/evolve', { method: 'POST', body })
+    }
+
+    /** `POST /tasks/reassign`：换负责人（expectedRev 走 CAS，防止覆盖别人的改动）。 */
+    async function postReassign({ id, ownerId, expectedRev }) {
+      if (!id) throw new Error('缺少任务 ID，无法换负责人')
+      if (!ownerId) throw new Error('请先选择新的负责人')
+      const body = { id, ownerId }
+      if (expectedRev !== undefined && expectedRev !== null) body.expectedRev = expectedRev
+      return call('/tasks/reassign', { method: 'POST', body })
+    }
+
+    /** 唤醒结果 → 接在换负责人成功文案后面（没唤醒就明说，不装成功）。 */
+    function reassignWakeText(wake) {
+      if (!wake) return '，本次没有请求唤醒'
+      return `；${wakeLabel(wake)}`
+    }
+
+    /**
+     * 变更历史 + 上一轮交付物存档 + 长任务阶段（纯展示：数据全部由 props 给，
+     * 便于在无 jsdom 的测试里直接断言文案）。
+     */
+    function EvolveHistory({ changes, latestSnapshot, longrun, loading, error }) {
+      const list = Array.isArray(changes) ? changes : []
+      const snap = latestSnapshot ?? null
+      const arts = Array.isArray(snap?.artifacts) ? snap.artifacts : []
+      const snapText = arts.map((a) => (typeof a === 'string' ? a : JSON.stringify(a))).join('、')
+      const phases = Array.isArray(longrun?.phases) ? longrun.phases : []
+      return h('div', null,
+        snap
+          ? h('div', { className: 'csb-evolve-snap' },
+              `上一轮交付物：${snapText || '（当时没有交付物记录）'}（已存档，重开不会丢证据）`,
+              snap.status ? h('span', null, ` · 存档时状态：${snap.status}`) : null,
+              snap.completedAt ? h('span', null, ` · 完成于：${fmt(snap.completedAt)}`) : null)
+          : null,
+        phases.length
+          ? h('div', { className: 'csb-evolve-snap' },
+              `长任务阶段：${phases.map((p, i) => `${i + 1}. ${p}`).join('；')}`)
+          : null,
+        h(Section, {
+          title: `变更历史（${list.length} 条，按时间从早到晚）`,
+          desc: '每次重开 / 派生 / 转长任务 / 换负责人都会记在这里，含变更说明。',
+        }),
+        error ? h('div', { className: 'csb-note' }, `变更历史读取失败：${error}`) : null,
+        loading ? h(Skeleton, { n: 1 }) : null,
+        list.length === 0
+          ? h('div', { className: 'csb-set-d', style: { marginTop: 8 } },
+              '还没有变更记录。第一次重开 / 派生 / 转长任务后，这里会留下存档与理由。')
+          : h('div', { className: 'csb-list', style: { marginTop: 10 } },
+              list.map((ch, i) =>
+                h('div', { key: ch?.at ?? i, className: 'csb-card csb-chg' },
+                  h('div', { className: 'csb-card-main csb-chg-t' }, evolveChangeText(ch))))))
+    }
+
+    /**
+     * 任务详情 ·「变更」区块（契约 §3.1 / §3.3）。
+     *
+     * 位置在「可以做什么」之后；`status === 'completed'` 时**默认展开**，
+     * 标题改成行动指引 —— 已完成 ≠ 不能改。
+     */
+    function TaskEvolvePanel({ taskId, task, onChange }) {
+      const changesQ = useApi(`/tasks/changes?id=${encodeURIComponent(taskId)}`, [taskId])
+      const [note, setNote] = useState('')
+      const [busy, setBusy] = useState(null) // 'reopen' | 'followup' | 'longrun'
+      const [err, setErr] = useState(null)
+      const [result, setResult] = useState(null)
+      const completed = task?.status === 'completed'
+      // 已完成任务默认展开（用户看到完成就以为没救了 —— 这里必须先把入口摆出来）
+      const [open, setOpen] = useState(completed)
+
+      const changes = changesQ.data?.changes ?? []
+      const latestSnapshot = changesQ.data?.latestSnapshot ?? null
+      const longrun = changesQ.data?.longrun ?? null
+
+      const run = async (mode) => {
+        const text = note.trim()
+        if (!text || busy) return
+        setBusy(mode)
+        setErr(null)
+        setResult(null)
+        try {
+          const d = await postEvolve({ id: taskId, mode, note: text, reopen: mode === 'longrun' })
+          if (mode === 'followup') {
+            const newId = d?.task?.id ?? d?.newTaskId ?? '新任务'
+            setResult(`已派生 ${newId}`)
+          } else if (mode === 'longrun') {
+            setResult(d?.note ?? '已标记为长任务；后续每次唤醒都会带上阶段清单')
+          } else {
+            setResult(d?.note ?? '已重开；上一轮交付物已存档，见变更历史')
+          }
+          setNote('')
+          changesQ.reload()
+          onChange?.()
+        } catch (e) {
+          setErr(`变更失败：${e.message}`)
+        } finally {
+          setBusy(null)
+        }
+      }
+
+      const disabled = Boolean(busy) || !note.trim()
+
+      const openBody = h('div', { style: { marginTop: 10 } },
+        h('div', { className: 'csb-fld' },
+          h('label', null, '变更说明（必填）'),
+          h('textarea', {
+            className: 'csb-ta',
+            placeholder: '例如：第 3 条验收标准未满足，接口漏了限流…',
+            value: note,
+            onChange: (e) => setNote(e.target.value),
+          }),
+          h('div', { className: 'csb-fld-h' },
+            '写清「为什么改」，它会进变更历史。没有说明的变更不许提交。')),
+        h('div', { className: 'csb-bar' },
+          h('button', {
+            className: 'csb-btn csb-btn-p',
+            disabled,
+            onClick: () => run('reopen'),
+          }, busy === 'reopen' ? '重开中…' : '重开（纠错/继续做）'),
+          h('button', {
+            className: 'csb-btn',
+            disabled,
+            onClick: () => run('followup'),
+          }, busy === 'followup' ? '派生中…' : '派生优化单'),
+          h('button', {
+            className: 'csb-btn',
+            disabled,
+            onClick: () => run('longrun'),
+          }, busy === 'longrun' ? '标记中…' : '转为长任务')),
+        err ? h('div', { className: 'csb-err' }, err) : null,
+        result ? h(Notice, { kind: 'ok', onClose: () => setResult(null) }, result) : null,
+        h(EvolveHistory, {
+          changes,
+          latestSnapshot,
+          longrun,
+          loading: changesQ.loading,
+          error: changesQ.error,
+        }))
+
+      return h('div', null,
+        h(Section, {
+          // 契约 §3.3：「已完成 · 要纠错/优化/变更从这里开始」放在「可以做什么」区
+          // （见 TaskDrawer），这里是紧接着的变更操作区，标题不重复。
+          title: completed ? '变更 · 已完成的任务可以继续改' : '变更（纠错 / 优化 / 转长任务）',
+          desc: completed
+            ? '这个任务已经完成，但随时可以改：重开接着做、派生一张优化单、或转成长任务。变更说明必填。'
+            : '要纠错、优化、或把它变成长任务？写清理由再选一种变更方式。变更说明必填。',
+        }),
+        h('div', { className: 'csb-evolve' },
+          h('div', { className: 'csb-evolve-head' },
+            h('h4', null, completed ? '已完成任务可以继续改' : '变更操作'),
+            h('button', {
+              className: 'csb-btn csb-btn-s',
+              onClick: () => setOpen((v) => !v),
+            }, open ? '收起变更面板' : '展开变更面板')),
+          open
+            ? openBody
+            : h('div', { className: 'csb-set-d', style: { marginTop: 8 } },
+                '变更面板已收起。点「展开变更面板」可以重开 / 派生优化单 / 转长任务。')))
+    }
+
+    /**
+     * 「换负责人」弹窗（契约 §3.2）。
+     *
+     * 已完成任务会被后端拦（`TASK_COMPLETED`）——这里不隐藏按钮，而是把
+     * 「改走重开 / 派生优化单」的可操作提示显示出来，否则用户只会看到一句报错。
+     */
+    function TaskReassignModal({ task, bots, onClose, onChange }) {
+      const [ownerId, setOwnerId] = useState('')
+      const [busy, setBusy] = useState(false)
+      const [err, setErr] = useState(null)
+      const [done, setDone] = useState(null)
+      // GET /roster 默认不含 retired，这里再过滤一次：退役 Bot 不可被指派
+      const liveBots = (Array.isArray(bots) ? bots : []).filter((b) => b && b.state !== 'retired')
+      const current = task?.ownerId ?? task?.assignee ?? null
+
+      const submit = async () => {
+        if (!ownerId || busy) return
+        setBusy(true)
+        setErr(null)
+        setDone(null)
+        try {
+          const d = await postReassign({ id: task?.id, ownerId, expectedRev: task?.rev })
+          const fromName = current ? botName(liveBots.length ? liveBots : bots, current) : '未派人'
+          const toName = botName(liveBots, d?.to ?? ownerId)
+          setDone(`已从 ${fromName} 换到 ${toName}${reassignWakeText(d?.wake)}`)
+          onChange?.()
+        } catch (e) {
+          if (e?.code === 'TASK_COMPLETED') {
+            setErr('任务已完成，不能直接换负责人。'
+              + '请先用下方「变更」区的「重开（纠错/继续做）」或「派生优化单」，再换负责人。'
+              + `（后端说明：${e.message}）`)
+          } else {
+            setErr(`换负责人失败：${e.message}`)
+          }
+        } finally {
+          setBusy(false)
+        }
+      }
+
+      return h(Modal, {
+        title: '换负责人',
+        onClose,
+        footer: [
+          h('button', { key: 'c', className: 'csb-btn', onClick: onClose }, '关闭'),
+          h('button', {
+            key: 'o',
+            className: 'csb-btn csb-btn-p',
+            disabled: busy || !ownerId,
+            onClick: submit,
+          }, busy ? '变更中…' : '确认换人'),
+        ],
+      },
+        h('div', { className: 'csb-field-l' },
+          `当前负责人：${current ? botName(liveBots.length ? liveBots : bots, current) : '还没人领'}`),
+        h('div', { className: 'csb-fld', style: { marginTop: 10 } },
+          h('label', null, '新负责人'),
+          liveBots.length === 0
+            ? h('div', { className: 'csb-set-d' }, '还没有可指派的 Bot（退役的不算）。去「Bot」页先建一个。')
+            : h('select', {
+                className: 'csb-sel',
+                style: { width: '100%' },
+                value: ownerId,
+                onChange: (e) => setOwnerId(e.target.value),
+              },
+                h('option', { value: '' }, '请选择 Bot'),
+                liveBots.map((b) => h('option', { key: b.id ?? b.sessionId, value: b.sessionId ?? b.id },
+                  `${b.name ?? '(无名)'}${b.state ? ` · ${b.state}` : ''}`))),
+          h('div', { className: 'csb-fld-h' },
+            '换人会先把原负责人的租约交还，再以新负责人身份领取，并唤醒新负责人。'
+            + '已完成的任务会被拦 —— 先重开或派生优化单。')),
+        err ? h('div', { className: 'csb-err', style: { marginTop: 10 } }, err) : null,
+        done ? h(Notice, { kind: 'ok' }, done) : null)
     }
 
     /** Bot 页「派任务」：建任务 → 立即指派 → 显示唤醒结果（契约 §3.1）。 */
@@ -5395,6 +5704,15 @@ window.__ModuleLoader__.load({
     exports.reviveSession = reviveSession
     exports.reviveResultText = reviveResultText
     exports.reviveAllText = reviveAllText
+    // 改造06（CONTRACT-bots06 §3）：任务变更中心 / 换负责人
+    exports.TaskEvolvePanel = TaskEvolvePanel
+    exports.TaskReassignModal = TaskReassignModal
+    exports.EvolveHistory = EvolveHistory
+    exports.postEvolve = postEvolve
+    exports.postReassign = postReassign
+    exports.evolveActionLabel = evolveActionLabel
+    exports.evolveChangeText = evolveChangeText
+    exports.reassignWakeText = reassignWakeText
     exports.PANEL_ID = PANEL_ID
     exports.API = API
 

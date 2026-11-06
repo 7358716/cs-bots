@@ -13,6 +13,72 @@
 
 ---
 
+## [0.7.0] - 2026-11-06
+
+「任务可以改」版。一句话：**已完成不是终点**——可以纠错、优化、变更、换负责人，
+还能把任务转成「长任务」（带阶段清单，每次唤醒都带上，防跑偏）。
+
+### Added
+
+- **任务变更中心（`POST /tasks/evolve` + `GET /tasks/changes`）**
+  三种变更方式，都要求填「变更说明」（**没有理由的变更不许进历史**）：
+
+  | 模式 | 语义 | 关键设计 |
+  |---|---|---|
+  | `reopen` | 纠错 / 继续做 | **重开前先把「当时的样子」快照进 `task-meta.jsonl`** |
+  | `followup` | 优化 / 修复单（原任务保持已完成） | 幂等键 `evolve:<id>:<note的sha1>` |
+  | `longrun` | 转成长任务（可带阶段 + 可选重开） | 阶段清单注入锚定文案 |
+
+  为什么必须快照：内核 `board.reopen` 会**清掉 `artifacts`/`acceptance`/`completedAt`**。
+  这是内核行为（`board.js` 冻结不能改），但「上一轮交付了什么」是纠错和优化的唯一判据，
+  所以变更前先存档，`GET /tasks/changes` 返回 `latestSnapshot` 给页面显示
+  「上一轮交付物：…（已存档，重开不会丢证据）」。
+
+  为什么 followup 幂等键用 note 的 sha1 而不是 `task.rev`：同一个理由连点两次应该只建一张；
+  但**不同**理由是不同的诉求，必须各建一张 —— 用 rev 会让第二次派生静默命中第一张，
+  用户看不到自己新写的理由。
+
+- **换负责人（`POST /tasks/reassign`）**
+  为什么不能复用 `/tasks/assign`：`board.claim` 会拦三种情况——租约被他人持有、
+  任务已完成、WIP 超限。换负责人必须**先以原持有者身份 release** 再 claim。
+  已完成的换人会返回 `code:"TASK_COMPLETED"` 并提示「先重开或派生优化单」，
+  而不是把 `BOARD_ALREADY_COMPLETED` 原样丢给用户。
+
+- **长任务阶段清单进锚定文案**
+  `buildTaskAnchorText` 在有 `longrun` 记录时插入：
+  ```
+  阶段（长任务，按序推进，不得跳步）：
+  1. <phase1>
+  2. <phase2>
+  ```
+  没有 longrun 记录时输出**逐字不变**（既有逐行文案断言继续通过）。
+  这样「转长任务」不是贴个标签，而是**真的改变了每次唤醒带给 Bot 的内容**。
+
+### Fixed
+
+- **「去对话」报「该负责人不是本平台的 Bot…定位 ui」**
+  `ownerId` 是**租约持有者**（人会自己 claim 成 `ui`，验收时也会被覆盖），
+  「这活原本派给谁」记在 `assignee`。旧实现只看 `ownerId` → 拿 `ui` 去 roster 找 →
+  必然找不到 → 报一句无解的错误，让用户以为任务没派出去。
+  现在按 `assignee → ownerId → task.ownerId` 解析，并过滤 `ui/user/anyone/system`
+  这类平台伪身份；找不到时也只说「可能已退役/外部会话」，不再糊一句无解。
+
+### Tests
+
+- `test/api-evolve.test.mjs`（15）：三模式 + 快照 + followup 幂等 + 前缀规则 +
+  reassign 的已完成/WIP/租约交还 + longrun 文案（有/无的差异）
+- `test/client-evolve.test.mjs`（16）：变更区三按钮与历史、换负责人弹窗、完成态默认展开
+- `test/client-goto.test.mjs`（8）：负责人解析回归（含用户实测的 `ownerId=ui` + `assignee=bot` 场景）
+- 基线：786 → **825**，全部通过（exit 0）；ci-zero-dep PASS
+
+### Docs
+
+- `design/CONTRACT-bots06.md`（任务变更中心契约）
+- `design/大团队-可行性调研-v1.md`（多 Lead 组织层调研：结论是做成「组织层」而不是「引擎」，
+  三档方案 + 两个必须先解决的风险）
+
+---
+
 ## [0.6.1] - 2026-11-06
 
 修「创建任务指派 Bot 报错」。一句话：**不是派活逻辑坏了，是重启后 Bot 会话没被加载**，
