@@ -294,6 +294,22 @@ window.__ModuleLoader__.load({
   border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-base)}
 .csb-step-n{width:22px;height:22px;border-radius:50%;flex:none;display:flex;align-items:center;justify-content:center;
   font-size:11px;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-secondary)}
+
+/* 看板视图 */
+.csb-kanban{display:flex;gap:12px;overflow-x:auto;padding-bottom:8px}
+.csb-kanban-col{flex:1 1 240px;min-width:220px;display:flex;flex-direction:column;
+  border:1px solid var(--dsw-alias-border-l1);border-radius:14px;background:var(--dsw-alias-bg-layer-1)}
+.csb-kanban-col-h{flex:none;display:flex;align-items:center;gap:7px;padding:10px 12px;
+  font-size:12.5px;font-weight:600}
+.csb-kanban-body{flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:8px;padding:8px}
+.csb-kanban-card{display:block;padding:10px 11px;border-radius:10px;border:1px solid var(--dsw-alias-border-l1);
+  background:var(--dsw-alias-bg-base);cursor:pointer}
+.csb-kanban-card:hover{border-color:var(--dsw-alias-brand-primary);background:var(--dsw-alias-bg-layer-2)}
+.csb-kanban-t{font-size:12.5px;font-weight:500;line-height:1.4;margin-bottom:5px;word-break:break-word}
+.csb-kanban-m{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--dsw-alias-label-secondary);margin-top:5px}
+
+/* @提及高亮 */
+.csb-at{color:var(--dsw-alias-label-primary);font-weight:600}
 `
 
     function installStyles() {
@@ -341,8 +357,14 @@ window.__ModuleLoader__.load({
     }
 
     function useApi(path, deps) {
-      const [state, setState] = useState({ loading: true, data: null, error: null })
+      // path 为 null ⇒ 空转（不请求）。给「条件加载」用：
+      // 例如数据页没选文件时不该去请求 `/data/rows?name=null`。
+      const [state, setState] = useState({ loading: path != null, data: null, error: null })
       const reload = useCallback(() => {
+        if (path === null || path === undefined) {
+          setState({ loading: false, data: null, error: null })
+          return () => {}
+        }
         let alive = true
         setState((s) => ({ ...s, loading: true, error: null }))
         call(path)
@@ -613,6 +635,28 @@ window.__ModuleLoader__.load({
     }
     const short = (s, n) => (typeof s === 'string' && s.length > (n ?? 14) ? `${s.slice(0, n ?? 14)}…` : String(s ?? '—'))
 
+    /**
+     * 把文本里的 `@名字` 拆成 React 节点高亮显示。
+     * 正则：`/@([\w一-龥-]+)/g` —— 支持中英文、数字、下划线、连字符。
+     * 不用 dangerouslySetInnerHTML：我们只做文本节点拆分，不注入 HTML。
+     */
+    const AT_RE = /@([\w一-龥-]+)/g
+    function renderAt(text) {
+      const s = String(text ?? '')
+      const parts = []
+      let last = 0
+      let m
+      AT_RE.lastIndex = 0
+      let i = 0
+      while ((m = AT_RE.exec(s)) !== null) {
+        if (m.index > last) parts.push(s.slice(last, m.index))
+        parts.push(h('span', { key: `a${i++}`, className: 'csb-at' }, `@${m[1]}`))
+        last = m.index + m[0].length
+      }
+      if (last < s.length) parts.push(s.slice(last))
+      return parts
+    }
+
     // ── 目录选择器（自建，替代宿主原生 picker）──────────────────────────────
 
     /**
@@ -794,6 +838,12 @@ window.__ModuleLoader__.load({
       const [picking, setPicking] = useState(null) // 'complete' | 'abort'
       const [artifacts, setArtifacts] = useState('')
       const [abortReason, setAbortReason] = useState('需求取消')
+      // 进度编辑
+      const [progressVal, setProgressVal] = useState('')
+      // 依赖链
+      const [graph, setGraph] = useState(null)
+      const [graphLoading, setGraphLoading] = useState(false)
+      const [graphError, setGraphError] = useState(null)
       const task = data?.task
       const history = data?.history ?? []
       // 「下一步」按钮的落点（spec §8）
@@ -816,6 +866,30 @@ window.__ModuleLoader__.load({
       }
       const upd = (action, extra) =>
         call('/tasks/update', { method: 'POST', body: { id: task.id, expectedRev: task.rev, action, ...(extra ?? {}) } })
+
+      // 加载依赖链（上游 blockedBy 递归 + 下游 dependents）
+      useEffect(() => {
+        if (!task) return
+        let alive = true
+        setGraph(null)
+        setGraphError(null)
+        setGraphLoading(true)
+        call(`/tasks/graph?id=${encodeURIComponent(task.id)}`)
+          .then((d) => { if (alive) setGraph(d) })
+          .catch((e) => { if (alive) setGraphError(e.message) })
+          .finally(() => { if (alive) setGraphLoading(false) })
+        return () => { alive = false }
+      }, [task?.id])
+
+      const saveProgress = async () => {
+        const v = Number(progressVal)
+        if (Number.isNaN(v) || v < 0 || v > 100) {
+          setErr('进度必须是 0-100 的数字')
+          return
+        }
+        await act(() => upd('edit', { progress: v }), '保存进度')
+        setProgressVal('')
+      }
 
       return h(Drawer, { title: task?.subject ?? id, onClose },
         loading ? h(Skeleton, { n: 2 }) : null,
@@ -861,6 +935,35 @@ window.__ModuleLoader__.load({
                 h('button', { className: 'csb-btn csb-btn-s', onClick: () => act(() => upd('heartbeat'), '延长') }, '延长 5 分钟'))
             : h('div', { className: 'csb-set-d', style: { marginTop: 10 } }, '任务不在进行中，没有租约。'),
 
+          // 进度编辑
+          h(Section, { title: '更新进度', desc: `当前 ${task.progress ?? 0}%。填入 0-100 的数字并保存（走 CAS，别人刚改过会提示刷新）。` }),
+          h('div', { className: 'csb-bar', style: { marginTop: 10 } },
+            h('input', {
+              className: 'csb-in', style: { width: 100 }, type: 'number', min: 0, max: 100,
+              placeholder: '0-100', value: progressVal,
+              onChange: (e) => setProgressVal(e.target.value),
+              onKeyDown: (e) => e.key === 'Enter' && saveProgress(),
+            }),
+            h('button', { className: 'csb-btn csb-btn-p', disabled: progressVal === '', onClick: saveProgress }, '保存进度')),
+
+          // 依赖链
+          h(Section, { title: '依赖链', desc: '上游 = 完成前必须先做的；下游 = 等着这个任务完成的。' }),
+          graphLoading ? h(Skeleton, { n: 1 }) : null,
+          graphError ? h('div', { className: 'csb-err' }, graphError) : null,
+          graph
+            ? h(DepGraph, { graph, currentId: task.id })
+            : null,
+
+          // 成果展示
+          h(Section, { title: '产出物证据', desc: '任务完成时要带上「做了什么」的凭据（文件路径 / 链接）。' }),
+          (task.artifacts ?? []).length === 0
+            ? h(Empty, { icon: '◈', title: '还没有产出物证据', hint: '任务完成并带上产出物证据后会出现在这里' })
+            : h('div', { className: 'csb-list', style: { marginTop: 10 } },
+                (task.artifacts ?? []).map((a, i) =>
+                  h('div', { key: i, className: 'csb-card', style: { padding: '9px 12px' } },
+                    h('div', { className: 'csb-card-main' },
+                      h('div', { className: 'csb-card-t csb-mono' }, typeof a === 'string' ? a : JSON.stringify(a)))))),
+
           h(Section, { title: '审计流', desc: `共 ${history.length} 条，最新在前` }),
           history.length === 0
             ? h(Empty, { title: '还没有操作记录' })
@@ -895,6 +998,78 @@ window.__ModuleLoader__.load({
           : null)
     }
 
+    /**
+     * 依赖链树状展示。
+     *
+     * 后端 `GET /tasks/graph?id=` 返回闭包：`nodes[]` + `edges[]`，
+     * 边语义是 **`from` 依赖 `to`**（from 的 blockedBy 含 to）。
+     *
+     *  · 上游：从当前任务出发，沿 from=当前 → to 递归（blockedBy 递归）
+     *  · 下游：反向，找 from 指向当前任务的那些，再递归
+     *
+     * 用 depth 缩进做树状文本；`seen` 集合防环（后端会忽略悬空，但环要前端防）。
+     */
+    function DepGraph({ graph, currentId }) {
+      const nodes = graph?.nodes ?? []
+      const edges = graph?.edges ?? []
+      const byId = new Map(nodes.map((n) => [n.id, n]))
+      const upOf = new Map()   // id → 它依赖的 id 列表
+      const downOf = new Map() // id → 依赖它的 id 列表
+      for (const e of edges) {
+        if (!upOf.has(e.from)) upOf.set(e.from, [])
+        upOf.get(e.from).push(e.to)
+        if (!downOf.has(e.to)) downOf.set(e.to, [])
+        downOf.get(e.to).push(e.from)
+      }
+      const walk = (id, dir, depth, seen, out) => {
+        if (depth > 12 || seen.has(id)) return
+        seen.add(id)
+        const n = byId.get(id)
+        if (!n) return
+        out.push({ id, node: n, depth, dir })
+        const next = (dir === 'up' ? upOf : downOf).get(id) ?? []
+        for (const nid of next) walk(nid, dir, depth + 1, seen, out)
+      }
+      const upRoots = (upOf.get(currentId) ?? []).slice()
+      const downRoots = (downOf.get(currentId) ?? []).slice()
+      const ups = []
+      const downs = []
+      const seenUp = new Set([currentId])
+      const seenDown = new Set([currentId])
+      for (const r of upRoots) walk(r, 'up', 1, seenUp, ups)
+      for (const r of downRoots) walk(r, 'down', 1, seenDown, downs)
+      const row = (it) => h('div', {
+        key: `${it.dir}:${it.id}:${it.depth}`,
+        className: 'csb-set-d',
+        style: { paddingLeft: (it.depth - 1) * 16, lineHeight: 1.9 },
+      },
+        h('span', { className: 'csb-mono' }, `${'└ '.repeat(0)}${it.depth > 1 ? '↳ ' : ''}${it.id}`),
+        h('span', null, ' · '),
+        h('span', { style: { color: 'var(--dsw-alias-label-primary)' } }, it.node.subject ?? '(无标题)'),
+        h('span', null, ' · '),
+        h(Badge, { status: it.node.status }),
+        it.node.progress !== undefined ? h('span', null, ` · ${it.node.progress}%`) : null)
+      const total = ups.length + downs.length
+      if (!nodes.length) {
+        return h('div', { className: 'csb-note', style: { marginTop: 10 } }, '没有依赖关系。')
+      }
+      return h('div', { style: { marginTop: 10 } },
+        total === 0
+          ? h('div', { className: 'csb-note' }, '这个任务没有上游也没有下游（孤立节点）。')
+          : null,
+        ups.length
+          ? h('div', null,
+              h('div', { className: 'csb-field-l', style: { marginBottom: 4 } }, `↑ 上游（必须先完成）${ups.length} 个`),
+              ups.map(row))
+          : null,
+        downs.length
+          ? h('div', { style: { marginTop: 10 } },
+              h('div', { className: 'csb-field-l', style: { marginBottom: 4 } }, `↓ 下游（等这个完成）${downs.length} 个`),
+              downs.map(row))
+          : null,
+        graph?.note ? h('div', { className: 'csb-field-h', style: { marginTop: 8 } }, graph.note) : null)
+    }
+
     function botName(bots, sessionId) {
       const b = (bots ?? []).find((x) => x.sessionId === sessionId)
       return b ? b.name : short(sessionId, 16)
@@ -903,11 +1078,20 @@ window.__ModuleLoader__.load({
     function TasksTab() {
       const [filter, setFilter] = useState('')
       const [subject, setSubject] = useState('')
+      const [desc, setDesc] = useState('')
+      const [priority, setPriority] = useState('')
+      const [assignee, setAssignee] = useState('')
+      const [showAdv, setShowAdv] = useState(false)
       const [openId, setOpenId] = useState(null)
       const [busy, setBusy] = useState(false)
       const [err, setErr] = useState(null)
       // 默认只看「需要我管的」；点「看全部」才显示 AI 派发的和已完成的
       const [attentionOnly, setAttentionOnly] = useState(true)
+      // 双视图：看板 / 列表
+      const [view, setView] = useState('list')
+      // 本地过滤：负责人 / 关键词（不改后端 query）
+      const [ownerFilter, setOwnerFilter] = useState('')
+      const [keyword, setKeyword] = useState('')
       const subjectRef = useRef(null)
       const q = new URLSearchParams()
       if (filter) q.set('status', filter)
@@ -919,6 +1103,17 @@ window.__ModuleLoader__.load({
       const bots = rosterData?.bots ?? []
       const workflows = wfData?.workflows ?? []
       const tasks = data?.tasks ?? []
+      // 本地过滤（不改后端 query）：负责人 + 关键词（subject/description 子串，大小写不敏感）
+      const kw = keyword.trim().toLowerCase()
+      const filtered = tasks.filter((t) => {
+        if (ownerFilter && t.ownerId !== ownerFilter) return false
+        if (kw) {
+          const inSubj = (t.subject ?? '').toLowerCase().includes(kw)
+          const inDesc = (t.description ?? '').toLowerCase().includes(kw)
+          if (!inSubj && !inDesc) return false
+        }
+        return true
+      })
 
       // 「下一步」按钮的落点（spec §8）：按错误码给可执行动作
       const errActions = {
@@ -937,8 +1132,16 @@ window.__ModuleLoader__.load({
         setBusy(true)
         setErr(null)
         try {
-          await call('/tasks', { method: 'POST', body: { subject: s } })
+          const body = { subject: s }
+          if (desc.trim()) body.description = desc.trim()
+          if (priority !== '') body.priority = Number(priority)
+          if (assignee) body.assignee = assignee
+          await call('/tasks', { method: 'POST', body })
           setSubject('')
+          setDesc('')
+          setPriority('')
+          setAssignee('')
+          setShowAdv(false)
           reload()
         } catch (e) {
           setErr(humanizeError(e, errActions))
@@ -977,6 +1180,7 @@ window.__ModuleLoader__.load({
             onKeyDown: (e) => e.key === 'Enter' && create(),
             ref: subjectRef,
           }),
+          h('button', { className: 'csb-btn csb-btn-s', onClick: () => setShowAdv((v) => !v) }, showAdv ? '收起' : '更多字段'),
           h('button', { className: 'csb-btn csb-btn-p', disabled: busy || !subject.trim(), onClick: create }, '创建任务'),
           h('select', { className: 'csb-sel', style: { width: 116 }, value: filter, onChange: (e) => setFilter(e.target.value) },
             h('option', { value: '' }, '全部状态'),
@@ -984,30 +1188,92 @@ window.__ModuleLoader__.load({
             h('option', { value: 'in_progress' }, '进行中'),
             h('option', { value: 'completed' }, '已完成'),
             h('option', { value: 'blocked' }, '已终止'))),
+        showAdv
+          ? h('div', { className: 'csb-bar', style: { marginTop: 8, flexWrap: 'wrap' } },
+              h('input', {
+                className: 'csb-in csb-grow', placeholder: '任务描述（目标/标准）',
+                value: desc, onChange: (e) => setDesc(e.target.value),
+              }),
+              h('input', {
+                className: 'csb-in', style: { width: 90 }, type: 'number', placeholder: '优先级',
+                value: priority, onChange: (e) => setPriority(e.target.value),
+              }),
+              h('select', { className: 'csb-sel', style: { width: 160 }, value: assignee, onChange: (e) => setAssignee(e.target.value) },
+                h('option', { value: '' }, '负责人（自动）'),
+                bots.map((b) => h('option', { key: b.id, value: b.sessionId }, b.name))))
+          : null,
+        h('div', { className: 'csb-bar', style: { marginTop: 8, flexWrap: 'wrap' } },
+          h('button', {
+            className: `csb-btn csb-btn-s${view === 'kanban' ? ' csb-btn-p' : ''}`,
+            onClick: () => setView('kanban'),
+          }, '看板视图'),
+          h('button', {
+            className: `csb-btn csb-btn-s${view === 'list' ? ' csb-btn-p' : ''}`,
+            onClick: () => setView('list'),
+          }, '列表视图'),
+          h('input', {
+            className: 'csb-in csb-grow', placeholder: '搜索任务（标题或描述）…',
+            value: keyword, onChange: (e) => setKeyword(e.target.value),
+          }),
+          h('select', { className: 'csb-sel', style: { width: 140 }, value: ownerFilter, onChange: (e) => setOwnerFilter(e.target.value) },
+            h('option', { value: '' }, '全部负责人'),
+            bots.map((b) => h('option', { key: b.id, value: b.sessionId }, b.name)))),
         err ? h(ErrBox, { humanized: err, onAction: (c) => errActions[c]?.() }) : null,
         error ? h('div', { className: 'csb-err' }, error) : null,
         loading ? h(Skeleton, { n: 3 }) : null,
-        !loading && !error && tasks.length === 0
+        !loading && !error && filtered.length === 0
           ? h(Empty, {
               icon: '◫', title: '还没有任务',
               hint: '在上面输入一句话就能建任务。建好后可以指派给某个 Bot，也可以自己领取来做。',
               action: { label: '新建任务', icon: '✎', onClick: () => subjectRef.current?.focus() },
             })
           : null,
-        h('div', { className: 'csb-list' }, tasks.map((t) =>
-          h('div', { key: t.id, className: 'csb-card csb-card-c', onClick: () => setOpenId(t.id) },
-            h(Dot, { status: t.status }),
-            h('div', { className: 'csb-card-main' },
-              h('div', { className: 'csb-card-t' }, t.subject),
-              h('div', { className: 'csb-card-m' },
-                h(Badge, { status: t.status }),
-                h('span', null, t.ownerId ? `由 ${botName(bots, t.ownerId)} 负责` : '还没人领'),
-                (t.blockedBy ?? []).length ? h('span', null, ` · 等 ${t.blockedBy.length} 个前置任务`) : null,
-                h('span', null, ` · 第 ${t.rev} 版`))),
-            h('div', { style: { display: 'flex', gap: 6, flex: 'none' }, onClick: (e) => e.stopPropagation() },
-              t.status === 'pending'
-                ? h('button', { className: 'csb-btn csb-btn-s', disabled: busy, onClick: () => quick(t, 'claim') }, '我来管')
-                : null)))),
+        // 列表视图（保留原有卡片列表）
+        !loading && !error && view === 'list'
+          ? h('div', { className: 'csb-list' }, filtered.map((t) =>
+              h('div', { key: t.id, className: 'csb-card csb-card-c', onClick: () => setOpenId(t.id) },
+                h(Dot, { status: t.status }),
+                h('div', { className: 'csb-card-main' },
+                  h('div', { className: 'csb-card-t' }, t.subject),
+                  h('div', { className: 'csb-card-m' },
+                    h(Badge, { status: t.status }),
+                    h('span', null, t.ownerId ? `由 ${botName(bots, t.ownerId)} 负责` : '还没人领'),
+                    (t.blockedBy ?? []).length ? h('span', null, ` · 等 ${t.blockedBy.length} 个前置任务`) : null,
+                    h('span', null, ` · 第 ${t.rev} 版`))),
+                h('div', { style: { display: 'flex', gap: 6, flex: 'none' }, onClick: (e) => e.stopPropagation() },
+                  t.status === 'pending'
+                    ? h('button', { className: 'csb-btn csb-btn-s', disabled: busy, onClick: () => quick(t, 'claim') }, '我来管')
+                    : null))))
+          : null,
+        // 看板视图
+        !loading && !error && view === 'kanban'
+          ? h('div', { className: 'csb-kanban' },
+              [
+                { key: 'pending', label: '待办', cls: 'csb-b' },
+                { key: 'in_progress', label: '进行中', cls: 'csb-b csb-b-run' },
+                { key: 'completed', label: '已完成', cls: 'csb-b csb-b-ok' },
+                { key: 'blocked', label: '已终止', cls: 'csb-b csb-b-err' },
+              ].map((col) => {
+                const colTasks = filtered.filter((t) => t.status === col.key)
+                return h('div', { key: col.key, className: 'csb-kanban-col' },
+                  h('div', { className: 'csb-kanban-col-h' },
+                    h('span', { className: col.cls }, col.label),
+                    h('span', { className: 'csb-set-d' }, `${colTasks.length} 个`)),
+                  h('div', { className: 'csb-kanban-body' },
+                    colTasks.length === 0
+                      ? h('div', { className: 'csb-set-d', style: { padding: '8px 4px', fontSize: 11.5 } }, '空')
+                      : colTasks.map((t) => {
+                          return h('div', { key: t.id, className: 'csb-kanban-card', onClick: () => setOpenId(t.id) },
+                            h('div', { className: 'csb-kanban-t' }, t.subject),
+                            h('div', { className: 'csb-progress' },
+                              h('div', { className: 'csb-progress-fill', style: { width: `${Math.max(0, Math.min(100, t.progress ?? 0))}%` } })),
+                            h('div', { className: 'csb-kanban-m' },
+                              h('span', null, t.ownerId ? botName(bots, t.ownerId) : '还没人领'),
+                              h('span', null, `· 优先级 ${t.priority ?? 0}`),
+                              (t.blockedBy ?? []).length ? h('span', null, `· 前置 ${t.blockedBy.length}`) : null))
+                        })))
+              }))
+          : null,
         openId ? h(TaskDrawer, { id: openId, bots, workflows, onClose: () => setOpenId(null), onChange: reload }) : null)
     }
 
@@ -2092,6 +2358,9 @@ window.__ModuleLoader__.load({
       const [editing, setEditing] = useState(null)
       const [confirmDel, setConfirmDel] = useState(null)
       const [showBody, setShowBody] = useState(null)
+      // 历史分页：前端切片（后端 sinceSeq 是「向后取」，不是「向前取」，
+      // 所以先用全量、前端只渲染末尾 shownCount 条，点「加载更早」递增）
+      const [shownCount, setShownCount] = useState(50)
       const endRef = useRef(null)
       const roomNameRef = useRef(null)
 
@@ -2106,7 +2375,10 @@ window.__ModuleLoader__.load({
           .catch((e) => setErr(e.message))
       }, [])
       useEffect(() => {
-        if (active) loadMsgs(active)
+        if (active) {
+          setShownCount(50)
+          loadMsgs(active)
+        }
       }, [active, loadMsgs])
       useEffect(() => {
         endRef.current?.scrollIntoView?.({ block: 'end' })
@@ -2228,13 +2500,21 @@ window.__ModuleLoader__.load({
               h('div', { className: 'csb-room-chat' },
                 h(Section, {
                   title: `消息 · ${current.name}`,
-                  desc: `${msgs.length} 条全部显示。发帖者必须是成员；你是超级管理员，可以直接看全部内容。`,
+                  desc: `共 ${msgs.length} 条，当前显示最近 ${Math.min(shownCount, msgs.length)} 条。发帖者必须是成员；你是超级管理员，可以直接看全部内容。`,
                 }),
                 current.purpose ? h('div', { className: 'csb-note', style: { marginTop: 10 } }, `用途：${current.purpose}`) : null,
                 current.notice ? h('div', { className: 'csb-note', style: { marginTop: 10 } }, current.notice) : null,
                 h('div', { style: { maxHeight: 460, overflowY: 'auto', margin: '12px 0' } },
                   msgs.length === 0 ? h(Empty, { title: '还没有消息' }) : null,
-                  msgs.map((m) => {
+                  // 「加载更早」：只在还有更早消息时显示（前端切片，零后端改动）
+                  msgs.length > shownCount
+                    ? h('div', { className: 'csb-bar', style: { justifyContent: 'center', marginBottom: 8 } },
+                        h('button', {
+                          className: 'csb-btn csb-btn-s',
+                          onClick: () => setShownCount((n) => n + 50),
+                        }, `加载更早的 50 条（还有 ${msgs.length - shownCount} 条）`))
+                    : null,
+                  msgs.slice(-shownCount).map((m) => {
                     const body = m.body ?? m.text ?? ''
                     const long = body.length > 300
                     const isMe = m.from === 'user' || m.from === 'ui'
@@ -2251,7 +2531,7 @@ window.__ModuleLoader__.load({
                             }, '看全文')
                           : null),
                       h('div', { className: `csb-msg${isMe ? ' csb-msg-me' : ''}` },
-                        h('div', { className: 'csb-msg-b' }, long ? `${body.slice(0, 300)}…` : body)),
+                        h('div', { className: 'csb-msg-b' }, renderAt(long ? `${body.slice(0, 300)}…` : body))),
                       h('div', { className: 'csb-msg-time' }, fmt(m.at)))
                   }),
                   h('div', { ref: endRef }))),
@@ -2433,6 +2713,187 @@ window.__ModuleLoader__.load({
               type: 'checkbox', checked: settings.relayEnabled,
               onChange: (e) => setSettings({ ...settings, relayEnabled: e.target.checked }),
             }), settings.relayEnabled ? '允许' : '不允许')))
+    }
+
+    // ── 成果（artifacts 聚合）────────────────────────────────────────────────
+
+    /**
+     * 成果 = 任务完成时提交的产出物证据（`task.artifacts`）。
+     *
+     * 为什么要单独一页：成果原本只在任务详情里作为一行文本出现，
+     * 想「最近交了哪些东西」只能一个个任务点开。这里按任务聚合、可按
+     * 负责人/状态/关键词筛选，点卡片回任务详情。
+     *
+     * 数据来自 `GET /artifacts`（契约 CONTRACT-bots03.md §1）。
+     */
+    function ArtifactsTab({ onGoto }) {
+      const [q, setQ] = useState('')
+      const [ownerFilter, setOwnerFilter] = useState('')
+      const [statusFilter, setStatusFilter] = useState('')
+      const [openId, setOpenId] = useState(null)
+
+      const qs = new URLSearchParams()
+      if (q.trim()) qs.set('q', q.trim())
+      if (ownerFilter) qs.set('ownerId', ownerFilter)
+      if (statusFilter) qs.set('status', statusFilter)
+      const suffix = qs.toString() ? `?${qs.toString()}` : ''
+      const { data, loading, error, reload } = useApi(`/artifacts${suffix}`, [q, ownerFilter, statusFilter])
+      const { data: rosterData } = useApi('/roster')
+      const bots = rosterData?.bots ?? []
+      const items = data?.artifacts ?? []
+      const stats = data?.stats ?? { tasks: 0, items: 0 }
+
+      return h('div', { className: 'csb-wrap' },
+        h(Section, {
+          title: '成果库',
+          desc: '任务完成时提交的产出物证据（文件路径、提交号、报告链接…）。按负责人/状态筛选，点卡片回到任务详情。',
+        }),
+        h('div', { className: 'csb-bar', style: { marginTop: 12, flexWrap: 'wrap' } },
+          h('input', {
+            className: 'csb-in csb-grow', placeholder: '搜成果：任务标题或产出物路径…',
+            value: q, onChange: (e) => setQ(e.target.value),
+          }),
+          h('select', { className: 'csb-sel', style: { width: 170 }, value: ownerFilter, onChange: (e) => setOwnerFilter(e.target.value) },
+            h('option', { value: '' }, '全部负责人'),
+            bots.map((b) => h('option', { key: b.id, value: b.sessionId }, b.name))),
+          h('select', { className: 'csb-sel', style: { width: 116 }, value: statusFilter, onChange: (e) => setStatusFilter(e.target.value) },
+            h('option', { value: '' }, '全部状态'),
+            h('option', { value: 'pending' }, '待办'),
+            h('option', { value: 'in_progress' }, '进行中'),
+            h('option', { value: 'completed' }, '已完成'),
+            h('option', { value: 'blocked' }, '已终止'))),
+
+        h('div', { className: 'csb-note', style: { marginTop: 8 } },
+          `共 ${stats.tasks} 个任务、${stats.items} 件产出物${data?.note ? ` · ${data.note}` : ''}`),
+        error ? h('div', { className: 'csb-err' }, error) : null,
+        loading ? h(Skeleton, { n: 3 }) : null,
+        !loading && !error && items.length === 0
+          ? h(Empty, {
+              icon: '◈', title: '还没有成果',
+              hint: '任务完成并带上产出物证据（artifacts）后就会出现在这里。先去任务板把任务做完。',
+              action: onGoto ? { label: '去看任务板', icon: '◫', onClick: () => onGoto('tasks') } : undefined,
+            })
+          : null,
+        h('div', { className: 'csb-list' }, items.map((a) =>
+          h('div', {
+            key: a.taskId, className: 'csb-card csb-card-c',
+            onClick: () => setOpenId(a.taskId),
+          },
+            h(Dot, { status: a.status }),
+            h('div', { className: 'csb-card-main' },
+              h('div', { className: 'csb-card-t' }, a.subject ?? a.taskId),
+              h('div', { className: 'csb-card-m' },
+                h(Badge, { status: a.status }),
+                h('span', null, a.ownerId ? `由 ${botName(bots, a.ownerId)} 负责` : '无负责人'),
+                a.accepted === true ? h('span', null, ' · 已验收') : (a.status === 'completed' ? h('span', null, ' · 待验收') : null),
+                h('span', null, ` · ${a.taskId}`),
+                a.completedAt ? h('span', null, ` · ${fmt(a.completedAt)}`) : null),
+              h('div', { className: 'csb-tags', style: { marginTop: 6 } },
+                (a.items ?? []).map((it, i) =>
+                  h('span', { key: i, className: 'csb-tag csb-mono' }, short(it, 60)))))),
+            h('div', { style: { flex: 'none' } },
+              h('button', { className: 'csb-btn csb-btn-s', onClick: (e) => { e.stopPropagation(); setOpenId(a.taskId) } }, '看任务')))),
+        openId ? h(TaskDrawer, {
+          id: openId, bots, workflows: [],
+          onClose: () => setOpenId(null),
+          onChange: reload,
+        }) : null)
+    }
+
+    // ── 数据（只读浏览）──────────────────────────────────────────────────────
+
+    /**
+     * 数据浏览 —— 让「数据库」看得见。
+     *
+     * cs-bots 的存储在零依赖约束下**不是 SQLite**，而是：
+     *   事件流 `xxx.jsonl`（真相源，append-only）+ 快照 `xxx.snap.json`（加速恢复）。
+     * 这一页把状态目录**直属**的 jsonl/json 文件列出来，点开看行。
+     *
+     * **只读**：写入一律走域服务的 CAS 校验，不提供任何写接口。
+     * 安全：文件名/子目录走后端白名单（拒绝 `..` 穿越）。
+     */
+    function DataTab() {
+      const PAGE = 50
+      const [dir, setDir] = useState('')
+      const [name, setName] = useState('')
+      const [offset, setOffset] = useState(0)
+      const filesQ = useApi(`/data/files${dir ? `?dir=${encodeURIComponent(dir)}` : ''}`, [dir])
+      const files = filesQ.data?.files ?? []
+      const rowsPath = name
+        ? `/data/rows?name=${encodeURIComponent(name)}${dir ? `&dir=${encodeURIComponent(dir)}` : ''}&limit=${PAGE}&offset=${offset}`
+        : null
+      const rowsQ = useApi(rowsPath, [name, dir, offset])
+      const rows = rowsQ.data?.rows ?? []
+      const total = rowsQ.data?.total ?? 0
+
+      const fileList = h('div', { className: 'csb-list', style: { marginTop: 8 } },
+        files.map((f) =>
+          h('div', {
+            key: f.name,
+            className: `csb-card csb-card-c${name === f.name ? ' csb-card-on' : ''}`,
+            onClick: () => { setName(f.name); setOffset(0) },
+          },
+            h('div', { className: 'csb-card-main' },
+              h('div', { className: 'csb-card-t csb-mono' }, f.name),
+              h('div', { className: 'csb-card-m' },
+                h('span', null, `${f.bytes ?? 0} 字节`),
+                f.kind === 'jsonl'
+                  ? h('span', null, ` · ${f.lines === null ? '行数过多' : `${f.lines} 行`}`)
+                  : h('span', null, ' · 快照'),
+                f.truncated ? h('span', { className: 'csb-b csb-b-idle' }, ' · 已截断') : null)))))
+
+      const rowList = h('div', { style: { maxHeight: 520, overflowY: 'auto', marginTop: 8 } },
+        rows.map((r) =>
+          h('div', { key: r._line, className: 'csb-card', style: { padding: '7px 9px', marginBottom: 5 } },
+            h('div', { className: 'csb-card-m' },
+              h('span', { className: 'csb-mono' }, `#${r._line}`),
+              r._parseError ? h('span', { className: 'csb-b csb-b-err' }, 'JSON 解析失败') : null,
+              r._truncated ? h('span', { className: 'csb-b csb-b-idle' }, '已截断') : null),
+            h('pre', {
+              className: 'csb-mono',
+              style: { margin: '4px 0 0', whiteSpace: 'pre-wrap', wordBreak: 'break-all', fontSize: 11.5 },
+            }, r._raw))))
+
+      const pager = h('div', { className: 'csb-bar', style: { marginTop: 8 } },
+        h('button', {
+          className: 'csb-btn csb-btn-s', disabled: offset <= 0,
+          onClick: () => setOffset((o) => Math.max(0, o - PAGE)),
+        }, '上一页'),
+        h('span', { className: 'csb-set-d' },
+          `${total ? offset + 1 : 0}-${Math.min(offset + PAGE, total)} / ${total}`),
+        h('button', {
+          className: 'csb-btn csb-btn-s', disabled: offset + PAGE >= total,
+          onClick: () => setOffset((o) => o + PAGE),
+        }, '下一页'))
+
+      const right = !name
+        ? h(Empty, { icon: '▤', title: '选一个文件', hint: '左侧点击任意文件，这里会按行显示内容（每行原始 JSON，最多 50 行/页）。' })
+        : h('div', null,
+            h(Section, { title: `内容 · ${name}`, desc: rowsQ.data?.note ?? ' ' }),
+            rowsQ.error ? h('div', { className: 'csb-err' }, rowsQ.error) : null,
+            rowsQ.loading ? h(Skeleton, { n: 3 }) : null,
+            pager, rowList)
+
+      return h('div', { className: 'csb-wrap' },
+        h(Section, {
+          title: '数据（只读）',
+          desc: 'cs-bots 用 JSONL 事件流 + JSON 快照存储（零第三方依赖，不引入数据库）。'
+            + '这里是只读浏览：写入一律走域服务与 CAS 校验，本页不提供任何写操作。',
+        }),
+        h('div', { className: 'csb-bar', style: { marginTop: 10, flexWrap: 'wrap' } },
+          h('input', {
+            className: 'csb-in', style: { width: 200 }, placeholder: '子目录（如 rooms / scratch，可空）',
+            value: dir, onChange: (e) => { setDir(e.target.value.trim()); setName(''); setOffset(0) },
+          }),
+          h('button', { className: 'csb-btn csb-btn-s', onClick: filesQ.reload }, '刷新')),
+        filesQ.error ? h('div', { className: 'csb-err' }, filesQ.error) : null,
+        h('div', { className: 'csb-room-split', style: { marginTop: 12 } },
+          h('div', { className: 'csb-room-side', style: { width: 320 } },
+            h(Section, { title: '文件', desc: `状态目录：${filesQ.data?.stateDir ?? '—'}` }),
+            filesQ.loading ? h(Skeleton, { n: 4 }) : null,
+            !filesQ.loading && files.length === 0 ? h(Empty, { title: '没有可浏览的文件' }) : null,
+            fileList),
+          h('div', { className: 'csb-room-chat' }, right)))
     }
 
     // ── 记忆 ────────────────────────────────────────────────────────────────
@@ -3973,6 +4434,7 @@ window.__ModuleLoader__.load({
       },
       { id: 'bots', label: 'Bot', Comp: BotsTab },
       { id: 'rooms', label: '房间', Comp: RoomsTab },
+      { id: 'artifacts', label: '成果', Comp: ArtifactsTab },
       {
         id: 'memory', label: '记忆',
         subs: [
@@ -3983,6 +4445,7 @@ window.__ModuleLoader__.load({
       },
       { id: 'skills', label: '技能库', Comp: SkillsTab },
       { id: 'workflows', label: '工作流库', Comp: WorkflowsTab },
+      { id: 'data', label: '数据', Comp: DataTab },
       { id: 'settings', label: '设置', Comp: SettingsBody },
     ]
 
@@ -4009,7 +4472,7 @@ window.__ModuleLoader__.load({
         h('div', { className: 'csb-head' },
           h('div', { className: 'csb-hrow' },
             h('h2', null, '协作平台'),
-            h('span', { className: 'csb-hint' }, '任务 · Bot · 房间 · 记忆 · 技能 · 工作流 · 设置')),
+            h('span', { className: 'csb-hint' }, '任务 · Bot · 房间 · 成果 · 记忆 · 技能 · 工作流 · 数据 · 设置')),
           h('div', { className: 'csb-tabs', role: 'tablist' },
             TABS.map((t) =>
               h('button', {
@@ -4028,7 +4491,7 @@ window.__ModuleLoader__.load({
             : null),
         h('div', { className: 'csb-body' },
           h(Boundary, { tab: `${current.label}/${activeView.label}` },
-            h(Comp, { key: `${current.id}:${activeView.id}` }))))
+            h(Comp, { key: `${current.id}:${activeView.id}`, onGoto: goTab }))))
     }
 
     function PanelIcon() {
@@ -4099,6 +4562,8 @@ window.__ModuleLoader__.load({
     exports.TasksTab = TasksTab
     exports.BotsTab = BotsTab
     exports.RoomsTab = RoomsTab
+    exports.ArtifactsTab = ArtifactsTab
+    exports.DataTab = DataTab
     exports.MemoryTab = MemoryTab
     exports.SkillsTab = SkillsTab
     exports.WorkflowsTab = WorkflowsTab

@@ -12,6 +12,8 @@
  *   - **前缀路由**：`/cs-bots/api`（与包名一致，避免和其他插件撞路径）。
  */
 
+import { readFileSync, readdirSync, statSync } from 'node:fs'
+import { join } from 'node:path'
 import { registerRoute, listPresets, defaultPreset } from './kernel.js'
 import { createLibrary } from './library.js'
 import { createDirBrowser } from './dirbrowse.js'
@@ -88,6 +90,42 @@ async function withService(services, key, fn) {
   }
   return fn(svc)
 }
+
+/** 数据浏览：合法文件名/子目录（防目录穿越）。 */
+const SAFE_SEGMENT = /^[A-Za-z0-9._-]+$/
+
+/** 判断是否是安全的单段路径（无 `..`、无分隔符）。 */
+function safeSegment(value) {
+  if (typeof value !== 'string' || value === '') return false
+  if (value === '.' || value === '..') return false
+  if (value.includes('..')) return false
+  return SAFE_SEGMENT.test(value)
+}
+
+/** 把 artifacts 归一成字符串数组（对象用单行 JSON）。 */
+function normalizeArtifactItems(list) {
+  if (!Array.isArray(list)) return []
+  const out = []
+  for (const item of list) {
+    if (item === null || item === undefined) continue
+    if (typeof item === 'string') {
+      const t = item.trim()
+      if (t) out.push(t)
+    } else if (typeof item === 'object') {
+      try {
+        out.push(JSON.stringify(item))
+      } catch {
+        out.push(String(item))
+      }
+    } else {
+      out.push(String(item))
+    }
+  }
+  return out
+}
+
+/** 任务状态集合（与 board.js STATUSES 同口径，删除态不参与）。 */
+const GRAPH_STATUSES = ['pending', 'in_progress', 'completed', 'blocked', 'deleted']
 
 
 /**
@@ -552,6 +590,243 @@ export function installApi(ctx, { warn } = {}) {
           cwd: qp(url, 'cwd'),
         }))
         sendJson(response, 200, { ok: true, text })
+        return
+      }
+
+      // ── 成果聚合（只读）────────────────────────────────────────────────────
+      if (request.method === 'GET' && path === '/artifacts') {
+        const q = qp(url, 'q')
+        const ownerId = qp(url, 'ownerId')
+        const status = qp(url, 'status')
+        const limit = qn(url, 'limit')
+        const cap = limit !== undefined && limit > 0 ? Math.min(limit, 1000) : 200
+        const kw = q ? String(q).toLowerCase() : ''
+        const rows = await withService(services, 'board', (b) => b.list({ status: status ?? undefined }))
+        const artifacts = []
+        let itemCount = 0
+        let danglingSkipped = 0
+        for (const t of rows) {
+          if (ownerId && t.ownerId !== ownerId) continue
+          const items = normalizeArtifactItems(t.artifacts)
+          if (items.length === 0) continue
+          if (kw) {
+            const hay = `${t.subject ?? ''} ${items.join(' ')}`.toLowerCase()
+            if (!hay.includes(kw)) continue
+          }
+          itemCount += items.length
+          artifacts.push({
+            taskId: t.id,
+            subject: t.subject,
+            status: t.status,
+            ownerId: t.ownerId,
+            accepted: t.accepted === true,
+            completedAt: t.completedAt ?? t.createdAt,
+            items,
+          })
+        }
+        artifacts.sort((a, b) => (b.completedAt ?? 0) - (a.completedAt ?? 0))
+        const sliced = artifacts.slice(0, cap)
+        sendJson(response, 200, {
+          ok: true,
+          artifacts: sliced,
+          stats: { tasks: sliced.length, items: sliced.reduce((n, a) => n + a.items.length, 0) },
+          note: `已扫描 ${rows.length} 个任务${danglingSkipped ? `，跳过 ${danglingSkipped} 个悬空引用` : ''}`,
+        })
+        return
+      }
+
+      // ── 数据浏览（只读，绝不提供写接口）────────────────────────────────────
+      if (request.method === 'GET' && path === '/data/files') {
+        const dirParam = qp(url, 'dir')
+        const boardSvc = services.board
+        const stateDir = boardSvc?.paths?.stateDir ?? services.roster?.paths?.stateDir
+        if (!stateDir) {
+          sendJson(response, 503, { ok: false, reason: '状态目录不可用（域服务均未装配）' })
+          return
+        }
+        let root = stateDir
+        if (dirParam !== undefined && dirParam !== '') {
+          if (!safeSegment(dirParam)) {
+            sendJson(response, 400, { ok: false, reason: '非法子目录名' })
+            return
+          }
+          root = join(stateDir, dirParam)
+        }
+        const files = []
+        let note
+        try {
+          for (const name of readdirSync(root)) {
+            if (!/\.(jsonl|json)$/i.test(name)) continue
+            if (!safeSegment(name)) continue
+            let st
+            try {
+              st = statSync(join(root, name))
+            } catch {
+              continue
+            }
+            if (!st.isFile()) continue
+            const kind = /\.jsonl$/i.test(name) ? 'jsonl' : 'json'
+            let lines = 0
+            let truncated = false
+            if (kind === 'jsonl') {
+              if (st.size > 8 * 1024 * 1024) {
+                lines = null
+                truncated = true
+              } else {
+                try {
+                  const text = readFileSync(join(root, name), 'utf8')
+                  lines = text === '' ? 0 : text.split('\n').filter((x) => x.trim() !== '').length
+                } catch {
+                  lines = null
+                  truncated = true
+                }
+              }
+            }
+            const row = { name, bytes: st.size, lines, mtime: st.mtimeMs, kind }
+            if (truncated) row.truncated = true
+            files.push(row)
+          }
+          files.sort((a, b) => b.mtime - a.mtime)
+          note = `共 ${files.length} 个文件（只读浏览；写请走域服务与 CAS）`
+        } catch (error) {
+          note = `目录不可读：${error?.message ?? error}`
+        }
+        sendJson(response, 200, { ok: true, stateDir: root, files, note })
+        return
+      }
+
+      if (request.method === 'GET' && path === '/data/rows') {
+        const name = qp(url, 'name')
+        if (!name) {
+          sendJson(response, 400, { ok: false, reason: 'name 必填' })
+          return
+        }
+        if (!safeSegment(name) || !/\.(jsonl|json)$/i.test(name)) {
+          sendJson(response, 400, { ok: false, reason: '非法文件名' })
+          return
+        }
+        const dirParam = qp(url, 'dir')
+        if (dirParam !== undefined && dirParam !== '' && !safeSegment(dirParam)) {
+          sendJson(response, 400, { ok: false, reason: '非法子目录名' })
+          return
+        }
+        const boardSvc = services.board
+        const stateDir = boardSvc?.paths?.stateDir ?? services.roster?.paths?.stateDir
+        if (!stateDir) {
+          sendJson(response, 503, { ok: false, reason: '状态目录不可用（域服务均未装配）' })
+          return
+        }
+        const root = dirParam ? join(stateDir, dirParam) : stateDir
+        const abs = join(root, name)
+        const limitRaw = qn(url, 'limit')
+        const limit = limitRaw !== undefined && limitRaw > 0 ? Math.min(limitRaw, 200) : 50
+        const offsetRaw = qn(url, 'offset')
+        const offset = offsetRaw !== undefined && offsetRaw > 0 ? offsetRaw : 0
+        let text
+        try {
+          text = readFileSync(abs, 'utf8')
+        } catch (error) {
+          sendJson(response, 404, { ok: false, reason: `读取失败：${error?.message ?? error}` })
+          return
+        }
+        const all = text.split('\n').filter((line) => line.trim() !== '')
+        const page = all.slice(offset, offset + limit)
+        const rowsOut = page.map((raw, i) => {
+          const row = { _line: offset + i + 1, _raw: raw.length > 4000 ? raw.slice(0, 4000) : raw }
+          if (raw.length > 4000) row._truncated = true
+          if (/\.jsonl$/i.test(name)) {
+            try {
+              JSON.parse(raw)
+            } catch {
+              row._parseError = true
+            }
+          }
+          return row
+        })
+        sendJson(response, 200, {
+          ok: true,
+          name,
+          total: all.length,
+          offset,
+          rows: rowsOut,
+          note: `共 ${all.length} 行，显示 ${all.length ? offset + 1 : 0}-${Math.min(offset + limit, all.length)}`,
+        })
+        return
+      }
+
+      // ── 任务依赖图（只读）──────────────────────────────────────────────────
+      if (request.method === 'GET' && path === '/tasks/graph') {
+        const id = qp(url, 'id')
+        const all = await withService(services, 'board', (b) =>
+          b.list({}).filter((t) => t.status !== 'deleted'))
+        const byIdMap = new Map(all.map((t) => [t.id, t]))
+        const dependents = new Map()
+        let danglingEdges = 0
+        for (const t of all) {
+          for (const dep of t.blockedBy ?? []) {
+            if (!byIdMap.has(dep)) {
+              danglingEdges += 1
+              continue
+            }
+            if (!dependents.has(dep)) dependents.set(dep, [])
+            dependents.get(dep).push(t.id)
+          }
+        }
+        let picked
+        if (id) {
+          if (!byIdMap.has(id)) {
+            sendJson(response, 404, { ok: false, reason: `任务 ${id} 不存在` })
+            return
+          }
+          const keep = new Set()
+          const up = [id]
+          while (up.length) {
+            const cur = up.pop()
+            if (keep.has(cur)) continue
+            keep.add(cur)
+            const t = byIdMap.get(cur)
+            if (!t) continue
+            for (const dep of t.blockedBy ?? []) {
+              if (byIdMap.has(dep) && !keep.has(dep)) up.push(dep)
+            }
+          }
+          const down = [id]
+          while (down.length) {
+            const cur = down.pop()
+            for (const child of dependents.get(cur) ?? []) {
+              if (!keep.has(child)) {
+                keep.add(child)
+                down.push(child)
+              }
+            }
+          }
+          picked = all.filter((t) => keep.has(t.id))
+        } else {
+          picked = all
+        }
+        // 字段恒定出现（前端画图不判 undefined）：ownerId/priority 缺省给 null/0
+        const nodes = picked.map((t) => ({
+          id: t.id,
+          subject: t.subject,
+          status: t.status,
+          ownerId: t.ownerId ?? null,
+          progress: t.progress ?? 0,
+          priority: t.priority ?? 0,
+        }))
+        const pickedIds = new Set(nodes.map((n) => n.id))
+        const edges = []
+        for (const t of picked) {
+          for (const dep of t.blockedBy ?? []) {
+            if (!pickedIds.has(dep)) continue
+            edges.push({ from: t.id, to: dep, kind: 'blockedBy' })
+          }
+        }
+        sendJson(response, 200, {
+          ok: true,
+          nodes,
+          edges,
+          note: `节点 ${nodes.length} 个，边 ${edges.length} 条${danglingEdges ? `，忽略悬空依赖 ${danglingEdges} 条` : ''}`,
+        })
         return
       }
 

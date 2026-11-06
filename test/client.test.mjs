@@ -182,6 +182,32 @@ test('A9 API 前缀与宿主一致（/cs-bots/api）', () => {
   assert.equal(exports.API, '/cs-bots/api', '客户端 API 前缀必须与 src/api.js 一致')
 })
 
+test('A10 新增页签「成果」「数据」已导出并入 TABS（改造03）', () => {
+  const { exports } = loadClient().client
+  for (const name of ['ArtifactsTab', 'DataTab']) {
+    assert.equal(typeof exports[name], 'function', `应导出 ${name}`)
+  }
+  // TABS 里必须真的有这两个页签，否则组件导出了也没人渲染（就是「功能不存在」）
+  assert.match(SOURCE, /id:\s*'artifacts',\s*label:\s*'成果'/, 'TABS 应含「成果」页签')
+  assert.match(SOURCE, /id:\s*'data',\s*label:\s*'数据'/, 'TABS 应含「数据」页签')
+})
+
+test('A11 改造03 新端点在客户端被调用（/artifacts、/data/files、/tasks/graph）', () => {
+  // 前后端契约要对得上：客户端调用的路径必须与 design/CONTRACT-bots03.md 一致
+  assert.match(SOURCE, /['"`]\/artifacts/, 'ArtifactsTab 必须调用 /artifacts')
+  assert.match(SOURCE, /\/data\/files/, 'DataTab 必须调用 /data/files')
+  assert.match(SOURCE, /\/data\/rows/, 'DataTab 必须调用 /data/rows')
+  assert.match(SOURCE, /\/tasks\/graph/, 'TaskDrawer 必须调用 /tasks/graph')
+})
+
+test('A12 新页签首次渲染不抛（无网络时只出空态/加载态，不白屏）', () => {
+  const { exports } = loadClient().client
+  for (const name of ['ArtifactsTab', 'DataTab']) {
+    const tree = exports[name]({ onGoto: () => {} })
+    assert.ok(tree && typeof tree === 'object', `${name} 首渲染应返回元素树`)
+  }
+})
+
 // ── B. 真实 DOM 渲染（需 jsdom + react）──────────────────────────────────────
 
 test('B1 真实渲染 Workbench（需 jsdom+react，缺则 SKIP）', async (t) => {
