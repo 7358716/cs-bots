@@ -310,6 +310,16 @@ window.__ModuleLoader__.load({
 
 /* @提及高亮 */
 .csb-at{color:var(--dsw-alias-label-primary);font-weight:600}
+
+/* 目标锚（只读区块，契约 CONTRACT-bots04 §3.2） */
+.csb-anchor{border:1px solid var(--dsw-alias-border-l1);border-radius:12px;padding:12px 14px;
+  background:var(--dsw-alias-bg-base);margin-top:10px}
+.csb-anchor-subj{font-size:15px;font-weight:600;line-height:1.45;margin-bottom:8px;word-break:break-word}
+.csb-anchor-meta{display:flex;gap:6px 14px;flex-wrap:wrap;margin-top:8px;
+  font-size:11.5px;color:var(--dsw-alias-label-secondary)}
+/* 房间消息气泡 hover 才出现「⇢ 建任务」（契约 §3.4） */
+.csb-msg-task{opacity:0;transition:opacity .12s}
+.csb-msg-row:hover .csb-msg-task{opacity:1}
 `
 
     function installStyles() {
@@ -917,6 +927,9 @@ window.__ModuleLoader__.load({
             task.blockedReason ? h('span', { className: 'csb-v' }, task.blockedReason) : null),
           task.description ? h('div', { className: 'csb-pre', style: { marginBottom: 4 } }, task.description) : null,
 
+          // 改造04：目标锚（只读）+ 补充说明 + 补充历史 + 去对话 + 复制派发文案
+          h(TaskAnchorPanel, { taskId: task.id, task, onChange }),
+
           h(Section, { title: '可以做什么', desc: '指派、完成、验收是 Bot 的职责，不由你操作。这里只有需要你拍板的动作。' }),
           h('div', { className: 'csb-bar', style: { marginTop: 10 } },
             task.status === 'pending'
@@ -1075,6 +1088,440 @@ window.__ModuleLoader__.load({
       return b ? b.name : short(sessionId, 16)
     }
 
+    // ══════════════════════════════════════════════════════════════════════
+    // 协作平台改造04：派活 / 补充说明 / 直达对话（契约 CONTRACT-bots04 §3）
+    //
+    // 设计铁律：
+    //   · **唤醒结果必须可见**：sent / skipped / failed 全都要显示，失败带 reason。
+    //     「派活了但没唤醒」如果静默，用户会以为 Bot 已经在做，实际任务永远停着。
+    //   · **目标锚只读**：目标原文来自创建时，详情页只展示、不就地编辑；
+    //     补充说明走 /tasks/note 追加，永不覆盖目标 —— 这正是「长任务不失真」的落点。
+    // ══════════════════════════════════════════════════════════════════════
+
+    /** 唤醒结果 → 人话（sent / skipped / pending / failed 全覆盖，失败带原因）。 */
+    function wakeLabel(wake) {
+      if (!wake) return '未请求唤醒'
+      const result = wake.result ?? (wake.ok === false ? 'failed' : 'sent')
+      const base = {
+        sent: '已唤醒执行者',
+        skipped: '未重复唤醒（之前已唤醒过）',
+        pending: '已排队，稍后送达',
+        failed: '唤醒失败',
+      }[result] ?? `唤醒结果：${result}`
+      const reason = wake.reason ? `（原因：${wake.reason}）` : ''
+      return base + reason
+    }
+
+    /** 唤醒结果提示条（失败不静默）。 */
+    function WakeNotice({ wake, prefix }) {
+      if (!wake) return null
+      const bad = wake.ok === false || wake.result === 'failed'
+      return h(Notice, { kind: bad ? 'err' : 'ok' }, `${prefix ?? ''}${wakeLabel(wake)}`)
+    }
+
+    /** 可折叠长文本（目标原文可能很长；等宽字体保留格式）。 */
+    function CollapsibleText({ text, mono, limit }) {
+      const [open, setOpen] = useState(false)
+      const s = String(text ?? '')
+      const max = limit ?? 600
+      const cut = s.length > max
+      return h('div', null,
+        h('div', {
+          className: mono ? 'csb-pre' : undefined,
+          style: { whiteSpace: 'pre-wrap', wordBreak: 'break-word' },
+        }, open || !cut ? s : `${s.slice(0, max)}…`),
+        cut
+          ? h('button', {
+              className: 'csb-btn csb-btn-s', style: { marginTop: 6 },
+              onClick: () => setOpen((v) => !v),
+            }, open ? '收起' : `展开全文（共 ${s.length} 字）`)
+          : null)
+    }
+
+    /**
+     * 任务详情 ·「目标锚 + 补充说明」区块（契约 §3.2）。
+     *
+     * 数据来源：
+     *   GET /tasks/brief?id=  → anchor（创建时冻结的原文）+ notes + text
+     *   GET /tasks/notes?id=  → 补充历史
+     *   GET /roster           → ownerId → sessionId（去对话）
+     * 写入：
+     *   POST /tasks/note      → 追加补充说明（有执行者时顺带唤醒）
+     */
+    function TaskAnchorPanel({ taskId, task, onChange }) {
+      const briefQ = useApi(`/tasks/brief?id=${encodeURIComponent(taskId)}`, [taskId])
+      const notesQ = useApi(`/tasks/notes?id=${encodeURIComponent(taskId)}`, [taskId])
+      const rosterQ = useApi('/roster')
+      const [noteText, setNoteText] = useState('')
+      const [busy, setBusy] = useState(false)
+      const [err, setErr] = useState(null)
+      const [wake, setWake] = useState(null)
+      const [saved, setSaved] = useState(null)
+      const [copied, setCopied] = useState(null)
+      const [jump, setJump] = useState(null)
+
+      const brief = briefQ.data
+      const anchor = brief?.anchor ?? {}
+      const notes = notesQ.data?.notes ?? brief?.notes ?? []
+      const ownerId = anchor.ownerId ?? task?.ownerId ?? null
+      const subject = anchor.subject ?? task?.subject ?? '（无标题）'
+      const description = anchor.description ?? task?.description ?? ''
+      const writeScopes = anchor.writeScopes ?? task?.writeScopes ?? []
+      const blockedBy = anchor.blockedBy ?? task?.blockedBy ?? []
+      const bots = rosterQ.data?.bots ?? []
+      const hasOwner = Boolean(ownerId)
+
+      /** 复制「可直接发给任意会话」的锚定文案（后端生成，前端不改写）。 */
+      const copyBrief = async () => {
+        setErr(null)
+        setCopied(null)
+        try {
+          const d = await call(`/tasks/brief?id=${encodeURIComponent(taskId)}`)
+          const ok = await copyText(d.text ?? '')
+          setCopied(ok
+            ? '已复制派发文案，可直接粘贴给任意会话'
+            : '复制失败：浏览器不允许自动复制，请到「目标锚」里手动选中复制')
+        } catch (e) {
+          setErr(`复制派发文案失败：${e.message}`)
+        }
+      }
+
+      /** 去对话：ownerId → /roster 找 sessionId → 宿主 openSession。 */
+      const gotoOwner = async () => {
+        setErr(null)
+        if (!hasOwner) {
+          setErr('这个任务还没有执行者，先派活儿再跳转对话')
+          return
+        }
+        const bot = bots.find((b) => b.sessionId === ownerId || b.id === ownerId)
+        if (!bot) {
+          setJump({
+            id: ownerId,
+            hint: '该负责人不是本平台的 Bot，无法跳转。可以复制 ID 到左侧会话列表里手动定位。',
+          })
+          return
+        }
+        try {
+          if (hostUiWorkspace?.openSession) {
+            hostUiWorkspace.openSession({ sessionId: bot.sessionId ?? ownerId })
+            return
+          }
+          const ok = await copyText(bot.sessionId ?? ownerId)
+          setJump({
+            id: bot.sessionId ?? ownerId,
+            hint: ok
+              ? '宿主不支持自动跳转，已复制会话 ID，可在左侧会话列表里定位。'
+              : '宿主不支持自动跳转，请手动复制下面的会话 ID。',
+          })
+        } catch (e) {
+          setErr(`无法打开会话：${e.message}`)
+        }
+      }
+
+      /** 追加补充说明：成功后清空、刷新历史、显示唤醒结果。 */
+      const sendNote = async () => {
+        const text = noteText.trim()
+        if (!text || busy) return
+        setBusy(true)
+        setErr(null)
+        setWake(null)
+        setSaved(null)
+        setCopied(null)
+        try {
+          const body = { id: taskId, text }
+          if (!hasOwner) body.wake = false // 未派活：只保存，不装出「已唤醒」的样子
+          const d = await call('/tasks/note', { method: 'POST', body })
+          setNoteText('')
+          setWake(d?.wake ?? null)
+          if (!d?.wake) setSaved(hasOwner ? '补充已保存（本次没有唤醒）' : '补充已保存（未派活，不唤醒）')
+          notesQ.reload()
+          onChange?.()
+        } catch (e) {
+          setErr(`保存补充说明失败：${e.message}`)
+        } finally {
+          setBusy(false)
+        }
+      }
+
+      return h('div', null,
+        h(Section, {
+          title: '目标锚（只读）',
+          desc: '目标来自创建时原文 · 补充说明只追加不覆盖',
+        }),
+        briefQ.loading && !task ? h(Skeleton, { n: 1 }) : null,
+        briefQ.error ? h('div', { className: 'csb-note' }, `目标锚接口暂不可用：${briefQ.error}（下面用任务当前内容兜底）`) : null,
+        h('div', { className: 'csb-anchor' },
+          h('div', { className: 'csb-anchor-subj' }, subject),
+          description
+            ? h(CollapsibleText, { text: description, mono: true })
+            : h('div', { className: 'csb-set-d' }, '（创建时没有填写目标描述）'),
+          h('div', { className: 'csb-anchor-meta' },
+            h('span', null, `边界：${writeScopes.length ? writeScopes.join('、') : '（未限定）'}`),
+            h('span', null, `前置：${blockedBy.length ? blockedBy.join('、') : '（无）'}`),
+            h('span', null, `执行者：${hasOwner ? botName(bots, ownerId) : '未派活'}`))),
+
+        h('div', { className: 'csb-bar', style: { marginTop: 10 } },
+          h('button', { className: 'csb-btn csb-btn-s', onClick: copyBrief }, '复制派发文案'),
+          h('button', { className: 'csb-btn csb-btn-s', onClick: gotoOwner }, '去对话'),
+          copied ? h('span', { className: 'csb-set-d' }, copied) : null),
+        err ? h('div', { className: 'csb-err' }, err) : null,
+        wake ? h(WakeNotice, { wake, prefix: '补充已保存 · ' }) : null,
+        !wake && saved ? h(Notice, { kind: 'ok', onClose: () => setSaved(null) }, saved) : null,
+
+        h(Section, {
+          title: '补充说明',
+          desc: '只追加、不覆盖目标原文。发送后会把「完整目标原文 + 这条补充」一起送给执行者，长任务也不会跑偏。',
+        }),
+        h('div', { className: 'csb-fld', style: { marginTop: 10 } },
+          h('textarea', {
+            className: 'csb-ta',
+            placeholder: '例如：别忘了限流；接口文档在 docs/login.md…',
+            value: noteText,
+            onChange: (e) => setNoteText(e.target.value),
+          }),
+          h('div', { className: 'csb-bar', style: { marginTop: 8 } },
+            h('button', {
+              className: 'csb-btn csb-btn-p',
+              disabled: busy || !noteText.trim(),
+              onClick: sendNote,
+            }, busy ? '发送中…' : (hasOwner ? '发送给执行者' : '保存补充（未派活，暂不唤醒）')),
+            h('span', { className: 'csb-set-d' }, hasOwner ? '会立即唤醒执行者' : '任务还没有执行者，只保存不唤醒'))),
+
+        h(Section, { title: '补充历史', desc: `${notes.length} 条，按时间从早到晚` }),
+        notesQ.error ? h('div', { className: 'csb-note' }, `补充历史读取失败：${notesQ.error}`) : null,
+        notesQ.loading ? h(Skeleton, { n: 1 }) : null,
+        notes.length === 0
+          ? h('div', { className: 'csb-set-d', style: { marginTop: 8 } }, '还没有补充说明。')
+          : h('div', { className: 'csb-list', style: { marginTop: 10 } }, notes.map((n, i) =>
+              h('div', { key: n.id ?? i, className: 'csb-card', style: { padding: '9px 12px' } },
+                h('div', { className: 'csb-card-main' },
+                  h('div', { style: { fontSize: 12.5, lineHeight: 1.7, whiteSpace: 'pre-wrap', wordBreak: 'break-word' } },
+                    h('span', { className: 'csb-mono', style: { marginRight: 6 } }, `[${fmt(n.at)}]`),
+                    n.text ?? '',
+                    h('span', { className: 'csb-set-d' }, `（${n.by ?? 'ui'}）`)))))),
+
+        jump
+          ? h(Modal, {
+              title: '去对话',
+              onClose: () => setJump(null),
+              footer: [
+                h('button', {
+                  key: 'c', className: 'csb-btn',
+                  onClick: async () => {
+                    const ok = await copyText(jump.id)
+                    setJump((j) => j && { ...j, hint: ok ? '已复制 ID。' : '请手动选中复制。' })
+                  },
+                }, '复制 ID'),
+                h('button', { key: 'x', className: 'csb-btn csb-btn-p', onClick: () => setJump(null) }, '知道了'),
+              ],
+            },
+            h('p', { className: 'csb-field-h' }, jump.hint),
+            h('div', {
+              className: 'csb-mono',
+              style: { padding: 10, background: 'var(--dsw-alias-bg-layer-2)', borderRadius: 8, wordBreak: 'break-all' },
+            }, jump.id))
+          : null)
+    }
+
+    /** Bot 页「派任务」：建任务 → 立即指派 → 显示唤醒结果（契约 §3.1）。 */
+    function BotAssignModal({ bot, onClose }) {
+      const [subject, setSubject] = useState('')
+      const [desc, setDesc] = useState('')
+      const [priority, setPriority] = useState('')
+      const [busy, setBusy] = useState(false)
+      const [err, setErr] = useState(null)
+      const [done, setDone] = useState(null)
+      const sessionId = bot?.sessionId ?? ''
+
+      const submit = async () => {
+        const s = subject.trim()
+        if (!s || busy) return
+        setBusy(true)
+        setErr(null)
+        setDone(null)
+        let task = null
+        try {
+          const body = { subject: s, assignee: sessionId }
+          if (desc.trim()) body.description = desc.trim()
+          if (priority !== '') body.priority = Number(priority)
+          const created = await call('/tasks', { method: 'POST', body })
+          task = created?.task ?? null
+        } catch (e) {
+          setErr(`建任务失败：${e.message}`)
+          setBusy(false)
+          return
+        }
+        try {
+          const assigned = await call('/tasks/assign', {
+            method: 'POST',
+            body: { id: task?.id, ownerId: sessionId, expectedRev: task?.rev },
+          })
+          setDone({ taskId: task?.id ?? assigned?.task?.id ?? '?', wake: assigned?.wake ?? null })
+          setSubject('')
+          setDesc('')
+          setPriority('')
+        } catch (e) {
+          setErr(`任务 ${task?.id ?? ''} 已建，但派活失败：${e.message}`)
+        } finally {
+          setBusy(false)
+        }
+      }
+
+      return h(Modal, {
+        title: `派任务给「${bot?.name ?? '这个 Bot'}」`,
+        onClose,
+        footer: [
+          h('button', { key: 'c', className: 'csb-btn', onClick: onClose }, done ? '关闭' : '取消'),
+          h('button', {
+            key: 'o', className: 'csb-btn csb-btn-p',
+            disabled: busy || !subject.trim(), onClick: submit,
+          }, busy ? '派活中…' : '创建并派活'),
+        ],
+      },
+        h('div', { className: 'csb-fld' },
+          h('label', null, '要做什么'),
+          h('input', {
+            className: 'csb-in', placeholder: '例如：实现登录接口',
+            value: subject, onChange: (e) => setSubject(e.target.value), autoFocus: true,
+          })),
+        h('div', { className: 'csb-fld' },
+          h('label', null, '目标 / 标准（会成为不可变的目标锚原文）'),
+          h('textarea', {
+            className: 'csb-ta', placeholder: '越具体越不容易跑偏：目标、验收标准、边界…',
+            value: desc, onChange: (e) => setDesc(e.target.value),
+          }),
+          h('div', { className: 'csb-fld-h' },
+            '创建后立即派给这个 Bot 并唤醒它；唤醒结果（sent / skipped / failed）显示在下面，失败会带原因。')),
+        h('div', { className: 'csb-fld' },
+          h('label', null, '负责人（已预填这个 Bot）'),
+          h('div', { className: 'csb-set-d' }, `${bot?.name ?? '—'} · 会话 ${short(sessionId || '—', 18)}`),
+          h('div', { className: 'csb-fld-h' }, '创建后立即派给这个 Bot（ownerId = 它的 sessionId），不需要再手动领取。')),
+        h('div', { className: 'csb-fld' },
+          h('label', null, '优先级（可选，0-10）'),
+          h('input', {
+            className: 'csb-in', style: { width: 100 }, type: 'number',
+            value: priority, onChange: (e) => setPriority(e.target.value),
+          })),
+        err ? h('div', { className: 'csb-err' }, err) : null,
+        done
+          ? h('div', { className: 'csb-ok' }, `已建任务 ${done.taskId} 并派给「${bot?.name ?? sessionId}」 · ${wakeLabel(done.wake)}`)
+          : null)
+    }
+
+    /** Bot 页「发消息」：直接给该 Bot 的会话说话（契约 §3.1 / §2.4）。 */
+    function BotMessageModal({ bot, onClose }) {
+      const [text, setText] = useState('')
+      const [busy, setBusy] = useState(false)
+      const [err, setErr] = useState(null)
+      const [done, setDone] = useState(null)
+
+      const send = async () => {
+        const t = text.trim()
+        if (!t || busy) return
+        setBusy(true)
+        setErr(null)
+        setDone(null)
+        try {
+          const d = await call('/bots/message', { method: 'POST', body: { botId: bot?.id, text: t } })
+          setDone({ sessionId: d?.sessionId, wake: d?.wake ?? null })
+          setText('')
+        } catch (e) {
+          setErr(`发送失败：${e.message}`)
+        } finally {
+          setBusy(false)
+        }
+      }
+
+      return h(Modal, {
+        title: `给「${bot?.name ?? '这个 Bot'}」发消息`,
+        onClose,
+        footer: [
+          h('button', { key: 'c', className: 'csb-btn', onClick: onClose }, '关闭'),
+          h('button', {
+            key: 's', className: 'csb-btn csb-btn-p',
+            disabled: busy || !text.trim(), onClick: send,
+          }, busy ? '发送中…' : '发送'),
+        ],
+      },
+        h('div', { className: 'csb-fld' },
+          h('label', null, '消息内容'),
+          h('textarea', {
+            className: 'csb-ta', placeholder: '例如：先做登录接口，做完回我一声',
+            value: text, onChange: (e) => setText(e.target.value),
+          }),
+          h('div', { className: 'csb-fld-h' },
+            `等价于你在这个 Bot 的会话里发一条消息（会话 ${short(bot?.sessionId ?? '—', 18)}）。`)),
+        err ? h('div', { className: 'csb-err' }, err) : null,
+        done
+          ? h('div', { className: 'csb-ok' },
+              `已送达（会话 ${short(done.sessionId ?? '—', 18)}）`,
+              done.wake ? ` · ${wakeLabel(done.wake)}` : '')
+          : null)
+    }
+
+    /** 房间消息 → 建任务：sourceSeq 幂等，重复点不会建两个（契约 §3.4）。 */
+    function RoomTaskCreateModal({ roomId, msg, onClose }) {
+      const body = String(msg?.body ?? msg?.text ?? '')
+      const seq = msg?.seq
+      const sourceSeq = `room:${roomId}:${seq}`
+      const firstLine = body.split('\n').map((l) => l.trim()).find(Boolean) ?? '（无标题）'
+      const [subject, setSubject] = useState(firstLine.slice(0, 80))
+      const [desc, setDesc] = useState(`${body}\n\n出处：房间 ${roomId} · 消息 #${seq}`.trim())
+      const [busy, setBusy] = useState(false)
+      const [err, setErr] = useState(null)
+      const [done, setDone] = useState(null)
+
+      const create = async () => {
+        const s = subject.trim()
+        if (!s || busy) return
+        setBusy(true)
+        setErr(null)
+        setDone(null)
+        try {
+          const d = await call('/tasks', {
+            method: 'POST',
+            body: { subject: s, description: desc.trim(), sourceSeq },
+          })
+          setDone({ id: d?.task?.id ?? '?', sourceSeq })
+        } catch (e) {
+          setErr(`建任务失败：${e.message}`)
+        } finally {
+          setBusy(false)
+        }
+      }
+
+      return h(Modal, {
+        title: `从消息 #${seq} 建任务`,
+        wide: true,
+        onClose,
+        footer: [
+          h('button', { key: 'c', className: 'csb-btn', onClick: onClose }, done ? '关闭' : '取消'),
+          h('button', {
+            key: 'o', className: 'csb-btn csb-btn-p',
+            disabled: busy || !subject.trim(), onClick: create,
+          }, busy ? '创建中…' : '创建任务'),
+        ],
+      },
+        h('div', { className: 'csb-fld' },
+          h('label', null, '任务标题（消息正文首行，可改）'),
+          h('input', {
+            className: 'csb-in', value: subject,
+            onChange: (e) => setSubject(e.target.value), autoFocus: true,
+          })),
+        h('div', { className: 'csb-fld' },
+          h('label', null, '任务描述（消息全文 + 出处）'),
+          h('textarea', {
+            className: 'csb-ta', style: { minHeight: 140 },
+            value: desc, onChange: (e) => setDesc(e.target.value),
+          })),
+        h('div', { className: 'csb-field-h' },
+          `来源幂等键：${sourceSeq} —— 同一条消息重复点「建任务」不会建出第二个任务。`),
+        err ? h('div', { className: 'csb-err' }, err) : null,
+        done
+          ? h('div', { className: 'csb-ok' }, `已建任务 ${done.id}（幂等键 ${done.sourceSeq}）`)
+          : null)
+    }
+
     function TasksTab() {
       const [filter, setFilter] = useState('')
       const [subject, setSubject] = useState('')
@@ -1085,6 +1532,8 @@ window.__ModuleLoader__.load({
       const [openId, setOpenId] = useState(null)
       const [busy, setBusy] = useState(false)
       const [err, setErr] = useState(null)
+      // 创建/派活的成功提示（改造04：创建时填了负责人 = 一步派活，wake 结果要 toast 出来）
+      const [ok, setOk] = useState(null)
       // 默认只看「需要我管的」；点「看全部」才显示 AI 派发的和已完成的
       const [attentionOnly, setAttentionOnly] = useState(true)
       // 双视图：看板 / 列表
@@ -1131,18 +1580,35 @@ window.__ModuleLoader__.load({
         if (!s) return
         setBusy(true)
         setErr(null)
+        setOk(null)
         try {
           const body = { subject: s }
           if (desc.trim()) body.description = desc.trim()
           if (priority !== '') body.priority = Number(priority)
           if (assignee) body.assignee = assignee
-          await call('/tasks', { method: 'POST', body })
+          const created = await call('/tasks', { method: 'POST', body })
+          const task = created?.task ?? null
           setSubject('')
           setDesc('')
           setPriority('')
           setAssignee('')
           setShowAdv(false)
           reload()
+          // 改造04 §3.3：选了负责人 = 一步派活；失败不静默，wake 结果如实显示。
+          if (assignee && task?.id) {
+            try {
+              const assigned = await call('/tasks/assign', {
+                method: 'POST',
+                body: { id: task.id, ownerId: assignee, expectedRev: task.rev },
+              })
+              setOk(`任务 ${task.id} 已创建，并派给 ${botName(bots, assignee)} · ${wakeLabel(assigned?.wake)}`)
+              reload()
+            } catch (e) {
+              setErr(humanizeError(e, errActions, '任务已建，但派活失败：'))
+            }
+          } else {
+            setOk(task?.id ? `任务 ${task.id} 已创建` : '任务已创建')
+          }
         } catch (e) {
           setErr(humanizeError(e, errActions))
         } finally {
@@ -1219,6 +1685,7 @@ window.__ModuleLoader__.load({
             h('option', { value: '' }, '全部负责人'),
             bots.map((b) => h('option', { key: b.id, value: b.sessionId }, b.name)))),
         err ? h(ErrBox, { humanized: err, onAction: (c) => errActions[c]?.() }) : null,
+        ok ? h(Notice, { kind: 'ok', onClose: () => setOk(null) }, ok) : null,
         error ? h('div', { className: 'csb-err' }, error) : null,
         loading ? h(Skeleton, { n: 3 }) : null,
         !loading && !error && filtered.length === 0
@@ -1866,6 +2333,9 @@ window.__ModuleLoader__.load({
       const [renameTo, setRenameTo] = useState('')
       const [retiring, setRetiring] = useState(null)
       const [sessionPicker, setSessionPicker] = useState(null)
+      // 改造04：Bot 卡片上的「派任务」「发消息」
+      const [assignFor, setAssignFor] = useState(null)
+      const [msgFor, setMsgFor] = useState(null)
       const nameRef = useRef(null)
 
       const presets = presetData?.presets ?? []
@@ -2014,6 +2484,8 @@ window.__ModuleLoader__.load({
                 (b.profile?.memory ?? []).length ? h('span', { className: 'csb-b' }, `${b.profile.memory.length} 记忆`) : null)),
             h('div', { style: { display: 'flex', gap: 6, flex: 'none' } },
               b.state !== 'retired' ? h('button', { className: 'csb-btn csb-btn-s csb-btn-p', onClick: () => setProfileFor(b) }, '档案') : null,
+              b.state !== 'retired' ? h('button', { className: 'csb-btn csb-btn-s', onClick: () => setAssignFor(b) }, '派任务') : null,
+              b.state !== 'retired' ? h('button', { className: 'csb-btn csb-btn-s', onClick: () => setMsgFor(b) }, '发消息') : null,
               b.state !== 'retired' ? h('button', { className: 'csb-btn csb-btn-s', onClick: () => openSession(b) }, '打开会话') : null,
               b.state !== 'retired'
                 ? h('button', { className: 'csb-btn csb-btn-s', onClick: () => { setRenaming(b); setRenameTo(b.name) } }, '改名')
@@ -2023,6 +2495,14 @@ window.__ModuleLoader__.load({
                 : null)))),
 
         picking ? h(DirPicker, { value: form.cwd, onChange: (p) => setForm({ ...form, cwd: p }), onClose: () => setPicking(false) }) : null,
+
+        // 改造04 §3.1：派任务 / 发消息
+        assignFor
+          ? h(BotAssignModal, { bot: assignFor, onClose: () => setAssignFor(null) })
+          : null,
+        msgFor
+          ? h(BotMessageModal, { bot: msgFor, onClose: () => setMsgFor(null) })
+          : null,
 
         renaming
           ? h(Modal, {
@@ -2358,6 +2838,8 @@ window.__ModuleLoader__.load({
       const [editing, setEditing] = useState(null)
       const [confirmDel, setConfirmDel] = useState(null)
       const [showBody, setShowBody] = useState(null)
+      // 改造04 §3.4：消息气泡 → 建任务（sourceSeq 幂等）
+      const [taskFor, setTaskFor] = useState(null)
       // 历史分页：前端切片（后端 sinceSeq 是「向后取」，不是「向前取」，
       // 所以先用全量、前端只渲染末尾 shownCount 条，点「加载更早」递增）
       const [shownCount, setShownCount] = useState(50)
@@ -2529,7 +3011,12 @@ window.__ModuleLoader__.load({
                               className: 'csb-btn csb-btn-s', style: { marginLeft: 'auto' },
                               onClick: () => setShowBody(m),
                             }, '看全文')
-                          : null),
+                          : null,
+                        h('button', {
+                          className: 'csb-btn csb-btn-s csb-msg-task',
+                          title: '把这条消息变成任务',
+                          onClick: () => setTaskFor({ roomId: active, msg: m }),
+                        }, '⇢ 建任务')),
                       h('div', { className: `csb-msg${isMe ? ' csb-msg-me' : ''}` },
                         h('div', { className: 'csb-msg-b' }, renderAt(long ? `${body.slice(0, 300)}…` : body))),
                       h('div', { className: 'csb-msg-time' }, fmt(m.at)))
@@ -2582,6 +3069,15 @@ window.__ModuleLoader__.load({
               onClose: () => setShowBody(null),
               footer: [h('button', { key: 'c', className: 'csb-btn', onClick: () => setShowBody(null) }, '关闭')],
             }, h('div', { className: 'csb-pre', style: { whiteSpace: 'pre-wrap' } }, showBody.body ?? showBody.text ?? ''))
+          : null,
+
+        // 改造04 §3.4：消息 → 建任务
+        taskFor
+          ? h(RoomTaskCreateModal, {
+              roomId: taskFor.roomId,
+              msg: taskFor.msg,
+              onClose: () => setTaskFor(null),
+            })
           : null,
 
         editing
@@ -4576,6 +5072,14 @@ window.__ModuleLoader__.load({
     exports.DirPicker = DirPicker
     exports.Modal = Modal
     exports.ConfirmModal = ConfirmModal
+    // 改造04（CONTRACT-bots04 §3）：派活 / 补充说明 / 目标锚 / 房间建任务
+    exports.TaskAnchorPanel = TaskAnchorPanel
+    exports.BotAssignModal = BotAssignModal
+    exports.BotMessageModal = BotMessageModal
+    exports.RoomTaskCreateModal = RoomTaskCreateModal
+    exports.CollapsibleText = CollapsibleText
+    exports.WakeNotice = WakeNotice
+    exports.wakeLabel = wakeLabel
     exports.PANEL_ID = PANEL_ID
     exports.API = API
 

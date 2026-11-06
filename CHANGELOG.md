@@ -13,6 +13,61 @@
 
 ---
 
+## [0.6.0] - 2026-11-06
+
+「一站式工作台」版。一句话：把**派活 / 补充 / 沟通 / 跳转**四件事全收进协作平台页面，
+并给每个任务一份**不可变的目标锚**，从机制上防住长任务的目标漂移。
+
+### Added
+
+- **目标锚（`GET /tasks/brief`）**
+  为什么：长任务最常见的失败不是做错，而是**做着做着目标漂了**——几十轮对话后
+  Bot 记住的是「最近一条消息」，不是「当初要什么」。所以把创建时的
+  `subject + description + writeScopes + blockedBy` 冻成**目标锚原文**，
+  `brief` 永远返回这份原文 + 一段可直接投递的锚定文案（字段恒定、格式固定，测试按行断言）。
+  `anchor` 里的 `status/ownerId/progress/artifacts` 是**当前快照**，不是冻结值——
+  冻结的只有「目标与边界」，状态本来就该变。
+
+- **补充说明（`POST /tasks/note` + `GET /tasks/notes`）**
+  为什么：人的补充天然是「追加」而不是「改写」。落**新文件** `task-notes.jsonl`
+  （append-only，不改 board 事件流、不动 `board.js`），编号 `n-<seq>` 不复用。
+  每条补充都触发一次定向唤醒，且**投递文案 = 全量锚定文案 + 这条补充**——
+  这是「不失真」真正落地的地方：Bot 每次被唤醒看到的都是完整目标，而不是增量碎片。
+  去重键 `task-note:<taskId>:<noteId>`，同一条补充只唤一次。
+  `wake:false`（或任务没 owner）时只存档不唤醒，且 `wake` 返回 `null` 而不是假装 sent。
+
+- **直发消息（`POST /bots/message`）**
+  为什么：以前从平台跟 Bot 说话必须先去会话列表找到它。现在 Bot 卡片上「发消息」
+  直接 `dispatcher.notify(reason='room-message')`，带 `botId` 或 `sessionId`，
+  给了 `taskId` 就自动前置完整锚定文案。缺省 dedupKey 用 `sha1(taskId+text)` 前 16 位，
+  重复点发送不会唤醒两次。未知 sessionId 仍允许（可能是主对话），但响应里 `knownBot:false` 明说。
+
+- **前端：Bot 页「派任务」「发消息」**
+  「派任务」= 建任务 → 立即 assign → 唤醒，一步完成；唤醒结果 `sent/skipped/failed(reason)`
+  必然显示；「任务已建但派活失败」会直说，不假装成功。
+
+- **前端：任务详情「目标锚 / 补充说明 / 去对话 / 复制派发文案」**
+  锚区块只读并标注「补充说明只追加不覆盖」；补充说明无 owner 时按钮改成
+  「保存补充（未派活，暂不唤醒）」；「去对话」用 `uiWorkspace.openSession` 直接跳，
+  不是本平台 Bot 时提示 + 给复制 ID 兜底；没有 `brief` 接口时用任务当前内容兜底展示，不白屏。
+
+- **前端：房间消息 → 建任务**
+  hover 出现「⇢ 建任务」，标题取正文首行截 80、描述带全文与出处，
+  `sourceSeq = room:<roomId>:<seq>` 走 board 既有幂等索引——同一条消息重复点不会建出第二个任务。
+
+### Changed
+
+- 版本号 0.5.0 → 0.6.0；`docs/操作手册-v1.md` 升级到 0.6.0（新增 §1.9 派活 / §1.10 目标锚 / §1.11 跳转 / §3.6 房间与任务的关系）。
+
+### Tests
+
+- 新增 `test/api-anchor.test.mjs`（12）：brief 文案逐行结构、notes 空/连加两条不覆盖/at 升序、
+  note `wake:false` 不调 dispatcher、note 唤醒文案含全量锚定、bots/message 的 400/404/超长/幂等键。
+- 新增 `test/client-anchor.test.mjs`（11）：新按钮/文案存在、五个新端点被调用、首渲染不抛、幂等键格式。
+- 基线：736 → **759** 个测试，全部通过（exit 0），零第三方依赖（CI PASS）。
+
+---
+
 ## [0.5.0] - 2026-11-06
 
 「看得见、管得动」版。一句话：把用户抱怨的三件事——**没有数据库页、没有成果页、

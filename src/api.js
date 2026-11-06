@@ -13,12 +13,14 @@
  */
 
 import { readFileSync, readdirSync, statSync } from 'node:fs'
+import { createHash } from 'node:crypto'
 import { join } from 'node:path'
 import { registerRoute, listPresets, defaultPreset } from './kernel.js'
 import { createLibrary } from './library.js'
 import { createDirBrowser } from './dirbrowse.js'
 import { getServices } from './registry.js'
 import { createFence } from './fence.js'
+import { appendJsonl, readJsonl, statePath } from './store.js'
 
 /** 请求体上限（防大包打爆内存）。 */
 const MAX_BODY = 2 * 1024 * 1024
@@ -222,6 +224,134 @@ function applySuggestion(services, suggestion, by) {
     return { kind, id: item?.id }
   }
   throw new Error(`applySuggestion：未知建议类型 ${JSON.stringify(kind)}（拒绝静默忽略）`)
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// bots改造04：任务目标锚（objective anchor）与直发消息
+//
+// 设计依据：`design/CONTRACT-bots04.md` §2（**已冻结**，字段名/文案格式/状态码逐字照做）。
+// 为什么需要：长任务几十轮后容易「目标漂移」。每次唤醒 Bot 都带**全量目标原文**，
+// 补充说明只追加（task-notes.jsonl，append-only）、永不覆盖目标，从机制上防漂移。
+// ══════════════════════════════════════════════════════════════════════════════
+
+/** 目标锚文案的固定标题（契约 §2.1 原文，逐字不可改）。 */
+const ANCHOR_TITLE = '【任务目标 · 原文锚定，禁止改写】'
+/** 补充说明落盘文件（新建；append-only，一行一条）。 */
+const TASK_NOTES_FILE = 'task-notes.jsonl'
+/** 补充说明 / 直发消息正文长度上限（契约 §2.2 / §2.4：trim 后 1–4000）。 */
+const ANCHOR_TEXT_MAX = 4000
+
+/** 取状态目录（board 优先，roster 兜底；都没有返回 undefined）。 */
+function anchorStateDir(services) {
+  return services?.board?.paths?.stateDir ?? services?.roster?.paths?.stateDir
+}
+
+/** 补充说明文件路径（状态目录缺失时 undefined）。 */
+function taskNotesPath(services) {
+  const dir = anchorStateDir(services)
+  return dir ? statePath(dir, TASK_NOTES_FILE) : undefined
+}
+
+/**
+ * 把时间戳格式化成人类可读的本地时间（`YYYY-MM-DD HH:mm:ss`）。
+ * 契约只写 `<时间>` 占位符，未冻结具体格式；这里选无 locale 依赖的固定格式，
+ * 保证跨环境稳定、可被测试断言。
+ */
+function formatAnchorTime(at) {
+  const n = Number(at)
+  if (!Number.isFinite(n)) return '未知时间'
+  const d = new Date(n)
+  const pad = (x) => String(x).padStart(2, '0')
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} `
+    + `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
+}
+
+/** 逗号拼接；空数组返回契约规定的占位文案。 */
+function joinAnchorList(list, emptyText) {
+  const items = Array.isArray(list) ? list.filter((x) => x !== null && x !== undefined && String(x).trim() !== '').map(String) : []
+  return items.length ? items.join(',') : emptyText
+}
+
+/**
+ * 从任务快照里抽出「目标锚」（契约 §2.1 的 `anchor` 结构）。
+ * 字段恒定出现（前端直接渲染，不判 undefined）；unknown 值给安全默认。
+ * @param {object} task
+ */
+function buildTaskAnchor(task) {
+  return {
+    subject: task?.subject ?? '',
+    description: task?.description ?? '',
+    writeScopes: Array.isArray(task?.writeScopes) ? [...task.writeScopes] : [],
+    blockedBy: Array.isArray(task?.blockedBy) ? [...task.blockedBy] : [],
+    priority: task?.priority ?? 0,
+    status: task?.status,
+    ownerId: task?.ownerId ?? null,
+    progress: task?.progress ?? 0,
+    artifacts: normalizeArtifactItems(task?.artifacts),
+    createdAt: task?.createdAt,
+  }
+}
+
+/** 读某任务的全部补充说明（按 `at` 升序；坏行由 readJsonl 计入 bad，不静默崩）。 */
+function readTaskNotes(services, taskId) {
+  const file = taskNotesPath(services)
+  if (!file) return []
+  const { rows } = readJsonl(file)
+  return rows
+    .filter((row) => row && row.taskId === taskId)
+    .map((row) => ({ id: row.id, text: row.text, by: row.by ?? 'ui', at: row.at }))
+    .sort((a, b) => (Number(a.at) || 0) - (Number(b.at) || 0))
+}
+
+/** 生成下一个补充说明编号 `n-<seq>`（append-only 文件内全局递增，绝不复用）。 */
+function nextTaskNoteId(rows) {
+  let max = 0
+  for (const row of rows) {
+    const m = /^n-(\d+)$/.exec(String(row?.id ?? ''))
+    if (!m) continue
+    const n = Number(m[1])
+    if (Number.isFinite(n) && n > max) max = n
+  }
+  // 契约允许「已读行数+1」；同时取两者最大值，防止删行/坏行导致编号重复。
+  return `n-${Math.max(max + 1, rows.length + 1)}`
+}
+
+/**
+ * 生成契约 §2.1 的固定锚定文案（**前端只展示/复制，不得改写**）。
+ *
+ * 固定格式（逐行）：
+ * ```
+ * 【任务目标 · 原文锚定，禁止改写】
+ * 任务 <id>：<subject>
+ * 目标：<description 原文；为空则（未填写）>
+ * 边界：只改 <writeScopes 逗号拼接；为空则（未限定）>
+ * 前置：<blockedBy 逗号拼接；为空则（无）>
+ * 进度：<progress>%
+ * 已交付：<artifacts 逗号拼接；为空则（暂无）>
+ * 补充说明（按时间，全部有效，不得忽略）：
+ * - [<时间>] <text>
+ * ```
+ * @param {object} task
+ * @param {{ at: number, text: string }[]} [notes]
+ * @returns {string}
+ */
+function buildTaskAnchorText(task, notes = []) {
+  const anchor = buildTaskAnchor(task)
+  const desc = typeof anchor.description === 'string' ? anchor.description : ''
+  const lines = [
+    ANCHOR_TITLE,
+    `任务 ${task?.id}：${anchor.subject}`,
+    `目标：${desc.trim() ? desc : '（未填写）'}`,
+    `边界：只改 ${joinAnchorList(anchor.writeScopes, '（未限定）')}`,
+    `前置：${joinAnchorList(anchor.blockedBy, '（无）')}`,
+    `进度：${anchor.progress}%`,
+    `已交付：${joinAnchorList(anchor.artifacts, '（暂无）')}`,
+    '补充说明（按时间，全部有效，不得忽略）：',
+  ]
+  for (const note of notes) {
+    lines.push(`- [${formatAnchorTime(note?.at)}] ${note?.text ?? ''}`)
+  }
+  return lines.join('\n')
 }
 
 /**
@@ -929,6 +1059,167 @@ export function installApi(ctx, { warn } = {}) {
           typeof b.history === 'function' ? b.history(id) : [],
         )
         sendJson(response, 200, { ok: true, history })
+        return
+      }
+
+      // ── 任务目标锚（契约 bots04 §2.1）：创建时冻结的目标原文 + 锚定文案 ──
+      if (request.method === 'GET' && path === '/tasks/brief') {
+        const id = qp(url, 'id')
+        if (!id) {
+          sendJson(response, 400, { ok: false, reason: 'id 必填' })
+          return
+        }
+        const task = await withService(services, 'board', (b) => b.get(id))
+        if (!task) {
+          sendJson(response, 404, { ok: false, reason: `任务 ${id} 不存在` })
+          return
+        }
+        const notes = readTaskNotes(services, task.id)
+        sendJson(response, 200, {
+          ok: true,
+          taskId: task.id,
+          anchor: buildTaskAnchor(task),
+          notes,
+          text: buildTaskAnchorText(task, notes),
+          note: '目标锚来自任务创建时的原文；补充说明另存，不会覆盖目标',
+        })
+        return
+      }
+
+      // ── 补充说明（契约 bots04 §2.2）：append-only，永不覆盖目标 ──────────
+      if (request.method === 'POST' && path === '/tasks/note') {
+        const body = (await readBody(request)) ?? {}
+        if (!body.id) {
+          sendJson(response, 400, { ok: false, reason: 'id 必填' })
+          return
+        }
+        const text = typeof body.text === 'string' ? body.text.trim() : ''
+        if (!text) {
+          sendJson(response, 400, { ok: false, reason: '补充说明不能为空' })
+          return
+        }
+        if (text.length > ANCHOR_TEXT_MAX) {
+          sendJson(response, 400, { ok: false, reason: `补充说明过长（最多 ${ANCHOR_TEXT_MAX} 字）` })
+          return
+        }
+        const task = await withService(services, 'board', (b) => b.get(body.id))
+        if (!task) {
+          sendJson(response, 404, { ok: false, reason: `任务 ${body.id} 不存在` })
+          return
+        }
+        // 唤醒前置检查放在落盘**之前**：dispatcher 缺失时直接 503，
+        // 避免「说明已落盘但唤醒静默失败」的半成品状态。
+        const shouldWake = body.wake !== false && Boolean(task.ownerId)
+        const dispatcher = shouldWake
+          ? await withService(services, 'dispatcher', (d) => d)
+          : undefined
+
+        const file = taskNotesPath(services)
+        if (!file) {
+          const error = new Error('状态目录不可用（task-notes.jsonl 无法落盘）')
+          error.status = 503
+          throw error
+        }
+        const { rows } = readJsonl(file)
+        const note = {
+          id: nextTaskNoteId(rows),
+          taskId: task.id,
+          text,
+          by: typeof body.by === 'string' && body.by.trim() ? body.by.trim() : 'ui',
+          at: Date.now(),
+        }
+        if (!appendJsonl(file, note)) {
+          const error = new Error(`补充说明落盘失败（${file}）`)
+          error.status = 503
+          throw error
+        }
+
+        let wake = null
+        if (shouldWake) {
+          // 唤醒文案 = 完整锚定文案（含刚追加的这条）+ 【新增补充说明】<text>
+          // 这正是「长任务不失真」的落点：Bot 每次被唤醒都看到全量目标原文。
+          const notes = readTaskNotes(services, task.id)
+          wake = dispatcher.notify({
+            target: task.ownerId,
+            reason: 'task-assigned',
+            dedupKey: `task-note:${task.id}:${note.id}`,
+            text: `${buildTaskAnchorText(task, notes)}\n\n【新增补充说明】${note.text}`,
+          })
+        }
+        sendJson(response, 200, { ok: true, note, wake })
+        return
+      }
+
+      // ── 补充说明历史（契约 bots04 §2.3）：只读，按 at 升序 ────────────────
+      if (request.method === 'GET' && path === '/tasks/notes') {
+        const id = qp(url, 'id')
+        if (!id) {
+          sendJson(response, 400, { ok: false, reason: 'id 必填' })
+          return
+        }
+        const task = await withService(services, 'board', (b) => b.get(id))
+        if (!task) {
+          sendJson(response, 404, { ok: false, reason: `任务 ${id} 不存在` })
+          return
+        }
+        sendJson(response, 200, { ok: true, taskId: task.id, notes: readTaskNotes(services, task.id) })
+        return
+      }
+
+      // ── 直发消息（契约 bots04 §2.4）：从协作平台直接给某个 Bot 会话说话 ──
+      if (request.method === 'POST' && path === '/bots/message') {
+        const body = (await readBody(request)) ?? {}
+        if (!body.botId && !body.sessionId) {
+          sendJson(response, 400, { ok: false, reason: 'botId 或 sessionId 必填' })
+          return
+        }
+        const text = typeof body.text === 'string' ? body.text.trim() : ''
+        if (!text) {
+          sendJson(response, 400, { ok: false, reason: '消息不能为空' })
+          return
+        }
+        if (text.length > ANCHOR_TEXT_MAX) {
+          sendJson(response, 400, { ok: false, reason: `消息过长（最多 ${ANCHOR_TEXT_MAX} 字）` })
+          return
+        }
+        let sessionId
+        if (body.botId) {
+          const bot = await withService(services, 'roster', (r) => r.get(body.botId))
+          if (!bot) {
+            sendJson(response, 404, { ok: false, reason: `Bot ${body.botId} 不存在` })
+            return
+          }
+          sessionId = bot.sessionId
+        } else {
+          sessionId = body.sessionId
+        }
+        // 未知 sessionId 仍允许（可能是主对话），但必须如实告知 knownBot:false。
+        const knownBot = await withService(services, 'roster', (r) => r.hasSession(sessionId))
+
+        let prefix = ''
+        if (body.taskId) {
+          const task = await withService(services, 'board', (b) => b.get(body.taskId))
+          if (!task) {
+            sendJson(response, 404, { ok: false, reason: `任务 ${body.taskId} 不存在` })
+            return
+          }
+          prefix = `${buildTaskAnchorText(task, readTaskNotes(services, task.id))}\n\n`
+        }
+        const deliveredText = prefix + text
+        const hash = createHash('sha1')
+          .update(`${body.taskId ?? ''}${text}`)
+          .digest('hex')
+          .slice(0, 16)
+        const dedupKey = typeof body.dedupKey === 'string' && body.dedupKey.trim()
+          ? body.dedupKey.trim()
+          : `ui-msg:${hash}`
+        const wake = await withService(services, 'dispatcher', (d) => d.notify({
+          target: sessionId,
+          reason: 'room-message',
+          dedupKey,
+          text: deliveredText,
+        }))
+        sendJson(response, 200, { ok: true, sessionId, knownBot, wake, text: deliveredText })
         return
       }
 
