@@ -324,6 +324,17 @@ window.__ModuleLoader__.load({
 /* 唤醒失败后的可操作按钮（契约 bots05 §3.2） */
 .csb-wake{margin-bottom:10px}
 .csb-wake .csb-notice{margin-bottom:6px}
+
+/* 任务变更中心（契约 bots06 §3.1 / §3.3） */
+.csb-evolve{border:1px solid var(--dsw-alias-border-l1);border-radius:12px;padding:12px 14px;
+  margin-top:10px;background:var(--dsw-alias-bg-base)}
+.csb-evolve-head{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.csb-evolve-head h4{margin:0;font-size:13.5px;font-weight:600;line-height:1.4}
+.csb-evolve-head .csb-btn{margin-left:auto}
+.csb-evolve-snap{margin-top:10px;padding:9px 12px;border-radius:9px;font-size:12px;line-height:1.6;
+  color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-bg-layer-2);word-break:break-word}
+.csb-chg{padding:9px 12px}
+.csb-chg-t{font-size:12.5px;line-height:1.7;word-break:break-word}
 `
 
     function installStyles() {
@@ -1256,6 +1267,45 @@ window.__ModuleLoader__.load({
           : null)
     }
 
+    /** 平台伪身份：这些值永远不可能是 Bot 会话 id。 */
+    const PLATFORM_OWNER_IDS = ['ui', 'user', 'anyone', 'system']
+
+    /**
+     * 把任务的「负责人相关字段」解析成一个真正可跳转的 Bot。
+     *
+     * 为什么需要它（2026-11-06 用户实测报错「该负责人不是本平台的 Bot，无法跳转…定位 ui」）：
+     *   - `ownerId` 是**租约持有者**：人会自己 claim（`ui`），或验收时被覆盖；
+     *   - `assignee` 才是「这活原本派给谁」；
+     *   - 任务可能没有 owner 但创建时填了 assignee。
+     * 所以按 **assignee → ownerId → task.ownerId** 顺序找，命中即用；
+     * 同时过滤平台伪身份 —— 否则会把 `ui` 当成会话 id 去找，报一句无解的错误。
+     *
+     * @param {{ task?: object, ownerId?: string|null, bots?: object[] }} input
+     * @returns {{
+     *   bot: object|null,
+     *   tried: string[],
+     *   candidates: string[],
+     *   onlyPlatform: boolean,
+     * }}
+     */
+    function resolveOwnerBot({ task, ownerId, bots }) {
+      const list = Array.isArray(bots) ? bots : []
+      const raw = [task?.assignee, ownerId, task?.ownerId]
+      const candidates = []
+      for (const value of raw) {
+        if (typeof value !== 'string' || value.trim() === '') continue
+        const v = value.trim()
+        if (candidates.includes(v)) continue
+        candidates.push(v)
+      }
+      const tried = candidates.filter((v) => !PLATFORM_OWNER_IDS.includes(v.toLowerCase()))
+      for (const value of tried) {
+        const found = list.find((b) => b && (b.sessionId === value || b.id === value))
+        if (found) return { bot: found, tried, candidates, onlyPlatform: false }
+      }
+      return { bot: null, tried, candidates, onlyPlatform: tried.length === 0 }
+    }
+
     /**
      * 任务详情 ·「目标锚 + 补充说明」区块（契约 §3.2）。
      *
@@ -1305,18 +1355,32 @@ window.__ModuleLoader__.load({
         }
       }
 
-      /** 去对话：ownerId → /roster 找 sessionId → 宿主 openSession。 */
+      /**
+       * 去对话：把「负责人」解析成真正的 Bot 会话，再调宿主 openSession。
+       *
+       * 为什么不能只看 ownerId（2026-11-06 用户实测报错）：
+       *   `ownerId` 是**租约持有者**，人会自己 claim（`ui`）或验收时被覆盖；
+       *   而「这活原本派给谁」记在 `assignee` 上。只看 ownerId 就会出现
+       *   「任务明明派给了 bot-xxx，点去对话却说『该负责人不是本平台的 Bot』，定位 ui」。
+       * ⇒ 按 **assignee → ownerId → anchor.ownerId** 顺序逐个尝试，
+       *   并过滤 `ui`/`user`/`anyone` 这类平台伪身份（它们永远不可能是 Bot 会话）。
+       */
       const gotoOwner = async () => {
         setErr(null)
-        if (!hasOwner) {
+        const { bot, candidates, onlyPlatform } = resolveOwnerBot({ task, ownerId, bots })
+        if (candidates.length === 0) {
           setErr('这个任务还没有执行者，先派活儿再跳转对话')
           return
         }
-        const bot = bots.find((b) => b.sessionId === ownerId || b.id === ownerId)
         if (!bot) {
+          // 说清楚「为什么跳不了」，并给出真正能用的下一步，而不是只报一句无解。
           setJump({
-            id: ownerId,
-            hint: '该负责人不是本平台的 Bot，无法跳转。可以复制 ID 到左侧会话列表里手动定位。',
+            id: candidates[0],
+            hint: onlyPlatform
+              ? '这个任务的负责人是平台操作者（你），没有可跳转的 Bot 会话。'
+                + '如果它是派给某个 Bot 的，请确认「负责人」字段填的是 Bot 的会话 ID（可在 Bot 页复制）。'
+              : '这个任务的负责人不是本平台注册的 Bot（可能已被退役，或是外部会话），无法自动跳转。'
+                + '可以复制 ID 到左侧会话列表里手动定位。',
           })
           return
         }
@@ -5327,6 +5391,7 @@ window.__ModuleLoader__.load({
     exports.wakeLabel = wakeLabel
     // 改造05（CONTRACT-bots05 §3）：唤醒失败可操作化 / 会话启动
     exports.wakeReasonText = wakeReasonText
+    exports.resolveOwnerBot = resolveOwnerBot
     exports.reviveSession = reviveSession
     exports.reviveResultText = reviveResultText
     exports.reviveAllText = reviveAllText
