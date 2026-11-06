@@ -255,10 +255,17 @@ window.__ModuleLoader__.load({
   overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 
 .csb-msg{padding:9px 12px;border-radius:10px;margin-bottom:6px;background:var(--dsw-alias-bg-layer-1);
-  border:1px solid var(--dsw-alias-border-l1)}
-.csb-msg-me{background:var(--dsw-alias-bg-layer-2)}
+  border:1px solid var(--dsw-alias-border-l1);max-width:78%;display:inline-block}
+.csb-msg-me{background:var(--dsw-alias-bg-layer-2);margin-left:auto}
+.csb-msg-row{display:flex;flex-direction:column;margin-bottom:8px}
+.csb-msg-row-me{align-items:flex-end}
 .csb-msg-h{display:flex;align-items:center;gap:7px;margin-bottom:3px;font-size:11px;color:var(--dsw-alias-label-secondary)}
 .csb-msg-b{font-size:12.5px;line-height:1.6;white-space:pre-wrap;word-break:break-word}
+.csb-msg-time{font-size:10px;color:var(--dsw-alias-label-tertiary);margin-top:2px}
+.csb-msg-sender{font-weight:600}
+.csb-progress{height:6px;border-radius:3px;background:var(--dsw-alias-bg-layer-2);overflow:hidden;margin:4px 0}
+.csb-progress-fill{height:100%;background:var(--dsw-alias-label-primary);transition:width .2s}
+.csb-kv-progress{display:flex;align-items:center;gap:8px}
 
 .csb-tags{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px}
 .csb-tag{display:inline-flex;align-items:center;gap:6px;min-height:26px;padding:3px 8px;border-radius:6px;
@@ -824,6 +831,10 @@ window.__ModuleLoader__.load({
             h('span', { className: 'csb-k' }, '状态'), h('span', { className: 'csb-v' }, h(Badge, { status: task.status })),
             h('span', { className: 'csb-k' }, '任务编号'), h('span', { className: 'csb-v csb-mono' }, task.id),
             h('span', { className: 'csb-k' }, '谁在做'), h('span', { className: 'csb-v' }, task.ownerId ? botName(bots, task.ownerId) : '还没人领'),
+            h('span', { className: 'csb-k' }, '进度'), h('span', { className: 'csb-v csb-kv-progress' },
+              h('div', { className: 'csb-progress', style: { flex: 1, minWidth: 80 } },
+                h('div', { className: 'csb-progress-fill', style: { width: `${Math.max(0, Math.min(100, task.progress ?? 0))}%` } })),
+              h('span', null, `${task.progress ?? 0}%`)),
             h('span', { className: 'csb-k' }, '在哪做'), h('span', { className: 'csb-v' }, (task.writeScopes ?? []).join('、') || '不限'),
             h('span', { className: 'csb-k' }, '完成前必须先'), h('span', { className: 'csb-v' }, (task.blockedBy ?? []).length ? task.blockedBy.join('、') : '无'),
             h('span', { className: 'csb-k' }, '交付物'), h('span', { className: 'csb-v' }, (task.artifacts ?? []).join('、') || '—'),
@@ -2226,10 +2237,11 @@ window.__ModuleLoader__.load({
                   msgs.map((m) => {
                     const body = m.body ?? m.text ?? ''
                     const long = body.length > 300
-                    return h('div', { key: m.id, className: `csb-msg${m.from === 'user' || m.from === 'ui' ? ' csb-msg-me' : ''}` },
+                    const isMe = m.from === 'user' || m.from === 'ui'
+                    return h('div', { key: m.id, className: `csb-msg-row${isMe ? ' csb-msg-row-me' : ''}` },
                       h('div', { className: 'csb-msg-h' },
+                        h('span', { className: 'csb-msg-sender' }, botName(bots, m.from)),
                         h('span', null, `#${m.seq}`),
-                        h('span', null, botName(bots, m.from)),
                         m.bodyRef ? h('span', { className: 'csb-b' }, '长正文') : null,
                         m.bodyError ? h('span', { className: 'csb-b csb-b-err' }, '正文读取失败') : null,
                         long
@@ -2238,7 +2250,9 @@ window.__ModuleLoader__.load({
                               onClick: () => setShowBody(m),
                             }, '看全文')
                           : null),
-                      h('div', { className: 'csb-msg-b' }, long ? `${body.slice(0, 300)}…` : body))
+                      h('div', { className: `csb-msg${isMe ? ' csb-msg-me' : ''}` },
+                        h('div', { className: 'csb-msg-b' }, long ? `${body.slice(0, 300)}…` : body)),
+                      h('div', { className: 'csb-msg-time' }, fmt(m.at)))
                   }),
                   h('div', { ref: endRef }))),
                 h('div', { className: 'csb-bar' },
