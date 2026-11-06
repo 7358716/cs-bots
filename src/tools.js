@@ -102,6 +102,9 @@ const DEFS = [
           type: 'boolean',
           description: '该子任务是否值得用付费渠道（默认 false ⇒ free_only）；只有确实需要强模型时才置 true',
         },
+        cycle: { type: 'string', description: '周期名（PDCA 复盘周期标识）' },
+        milestone: { type: 'string', description: '里程碑名' },
+        estimate: { type: 'number', description: '预估工作量（≥0）' },
       },
       required: ['subject'],
       additionalProperties: false,
@@ -756,6 +759,247 @@ const DEFS = [
     run: (s, a) => {
       if (!s.suggest) return failure('suggest-unavailable')
       return success({ suggestions: s.suggest.listSuggestions(a ?? {}) })
+    },
+  },
+
+  // ── PDCA-4：复盘与标准化（Act）─────────────────────────────────────────────
+  {
+    name: 'bot_cycle_start',
+    description: '为一个任务开启 PDCA 复盘周期。阶段：planned→doing→checking→acting→done，不许跳步。',
+    parameters: {
+      type: 'object',
+      properties: {
+        taskId: { type: 'string', description: '任务 id' },
+        objective: { type: 'string', description: '目标原文（防漂移锚）' },
+        cycle: { type: 'string' },
+        milestone: { type: 'string' },
+        estimate: { type: 'number' },
+      },
+      required: ['taskId', 'objective'],
+      additionalProperties: false,
+    },
+    run: (s, a, exec) => {
+      if (!s.cycle) return failure('cycle-unavailable')
+      try {
+        return success({ cycle: s.cycle.start({ ...a, by: callerOf(exec) }) })
+      } catch (error) {
+        return failure(error?.code ?? 'cycle-start-failed', { message: error?.message ?? String(error) })
+      }
+    },
+  },
+  {
+    name: 'bot_cycle_advance',
+    description: '推进复盘阶段。**不许跳步**：planned→doing→checking→acting→done。',
+    parameters: {
+      type: 'object',
+      properties: {
+        id: { type: 'string' },
+        expectedRev: { type: 'number' },
+        phase: { type: 'string', enum: ['doing', 'checking', 'acting', 'done'] },
+        progress: { type: 'number' },
+        evidence: { type: 'string' },
+      },
+      required: ['id', 'phase'],
+      additionalProperties: false,
+    },
+    run: (s, a, exec) => {
+      if (!s.cycle) return failure('cycle-unavailable')
+      try {
+        return success({ cycle: s.cycle.advance({ ...a, by: callerOf(exec) }) })
+      } catch (error) {
+        return failure(error?.code ?? 'cycle-advance-failed', { message: error?.message ?? String(error) })
+      }
+    },
+  },
+  {
+    name: 'bot_cycle_check',
+    description: '记录检查结果。pass 前进到 acting，reject 打回 doing 重做。',
+    parameters: {
+      type: 'object',
+      properties: {
+        id: { type: 'string' },
+        expectedRev: { type: 'number' },
+        result: { type: 'string', enum: ['pass', 'reject'] },
+        evidence: { type: 'string' },
+      },
+      required: ['id', 'result'],
+      additionalProperties: false,
+    },
+    run: (s, a, exec) => {
+      if (!s.cycle) return failure('cycle-unavailable')
+      try {
+        return success({ cycle: s.cycle.check({ ...a, by: callerOf(exec) }) })
+      } catch (error) {
+        return failure(error?.code ?? 'cycle-check-failed', { message: error?.message ?? String(error) })
+      }
+    },
+  },
+  {
+    name: 'bot_cycle_review',
+    description: '复盘（Act）：记录经验教训，并提议标准化建议（纪律/记忆）。建议走确认制，人采纳才落库。',
+    parameters: {
+      type: 'object',
+      properties: {
+        id: { type: 'string' },
+        expectedRev: { type: 'number' },
+        summary: { type: 'string', description: '复盘总结（≤8000）' },
+        lessons: { type: 'array', items: { type: 'string' }, description: '经验教训（≤20 条）' },
+        standards: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              scope: { type: 'string', enum: ['global', 'workspace', 'room', 'bot'] },
+              scopeId: { type: 'string' },
+              kind: { type: 'string', enum: ['rule', 'requirement', 'principle', 'style'] },
+              title: { type: 'string' },
+              content: { type: 'string' },
+            },
+            required: ['scope', 'kind', 'title', 'content'],
+            additionalProperties: false,
+          },
+        },
+      },
+      required: ['id', 'summary'],
+      additionalProperties: false,
+    },
+    run: (s, a, exec) => {
+      if (!s.cycle) return failure('cycle-unavailable')
+      try {
+        return success(s.cycle.review({ ...a, by: callerOf(exec) }))
+      } catch (error) {
+        return failure(error?.code ?? 'cycle-review-failed', { message: error?.message ?? String(error) })
+      }
+    },
+  },
+
+  // ── PDCA-3：测量（metrics）────────────────────────────────────────────────
+  {
+    name: 'bot_metrics_record',
+    description: '记一条 PDCA 测量指标（cycle_start/accept_pass/accept_reject/task_claim 等）。',
+    parameters: {
+      type: 'object',
+      properties: {
+        kind: {
+          type: 'string',
+          enum: ['cycle_start', 'cycle_complete', 'review_proposed', 'review_done',
+            'accept_pass', 'accept_reject', 'task_claim', 'task_complete', 'task_blocked',
+            'lead_create', 'bot_create', 'room_create', 'turn_end'],
+        },
+        taskId: { type: 'string' },
+        cycleId: { type: 'string' },
+        sessionId: { type: 'string' },
+        value: { type: 'number' },
+        labels: { type: 'object' },
+      },
+      required: ['kind'],
+      additionalProperties: false,
+    },
+    run: (s, a, exec) => {
+      if (!s.metrics) return failure('metrics-unavailable')
+      try {
+        return success({ record: s.metrics.record({ ...a, by: callerOf(exec) }) })
+      } catch (error) {
+        return failure(error?.code ?? 'metrics-record-failed', { message: error?.message ?? String(error) })
+      }
+    },
+  },
+  {
+    name: 'bot_metrics_aggregate',
+    description: '聚合测量指标：按 kind 计数 + 求和 + 首末时间。',
+    parameters: {
+      type: 'object',
+      properties: {
+        kind: { type: 'string' },
+        since: { type: 'number', description: 'epoch ms' },
+      },
+      additionalProperties: false,
+    },
+    run: (s, a) => {
+      if (!s.metrics) return failure('metrics-unavailable')
+      return success({ aggregate: s.metrics.aggregate(a ?? {}) })
+    },
+  },
+
+  // ── PDCA-2：验收证据 ──────────────────────────────────────────────────────
+  {
+    name: 'bot_verify_evaluate',
+    description: '对一组产出路径做存在性检查（机器证据，不接受"我完成了"）。',
+    parameters: {
+      type: 'object',
+      properties: {
+        artifacts: { type: 'array', items: { type: 'string' }, description: '产出文件路径' },
+      },
+      required: ['artifacts'],
+      additionalProperties: false,
+    },
+    run: (s, a) => {
+      if (!s.verify) return failure('verify-unavailable')
+      return success(s.verify.evaluate(a?.artifacts ?? []))
+    },
+  },
+
+  // ── 大/小团队 ──────────────────────────────────────────────────────────────
+  {
+    name: 'bot_teams_create',
+    description: '创建一个团队。big 团队（人建的）必须带 leadId；small 团队（智能体自建的）leadId 可选。',
+    parameters: {
+      type: 'object',
+      properties: {
+        name: { type: 'string' },
+        type: { type: 'string', enum: ['big', 'small'] },
+        purpose: { type: 'string' },
+        memberIds: { type: 'array', items: { type: 'string' } },
+        leadId: { type: 'string' },
+      },
+      required: ['name', 'type'],
+      additionalProperties: false,
+    },
+    run: (s, a, exec) => {
+      if (!s.teams) return failure('teams-unavailable')
+      try {
+        return success({ team: s.teams.create({ ...a, by: callerOf(exec) }) })
+      } catch (error) {
+        return failure(error?.code ?? 'teams-create-failed', { message: error?.message ?? String(error) })
+      }
+    },
+  },
+  {
+    name: 'bot_teams_list',
+    description: '列出团队（按类型/状态过滤）。大团队是人建的稳定结构，小团队是智能体自建的临时小组。',
+    parameters: {
+      type: 'object',
+      properties: {
+        type: { type: 'string', enum: ['big', 'small'] },
+        status: { type: 'string', enum: ['open', 'closed'] },
+      },
+      additionalProperties: false,
+    },
+    run: (s, a) => {
+      if (!s.teams) return failure('teams-unavailable')
+      return success({ teams: s.teams.list(a ?? {}) })
+    },
+  },
+  {
+    name: 'bot_teams_add',
+    description: '向团队添加成员（需带 expectedRev 做 CAS）。',
+    parameters: {
+      type: 'object',
+      properties: {
+        id: { type: 'string' },
+        expectedRev: { type: 'number' },
+        memberId: { type: 'string' },
+      },
+      required: ['id', 'memberId'],
+      additionalProperties: false,
+    },
+    run: (s, a, exec) => {
+      if (!s.teams) return failure('teams-unavailable')
+      try {
+        return success({ team: s.teams.addMember({ ...a, by: callerOf(exec) }) })
+      } catch (error) {
+        return failure(error?.code ?? 'teams-add-failed', { message: error?.message ?? String(error) })
+      }
     },
   },
 ]

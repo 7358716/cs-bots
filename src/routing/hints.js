@@ -30,13 +30,24 @@ import {
   billingTierFor,
   classifyComplexity,
   normalizeRole,
+  normalizeSubagentMode,
   normalizeTier,
 } from './complexity.js'
 
 /** 跨插件唯一入口（与 cs-myfree 的 `adapter/routing-hints.js` 必须逐字一致）。 */
 export const HINTS_SYMBOL = Symbol.for('cs-myfree.routing.hints.v1')
-/** 本模块写入的 hint 版本（契约 §3 冻结为 1）。 */
-export const HINTS_VERSION = 1
+/**
+ * 本模块写入的 hint 版本。
+ *
+ * v1（`design/17` §3）= 六键；v2（`design/22` 契约 E1/E4）= 六键 + 两个**可选**键
+ * `follow_parent_routing` / `pinned_model`。
+ *
+ * 🔴 交叉兼容纪律（两个仓库的版本必然错开升级）：
+ *   · **v1 六键 hint 仍然合法**（本模块未声明策略时**照旧只发六键**，形状不变）；
+ *   · **未知键必须被丢弃而不是报错** —— 旧 cs-myfree 读新 hint、新 cs-myfree 读旧
+ *     hint 都必须能跑；报错会让整条授权链路静默消失（比缺功能更难查）。
+ */
+export const HINTS_VERSION = 2
 /** 请求级 hint 的来源标识（可审计：谁写的）。 */
 export const SOURCE_LLM_STREAM = 'cs-bots/llm-stream'
 /** 任务板 claim/wake 时写 hint 的来源标识。 */
@@ -126,16 +137,110 @@ export function signalsFromRequest(options = {}, extra = {}) {
 
 // ── hint 构造（纯函数，离线可测）──────────────────────────────────────────────
 
+/** v1 六键（`design/17` §3，语义冻结不许改）。 */
+export const HINT_KEYS_V1 = Object.freeze([
+  'billing_tier', 'complexity_tier', 'agent_role', 'requires_paid', 'source', 'at',
+])
+
+/** v2 新增的两个**可选**键（`design/22` 契约 E1）。 */
+export const HINT_KEYS_V2 = Object.freeze(['follow_parent_routing', 'pinned_model'])
+
+/** 本模块认得的全部键（白名单：其余一律丢弃）。 */
+export const KNOWN_HINT_KEYS = Object.freeze([...HINT_KEYS_V1, ...HINT_KEYS_V2])
+
 /**
- * 造一个契约 §3 形状的 hint（**恰好六个键**，不多不少）。
+ * 白名单过滤 hint：**只保留认得的键**（未知键丢弃，绝不抛错）。
+ *
+ * 用于「结果出口」而不是「入口校验」：cs-myfree 侧 `normalizeHint` 也是白名单重建，
+ * 两边都丢弃未知键 ⇒ 任一仓库先升级都不会把对方搞挂（契约 E4 的交叉兼容要求）。
+ *
+ * @param {unknown} hint
+ * @returns {object} 只含已知键的新对象（原对象不动；`null`/非对象 ⇒ `{}`）
+ */
+export function pickHintKeys(hint) {
+  const out = {}
+  if (!hint || typeof hint !== 'object') return out
+  for (const key of KNOWN_HINT_KEYS) {
+    if (hint[key] !== undefined) out[key] = hint[key]
+  }
+  return out
+}
+
+/**
+ * 归一化 `follow_parent_routing`：只认布尔，其它 ⇒ `undefined`（= **不出现在 hint 里**）。
+ *
+ * 为什么是 `undefined` 而不是 `null`：cs-bots 是 hint 的**生产方**，
+ * 「没有声明」就应该连键都不发（保持 v1 六键形状不变 ⇒ 旧 cs-myfree 零感知）。
+ * cs-myfree 是消费方，它那边才把「缺键」归一成 `null`。
+ *
+ * @param {unknown} value
+ * @returns {boolean|undefined}
+ */
+export function normalizeFollowParentRouting(value) {
+  return typeof value === 'boolean' ? value : undefined
+}
+
+/**
+ * 归一化 `pinned_model`（`'provider/model'` 或裸模型名）：非法 ⇒ `undefined`（不发该键）。
+ * @param {unknown} value
+ * @returns {string|undefined}
+ */
+export function normalizePinnedModel(value) {
+  if (typeof value !== 'string') return undefined
+  const s = value.trim()
+  if (!s) return undefined
+  if (/[\s\u0000-\u001F\u007F]/.test(s)) return undefined
+  return s.slice(0, 128)
+}
+
+/**
+ * 由 `subagentRouting`（或显式声明）推导两个 v2 键（纯函数）。
+ *
+ * 映射（契约 E3 三选项，逐条对应，不自创）：
+ *   · mode='follow' ⇒ `follow_parent_routing: true`
+ *   · mode='pinned' ⇒ `follow_parent_routing: false` + `pinned_model: model`（无 model 则不发该键）
+ *   · mode='auto'   ⇒ `follow_parent_routing: false`（明确不跟随，由 myfree 自动选路）
+ *   · 未配置（null）⇒ **两个键都不发**（保持 v1 六键形状 ⇒ 零回归）
+ *
+ * 显式 `followParentRouting` / `pinnedModel` 优先级高于 `subagentRouting.mode`（便于
+ * 任务板按任务覆盖）。
+ *
+ * @param {{ subagentRouting?: object|null, followParentRouting?: boolean,
+ *           pinnedModel?: string|null }} [deps]
+ * @returns {{ follow?: boolean, pinned?: string }}
+ */
+export function subagentRoutingKeys(deps = {}) {
+  const out = {}
+  const explicitFollow = normalizeFollowParentRouting(deps?.followParentRouting)
+  const explicitPinned = normalizePinnedModel(deps?.pinnedModel)
+  const mode = normalizeSubagentMode(deps?.subagentRouting?.mode)
+
+  if (explicitFollow !== undefined) out.follow = explicitFollow
+  else if (mode === 'follow') out.follow = true
+  else if (mode === 'pinned' || mode === 'auto') out.follow = false
+
+  if (explicitPinned !== undefined) out.pinned = explicitPinned
+  else if (mode === 'pinned') {
+    const pinned = normalizePinnedModel(deps?.subagentRouting?.model)
+    if (pinned !== undefined) out.pinned = pinned
+  }
+  return out
+}
+
+/**
+ * 造一个契约形状的 hint。
+ *
+ * v1 六键**永远**都在（值域不变）；v2 两键是**可选**的 —— 传了才出现，
+ * 没传就不出现（这是「v1 客户端/旧配置 ⇒ 形状与今天逐字一致」的落地方式）。
  *
  * @param {{ billing_tier: 'free_only'|'paid_allowed', complexity_tier: string|null,
  *           agent_role: 'main'|'subagent'|'unknown', requires_paid: boolean,
- *           source: string, at: number }} parts
+ *           source: string, at: number,
+ *           follow_parent_routing?: boolean|null, pinned_model?: string|null }} parts
  * @returns {object}
  */
 function buildHint(parts) {
-  return {
+  const hint = {
     billing_tier: parts.billing_tier,
     complexity_tier: parts.complexity_tier ?? null,
     agent_role: parts.agent_role,
@@ -143,6 +248,11 @@ function buildHint(parts) {
     source: String(parts.source),
     at: parts.at,
   }
+  const follow = normalizeFollowParentRouting(parts.follow_parent_routing)
+  if (follow !== undefined) hint.follow_parent_routing = follow
+  const pinned = normalizePinnedModel(parts.pinned_model)
+  if (pinned !== undefined) hint.pinned_model = pinned
+  return hint
 }
 
 /**
@@ -187,28 +297,66 @@ function isTaskGrant(hint) {
  * @param {object|null|undefined} existing 注册表里已有的 hint（可能为 null）
  * @param {object} next 本次请求算出的 hint
  * @param {{ now?: number, ttlMs?: number }} [opts]
- * @returns {object} 要写入的 hint（**恰好六个键**，与契约 §3 一致）
+ * @returns {object} 要写入的 hint（只含已知键；未声明策略时**恰好六键**，与契约 §3 一致）
  */
 export function mergeHint(existing, next, opts = {}) {
   if (!next || typeof next !== 'object') return next
-  if (next.billing_tier === 'paid_allowed') return next
-  if (!existing || typeof existing !== 'object') return next
+  const merged = mergeHintCore(existing, next, opts)
+  return pickHintKeys(merged)
+}
 
-  const isTaskAuth = isTaskGrant(existing)
-  if (!isTaskAuth) return next
+/**
+ * `mergeHint` 的实体（`pickHintKeys` 只做出口白名单，逻辑全在这里）。
+ *
+ * v2 两键的合并规则（与 billing_tier 的"只升不降"**不同**，刻意分开）：
+ *   · 它们是**声明式策略**，不是授权：本次请求声明了就以本次为准；
+ *   · 本次没声明（缺键）时**继承既有** —— 否则「claim 时写了 follow，下一条
+ *     llm/stream 请求没带策略」会把跟随关系抹掉（策略抖动 ⇒ 选路抖动）；
+ *   · 既有的也不带 ⇒ 两键都不出现（v1 六键形状）。
+ */
+function mergeHintCore(existing, next, opts = {}) {
+  if (next.billing_tier === 'paid_allowed') return next
+  const base = { ...next }
+  const carryStrategy = () => {
+    for (const key of HINT_KEYS_V2) {
+      if (base[key] === undefined && existing && typeof existing === 'object' && existing[key] !== undefined) {
+        base[key] = existing[key]
+      }
+    }
+  }
+
+  if (!existing || typeof existing !== 'object') {
+    carryStrategy()   // existing 缺失时无需继承，但走同一路径保证形状一致
+    return base
+  }
+
+  if (!isTaskGrant(existing)) {
+    carryStrategy()
+    return base
+  }
 
   const issuedAt = typeof existing.at === 'number' && Number.isFinite(existing.at) ? existing.at : null
-  if (issuedAt === null) return next
+  if (issuedAt === null) {
+    carryStrategy()
+    return base
+  }
   const now = typeof opts.now === 'number' && Number.isFinite(opts.now)
     ? opts.now
     : (typeof next.at === 'number' && Number.isFinite(next.at) ? next.at : null)
-  if (now === null) return next
+  if (now === null) {
+    carryStrategy()
+    return base
+  }
   const ttl = typeof opts.ttlMs === 'number' && Number.isFinite(opts.ttlMs) && opts.ttlMs > 0
     ? opts.ttlMs
     : HINT_TTL_MS
-  if (now - issuedAt >= ttl) return next
+  if (now - issuedAt >= ttl) {
+    carryStrategy()
+    return base
+  }
 
-  return { ...next, billing_tier: 'paid_allowed', requires_paid: true }
+  carryStrategy()
+  return { ...base, billing_tier: 'paid_allowed', requires_paid: true }
 }
 
 /**
@@ -220,7 +368,13 @@ export function mergeHint(existing, next, opts = {}) {
  *
  * @param {object} options
  * @param {{ role?: string, requiresPaid?: boolean, explicitComplexity?: string,
- *           source?: string, now?: number, contextTokens?: number }} [deps]
+ *           source?: string, now?: number, contextTokens?: number,
+ *           subagentRouting?: { mode?: string, model?: string|null }|null,
+ *           parentBillingTier?: string, followParentRouting?: boolean,
+ *           pinnedModel?: string|null }} [deps]
+ *   `subagentRouting` —— 子智能体路由跟随策略（`design/22` 契约 E3/E4）；
+ *     缺省 ⇒ **两个 v2 键都不写**（v1 六键形状不变，零回归）。
+ *   `parentBillingTier` —— 上级会话的授权标签，仅在 mode='follow' 时用于继承。
  * @returns {object|null} hint
  */
 export function resolveHint(options, deps = {}) {
@@ -235,14 +389,24 @@ export function resolveHint(options, deps = {}) {
   const signals = signalsFromRequest(options, { role, explicitComplexity, contextTokens: deps?.contextTokens })
   const classified = classifyComplexity(signals)
   const at = typeof deps?.now === 'number' && Number.isFinite(deps.now) ? deps.now : Date.now()
+  // v2 策略两键：未配置 ⇒ `{}`（⇒ buildHint 不写这两键，形状与 v1 逐字一致）
+  const strategy = subagentRoutingKeys(deps)
 
   return buildHint({
-    billing_tier: billingTierFor({ tier: classified.tier, role, requiresPaid }),
+    billing_tier: billingTierFor({
+      tier: classified.tier,
+      role,
+      requiresPaid,
+      subagentRouting: deps?.subagentRouting,
+      parentBillingTier: deps?.parentBillingTier,
+    }),
     complexity_tier: classified.tier,
     agent_role: role,
     requires_paid: requiresPaid,
     source: deps?.source ?? SOURCE_LLM_STREAM,
     at,
+    follow_parent_routing: strategy.follow,
+    pinned_model: strategy.pinned,
   })
 }
 
@@ -291,9 +455,16 @@ export function getGlobalHintsRegistry(scope = globalThis) {
  *           explicitComplexity?: string, source?: string, now?: Function,
  *           getRegistry?: Function,
  *           roleOf?: (sessionId: string) => 'main'|'subagent'|'unknown',
+ *           subagentRouting?: object|null,
+ *           subagentRoutingOf?: (sessionId: string) => object|null,
+ *           parentBillingTier?: string,
+ *           followParentRouting?: boolean, pinnedModel?: string|null,
  *           hintTtlMs?: number }} [opts]
  *   `roleOf` —— **每次请求按 sessionId 动态解析角色**（P3-fix）：主对话 ⇒ `main`（⇒ paid_allowed），
  *               注册表里的 Bot 会话 ⇒ `subagent`（⇒ free_only）。抛错/缺省 ⇒ `unknown`（fail-closed）。
+ *   `subagentRouting` / `subagentRoutingOf` —— v2 子智能体路由策略（`design/22` 契约 E4，
+ *               `{ mode:'auto'|'pinned'|'follow', model, fallback }`）；**缺省 ⇒ hint 只含六键**
+ *               （v1 形状不变 ⇒ 零回归）。`Of` 形式按 sessionId 逐请求解析（与 `roleOf` 同理）。
  *   `hintTtlMs` —— 任务级授权 hint 的延续上限（缺省 30 分钟，见 `HINT_TTL_MS`）。
  * @returns {{ installed: boolean, hooked: boolean, reason?: string,
  *             handler: Function, stats: object }}
@@ -320,6 +491,29 @@ export function installLlmStreamHint(ctx, kernel, opts = {}) {
     existingReadErrors: 0,
     /** 本次 next 只是 free_only、但因任务授权而保留 paid_allowed 的次数（P3-fix 的关键指标）。 */
     carriedTaskAuth: 0,
+    /** `opts.subagentRoutingOf` 抛错的次数（每次都会降级为「未配置」⇒ v1 六键形状）。 */
+    subagentRoutingErrors: 0,
+  }
+
+  /**
+   * 解析**这条请求**的子智能体路由策略（`design/22` 契约 E4）。
+   *
+   * `opts.subagentRoutingOf` 未提供时退回安装时的静态 `opts.subagentRouting`；
+   * 抛错/返回垃圾 ⇒ `null`（= 未配置 ⇒ 只写 v1 六键，行为与今天一致）。
+   */
+  function safeStrategyOf(strategyOf, sessionId) {
+    try {
+      const v = strategyOf(sessionId)
+      return v && typeof v === 'object' && !Array.isArray(v) ? v : null
+    } catch (error) {
+      stats.subagentRoutingErrors += 1
+      try {
+        warn(`[cs-bots] subagentRoutingOf 解析失败（按「未配置」处理 ⇒ 六键 hint）：${error?.message ?? error}`)
+      } catch {
+        /* 静默 */
+      }
+      return null
+    }
   }
 
   /**
@@ -384,6 +578,13 @@ export function installLlmStreamHint(ctx, kernel, opts = {}) {
             explicitComplexity: opts?.explicitComplexity,
             source,
             now: now(),
+            // v2 策略（`design/22` 契约 E4）：缺省不传 ⇒ hint 只有六键（零回归）
+            subagentRouting: typeof opts?.subagentRoutingOf === 'function'
+              ? safeStrategyOf(opts.subagentRoutingOf, sessionId, stats, warn)
+              : opts?.subagentRouting,
+            parentBillingTier: opts?.parentBillingTier,
+            followParentRouting: opts?.followParentRouting,
+            pinnedModel: opts?.pinnedModel,
           })
           if (hint) {
             // ⚠️ P3-fix：写入前先与已有 hint 合并（**只升不降**），否则 claim 写的
@@ -459,7 +660,11 @@ export function installLlmStreamHint(ctx, kernel, opts = {}) {
  *
  * @param {object} task BoardService 的 Task
  * @param {string} sessionId 目标会话（claim 时的 owner / wake 时的 target）
- * @param {{ role?: string, source?: string, now?: number, getRegistry?: Function }} [opts]
+ * @param {{ role?: string, source?: string, now?: number, getRegistry?: Function,
+ *           subagentRouting?: object|null, followParentRouting?: boolean,
+ *           pinnedModel?: string|null, parentBillingTier?: string }} [opts]
+ *   v2 策略键（`subagentRouting` / `followParentRouting` / `pinnedModel`）缺省时
+ *   **不写入**两个新键 ⇒ hint 仍是 v1 六键形状（零回归）。
  * @returns {{ ok: boolean, hint?: object, reason?: string }}
  */
 export function applyTaskHint(task, sessionId, opts = {}) {
@@ -474,13 +679,23 @@ export function applyTaskHint(task, sessionId, opts = {}) {
     const requiresPaid = task.requiresPaid === true
     const role = normalizeRole(opts?.role ?? 'subagent')
     const at = typeof opts?.now === 'number' && Number.isFinite(opts.now) ? opts.now : Date.now()
+    // 任务级策略覆盖（`design/22` 契约 E4）：缺省 ⇒ 不写 v2 两键（六键零回归）
+    const strategy = subagentRoutingKeys(opts)
     const hint = buildHint({
-      billing_tier: billingTierFor({ tier: tier ?? undefined, role, requiresPaid }),
+      billing_tier: billingTierFor({
+        tier: tier ?? undefined,
+        role,
+        requiresPaid,
+        subagentRouting: opts?.subagentRouting,
+        parentBillingTier: opts?.parentBillingTier,
+      }),
       complexity_tier: tier,
       agent_role: role,
       requires_paid: requiresPaid,
       source: opts?.source ?? SOURCE_TASK_BOARD,
       at,
+      follow_parent_routing: strategy.follow,
+      pinned_model: strategy.pinned,
     })
     registry.api.setRequestHint(sessionId, hint)
     return { ok: true, hint }

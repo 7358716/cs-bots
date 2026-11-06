@@ -18,11 +18,11 @@
 ## 1. 四层结构（严格分层，禁止跨层调用）
 
 ```
-┌─ L4 模型面   src/tools.js        28 个 bot_* 工具（模型能调什么）
-├─ L3 页面面   src/client.js       Web UI（7 页签 / 人话文案）
-│              src/api.js          93 个 HTTP 端点（页面数据面）
+┌─ L4 模型面   src/tools.js        38 个 bot_* 工具（模型能调什么）
+├─ L3 页面面   src/client.js       Web UI（10 页签 / 人话文案）
+│              src/api.js          114 个 HTTP 端点（页面数据面）
 ├─ L2 领域面   board/roster/room/memory/discipline/todo/scratch/
-│              prompts/suggest/reviewer/library/dispatcher（12 个服务）
+│              prompts/suggest/reviewer/library/dispatcher（16 个服务）
 └─ L1 内核面   kernel.js（宿主适配唯一出口） store.js（原子写/JSONL 回放）
                registry.js  settings.js  fence.js  compat.js
 ```
@@ -70,7 +70,7 @@
 
 ---
 
-## 3. 领域服务清单（12 个）
+## 3. 领域服务清单（16 个）
 
 | # | 服务 | 文件 | 一句话 | 持久化 |
 |---|---|---|---|---|
@@ -86,6 +86,10 @@
 | 10 | `prompts` 提示词库 | `prompts.js` | 模板 CRUD + 注入轨（每 N 回合/次数/立即） | `prompts.jsonl` |
 | 11 | `suggest` 建议确认队列 | `suggest.js` | 模型只能提议，人点采纳才落库 | `suggestions.jsonl` |
 | 12 | `reviewer` 自审调度 | `reviewer.js` | 每 N 回合提醒模型做记忆自检（纯计数，不越权写库） | `reviewer.jsonl` |
+| 13 | `metrics` 测量 | `metrics.js` | PDCA 的 Check 数据面：周期/吞吐/驳回率等指标 | `metrics.jsonl` + `.snap.json` |
+| 14 | `verify` 验收证据 | `verify.js` | PDCA 的 Check 证据自动化：文件/命令/测试声明式检查 | `verify.jsonl` + `.snap.json` |
+| 15 | `cycle` 复盘与标准化 | `cycle.js` | PDCA 的 Act：planned→doing→checking→acting→done，不许跳步 | `cycle.jsonl` + `.snap.json` |
+| 16 | `teams` 大/小团队 | `teams.js` | Lead 聚合管理：big（人建稳定结构）/ small（智能体自建临时小组） | `teams.jsonl` + `.snap.json` |
 
 ### 「建议确认制」是记忆安全的核心机制
 ```
@@ -102,7 +106,7 @@
 
 ---
 
-## 4. 页面层信息架构（7 页签，与原架构一致）
+## 4. 页面层信息架构（10 页签，与原架构一致）
 
 **判据（新增功能先过这一关）**
 > 新能力若没有独立生命周期、不需要多人/多 Bot 共同引用、不产生可点进去的详情，
@@ -196,7 +200,7 @@ commit(id, action, by, at, before, after) {
 
 ### 6.4 降级
 `apply()` 绝不抛：任一服务装配失败只 `warn` 并把 `services[key] = undefined`；
-`GET /status` 如实上报 12 个服务的 `available`，缺哪个页面就显示降级，不假装正常。
+`GET /status` 如实上报 16 个服务的 `available`，缺哪个页面就显示降级，不假装正常。
 
 ---
 

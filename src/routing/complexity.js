@@ -95,6 +95,42 @@ function finiteOrNull(value) {
   return typeof value === 'number' && Number.isFinite(value) ? value : null
 }
 
+// ── 子智能体路由策略（`design/22` 契约 E3/E4）────────────────────────────────
+//
+// 与 cs-myfree 的 `src/config/scope.js` 同一口径（跨仓冻结，改名 = 破坏兼容）：
+//   auto   : 不跟随路由，由 myfree 按可用性自动选路（今天的行为，默认）
+//   pinned : 不跟随路由，固定用 `subagentRouting.model`
+//   follow : 跟随路由，继承上级会话的授权与选路结果
+
+/** 三种策略（顺序 = UI 三选项顺序，契约 E3） */
+export const SUBAGENT_MODES = Object.freeze(['auto', 'pinned', 'follow'])
+
+/**
+ * 归一化 `subagentRouting.mode`：非法/缺省 ⇒ `null`（= 未配置 ⇒ 走今天的行为）。
+ *
+ * ⚠️ 刻意**不**回落成 `'auto'`：`null` 与 `'auto'` 在授权判定上等价，但保留 `null`
+ * 才能让调用方区分「用户明确选了第一项」与「根本没配置」（诊断/审计要看得出区别）。
+ *
+ * @param {unknown} value
+ * @returns {'auto'|'pinned'|'follow'|null}
+ */
+export function normalizeSubagentMode(value) {
+  if (typeof value !== 'string') return null
+  const v = value.trim().toLowerCase()
+  return SUBAGENT_MODES.includes(v) ? /** @type {any} */ (v) : null
+}
+
+/**
+ * 归一化付费授权标签：只认 `'paid_allowed'` / `'free_only'`，其它 ⇒ `null`（= 未知）。
+ * @param {unknown} value
+ * @returns {'free_only'|'paid_allowed'|null}
+ */
+export function normalizeBillingTier(value) {
+  if (typeof value !== 'string') return null
+  const v = value.trim().toLowerCase()
+  return v === 'paid_allowed' || v === 'free_only' ? /** @type {any} */ (v) : null
+}
+
 /** 布尔才认；其它视为无信号。 */
 function boolOrNull(value) {
   return typeof value === 'boolean' ? value : null
@@ -221,19 +257,38 @@ export function classifyComplexity(signals = {}) {
 // ── 授权标签 / 模型选择 ──────────────────────────────────────────────────────
 
 /**
- * 复杂度 + 角色 + 显式诉求 → 付费授权标签（契约 §6）。
+ * 复杂度 + 角色 + 显式诉求 → 付费授权标签（契约 §6 + `design/22` 契约 E4）。
  *
  * **fail-closed 是刻意的**：只有 `role === 'main'`（规划/验收方）或任务显式标了
  * `requiresPaid: true` 才给 `paid_allowed`；其余一律 `free_only`。理由：误判成付费
  * 只会多花钱，误判成免费只是慢一点 —— 两者的代价不对称。
  *
- * @param {{ tier?: string, role?: string, requiresPaid?: boolean }} [input]
+ * `design/22` 契约 E4 的唯一改动（**子智能体分支**）：不再一律 `free_only`，
+ * 而是按 `subagentRouting.mode` 决定：
+ *   · `'follow'` ⇒ **继承上级**（`parentBillingTier`）；上级未给（无上级/上级也未知）
+ *     ⇒ 仍落 `free_only`（fail-closed，绝不因为「说是跟随」就凭空放行付费）；
+ *   · `'auto'` / `'pinned'` ⇒ **现状**（`free_only`；pinned 只影响"用哪个模型"，
+ *     不影响"能不能付费"——授权口径只由 role/requiresPaid/follow 三者决定）；
+ *   · 没有配置（`subagentRouting` 缺省/非法）⇒ 与今天**逐字一致**（零回归）。
+ *
+ * @param {{ tier?: string, role?: string, requiresPaid?: boolean,
+ *           parentBillingTier?: string,
+ *           subagentRouting?: { mode?: string } }} [input]
  * @returns {'free_only'|'paid_allowed'}
  */
 export function billingTierFor(input = {}) {
   const role = normalizeRole(input?.role)
   if (role === 'main') return 'paid_allowed'
   if (input?.requiresPaid === true) return 'paid_allowed'
+  if (role === 'subagent') {
+    const mode = normalizeSubagentMode(input?.subagentRouting?.mode)
+    if (mode === 'follow') {
+      const inherited = normalizeBillingTier(
+        input?.parentBillingTier ?? input?.subagentRouting?.parentBillingTier,
+      )
+      if (inherited) return inherited
+    }
+  }
   return 'free_only'
 }
 

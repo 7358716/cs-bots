@@ -39,6 +39,13 @@ const OWNER = 'user'
 const DISCIPLINE_SCOPES = ['global', 'workspace', 'room', 'bot']
 const DISCIPLINE_KINDS = ['rule', 'requirement', 'principle', 'style']
 
+/** PDCA 复盘阶段（前端展示用；与 cycle.js 的 CYCLE_PHASES 逐字一致）。 */
+const CYCLE_PHASES = ['planned', 'doing', 'checking', 'acting', 'done']
+
+/** 团队类型与角色（前端展示用；与 teams.js 的 TEAM_TYPES/TEAM_ROLES 逐字一致）。 */
+const TEAM_TYPES = ['big', 'small']
+const TEAM_ROLES = ['lead', 'member']
+
 /** 读请求体（JSON）。 */
 async function readBody(request) {
   const chunks = []
@@ -612,6 +619,7 @@ export function installApi(ctx, { warn } = {}) {
         const SERVICE_KEYS = [
           'roster', 'board', 'dispatcher', 'room', 'memory',
           'library', 'discipline', 'todo', 'scratch', 'prompts', 'suggest', 'reviewer',
+          'metrics', 'verify', 'cycle', 'teams',
         ]
         for (const key of SERVICE_KEYS) {
           const svc = services[key]
@@ -2638,6 +2646,160 @@ export function installApi(ctx, { warn } = {}) {
       if (request.method === 'POST' && path === '/library/skills/scan-all') {
         const out = await withService(services, 'library', (l) => l.scanAllSkillDirs())
         sendJson(response, 200, { ok: true, ...out })
+        return
+      }
+
+      // ── PDCA-2：验收证据（C 的机器闸门）────────────────────────────────────
+      if (request.method === 'GET' && path === '/verify/history') {
+        const items = await withService(services, 'verify', (v) => v.history(Number(qp(url, 'limit')) ?? 50))
+        sendJson(response, 200, { ok: true, items })
+        return
+      }
+      if (request.method === 'GET' && path === '/verify/stats') {
+        const stats = await withService(services, 'verify', (v) => v.stats())
+        sendJson(response, 200, { ok: true, stats })
+        return
+      }
+      if (request.method === 'POST' && path === '/verify/check') {
+        const body = (await readBody(request)) ?? {}
+        const out = await withService(services, 'verify', (v) => v.check({ ...body, by: body.by ?? OWNER }))
+        sendJson(response, 200, { ok: true, ...out })
+        return
+      }
+      if (request.method === 'POST' && path === '/verify/evaluate') {
+        const body = (await readBody(request)) ?? {}
+        const out = await withService(services, 'verify', (v) => v.evaluate(body.artifacts ?? []))
+        sendJson(response, 200, { ok: true, ...out })
+        return
+      }
+      if (request.method === 'POST' && path === '/verify/task') {
+        const body = (await readBody(request)) ?? {}
+        const out = await withService(services, 'verify', (v) =>
+          v.verifyTask({ id: body.id, artifacts: body.artifacts ?? [], writeScopes: body.writeScopes ?? [] }, { by: body.by ?? OWNER }))
+        sendJson(response, 200, { ok: true, ...out })
+        return
+      }
+
+      // ── PDCA-3：测量（metrics）──────────────────────────────────────────────
+      if (request.method === 'GET' && path === '/metrics') {
+        const out = await withService(services, 'metrics', (m) => m.stats())
+        sendJson(response, 200, { ok: true, ...out })
+        return
+      }
+      if (request.method === 'GET' && path === '/metrics/series') {
+        const out = await withService(services, 'metrics', (m) => m.series({
+          kind: qp(url, 'kind'), taskId: qp(url, 'taskId'),
+          since: qp(url, 'since') === undefined ? undefined : Number(qp(url, 'since')),
+          limit: qp(url, 'limit') === undefined ? undefined : Number(qp(url, 'limit')),
+        }))
+        sendJson(response, 200, { ok: true, items: out })
+        return
+      }
+      if (request.method === 'GET' && path === '/metrics/aggregate') {
+        const out = await withService(services, 'metrics', (m) => m.aggregate({
+          kind: qp(url, 'kind'),
+          since: qp(url, 'since') === undefined ? undefined : Number(qp(url, 'since')),
+        }))
+        sendJson(response, 200, { ok: true, ...out })
+        return
+      }
+      if (request.method === 'POST' && path === '/metrics/record') {
+        const body = (await readBody(request)) ?? {}
+        const out = await withService(services, 'metrics', (m) => m.record({ ...body, by: body.by ?? OWNER }))
+        sendJson(response, 200, { ok: true, record: out })
+        return
+      }
+
+      // ── PDCA-4：复盘与标准化（Act）──────────────────────────────────────────
+      if (request.method === 'GET' && path === '/cycles') {
+        const items = await withService(services, 'cycle', (c) => c.list({
+          status: qp(url, 'status'), phase: qp(url, 'phase'), taskId: qp(url, 'taskId'),
+        }))
+        sendJson(response, 200, { ok: true, items, phases: CYCLE_PHASES })
+        return
+      }
+      if (request.method === 'POST' && path === '/cycles') {
+        const body = (await readBody(request)) ?? {}
+        const out = await withService(services, 'cycle', (c) =>
+          c.start({ ...body, by: body.by ?? OWNER }))
+        sendJson(response, 200, { ok: true, cycle: out })
+        return
+      }
+      if (request.method === 'POST' && path === '/cycles/advance') {
+        const body = (await readBody(request)) ?? {}
+        const out = await withService(services, 'cycle', (c) =>
+          c.advance({ ...body, by: body.by ?? OWNER }))
+        sendJson(response, 200, { ok: true, cycle: out })
+        return
+      }
+      if (request.method === 'POST' && path === '/cycles/check') {
+        const body = (await readBody(request)) ?? {}
+        const out = await withService(services, 'cycle', (c) =>
+          c.check({ ...body, by: body.by ?? OWNER }))
+        sendJson(response, 200, { ok: true, cycle: out })
+        return
+      }
+      if (request.method === 'POST' && path === '/cycles/review') {
+        const body = (await readBody(request)) ?? {}
+        const out = await withService(services, 'cycle', (c) =>
+          c.review({ ...body, by: body.by ?? OWNER }))
+        sendJson(response, 200, { ok: true, ...out })
+        return
+      }
+      if (request.method === 'GET' && path === '/cycles/stats') {
+        const stats = await withService(services, 'cycle', (c) => c.stats())
+        sendJson(response, 200, { ok: true, stats })
+        return
+      }
+
+      // ── 大/小团队（Lead 聚合管理）──────────────────────────────────────────
+      if (request.method === 'GET' && path === '/teams') {
+        const items = await withService(services, 'teams', (t) => t.list({
+          type: qp(url, 'type'), status: qp(url, 'status'),
+        }))
+        sendJson(response, 200, { ok: true, items, types: TEAM_TYPES, roles: TEAM_ROLES })
+        return
+      }
+      if (request.method === 'POST' && path === '/teams') {
+        const body = (await readBody(request)) ?? {}
+        const out = await withService(services, 'teams', (t) =>
+          t.create({ ...body, by: body.by ?? OWNER }))
+        sendJson(response, 200, { ok: true, team: out })
+        return
+      }
+      if (request.method === 'POST' && path === '/teams/add') {
+        const body = (await readBody(request)) ?? {}
+        const out = await withService(services, 'teams', (t) =>
+          t.addMember({ ...body, by: body.by ?? OWNER }))
+        sendJson(response, 200, { ok: true, team: out })
+        return
+      }
+      if (request.method === 'POST' && path === '/teams/remove') {
+        const body = (await readBody(request)) ?? {}
+        const out = await withService(services, 'teams', (t) =>
+          t.removeMember({ ...body, by: body.by ?? OWNER }))
+        sendJson(response, 200, { ok: true, team: out })
+        return
+      }
+      if (request.method === 'POST' && path === '/teams/role') {
+        const body = (await readBody(request)) ?? {}
+        const out = await withService(services, 'teams', (t) =>
+          t.setRole({ ...body, by: body.by ?? OWNER }))
+        sendJson(response, 200, { ok: true, team: out })
+        return
+      }
+      if (request.method === 'POST' && path === '/teams/note') {
+        const body = (await readBody(request)) ?? {}
+        const out = await withService(services, 'teams', (t) =>
+          t.note({ ...body, by: body.by ?? OWNER }))
+        sendJson(response, 200, { ok: true, team: out })
+        return
+      }
+      if (request.method === 'POST' && path === '/teams/close') {
+        const body = (await readBody(request)) ?? {}
+        const out = await withService(services, 'teams', (t) =>
+          t.close({ ...body, by: body.by ?? OWNER }))
+        sendJson(response, 200, { ok: true, team: out })
         return
       }
 

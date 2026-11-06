@@ -27,6 +27,10 @@ import { createScratch } from './scratch.js'
 import { createPrompts } from './prompts.js'
 import { createSuggest } from './suggest.js'
 import { createReviewer } from './reviewer.js'
+import { createMetrics } from './metrics.js'
+import { createVerify } from './verify.js'
+import { createCycle } from './cycle.js'
+import { createTeams } from './teams.js'
 import { createDirBrowser } from './dirbrowse.js'
 import { loadSettings } from './settings.js'
 import { probeHost, formatReport } from './compat.js'
@@ -265,6 +269,42 @@ function applyInner(ctx, config, { log, warn }) {
     warn(`[cs-bots] reviewer 装配失败（自审调度不可用）：${error?.message ?? error}`)
   }
 
+  // ── 测量（PDCA 的 Check 数据面）────────────────────────────────────────────
+  try {
+    services.metrics = createMetrics(ctx, { stateDir: config.stateDir ?? kernelStateDir() })
+    log('[cs-bots] metrics 就绪（PDCA 测量面）')
+  } catch (error) {
+    warn(`[cs-bots] metrics 装配失败（测量不可用）：${error?.message ?? error}`)
+  }
+
+  // ── 验收证据（PDCA 的 Check 证据自动化）─────────────────────────────────────
+  try {
+    services.verify = createVerify(ctx, { stateDir: config.stateDir ?? kernelStateDir() })
+    log('[cs-bots] verify 就绪（验收证据自动化）')
+  } catch (error) {
+    warn(`[cs-bots] verify 装配失败（验收证据不可用）：${error?.message ?? error}`)
+  }
+
+  // ── 复盘与标准化（PDCA 的 Act）──────────────────────────────────────────────
+  // suggest 缺失也能装配（review() 会降级为「只记复盘内容」）。
+  try {
+    services.cycle = createCycle(ctx, {
+      stateDir: config.stateDir ?? kernelStateDir(),
+      suggest: services.suggest,
+    })
+    log('[cs-bots] cycle 就绪（复盘与标准化）')
+  } catch (error) {
+    warn(`[cs-bots] cycle 装配失败（复盘不可用）：${error?.message ?? error}`)
+  }
+
+  // ── 大/小团队（Lead 聚合管理）───────────────────────────────────────────────
+  try {
+    services.teams = createTeams(ctx, { stateDir: config.stateDir ?? kernelStateDir() })
+    log(`[cs-bots] teams 就绪（${services.teams.stats().total} 个团队）`)
+  } catch (error) {
+    warn(`[cs-bots] teams 装配失败（团队不可用）：${error?.message ?? error}`)
+  }
+
   // ── 页面数据面：HTTP API（页面层靠它拿数据；没有它 UI 是空壳）──────────────
   services.apiDispose = installApi(ctx, { warn })
 
@@ -305,6 +345,14 @@ function applyInner(ctx, config, { log, warn }) {
     services.routing = { installed: false, reason: 'assembly-failed' }
     warn(`[cs-bots] 复杂度路由装配失败（降级，不影响对话）：${error?.message ?? error}`)
   }
+
+  // ── PDCA-1：回合钩子（让自审计数真正被推进）─────────────────────────────────
+  installTurnHook(ctx, {
+    warn,
+    reviewer: services.reviewer,
+    metrics: services.metrics,
+    suggest: services.suggest,
+  })
 
   // ── 生命周期收尾：停止定时器，避免进程退出被挂起的 timer 拖住 ────────────────
   // 用官方 ctx.effect（若可用）保证插件卸载时被调用；不可用则退化为不注册。
@@ -491,3 +539,103 @@ function installBotToolTrimmer(ctx, { warn, roster }) {
     warn(`[cs-bots] 注册 agent/created 失败：${error?.message ?? error}`)
   }
 }
+
+/**
+ * PDCA-1：回合钩子 —— 让 reviewer 的「每 N 回合自审」真正被触发。
+ *
+ * 为什么必须自己接：宿主把回合边界写成 session 事件（`turn/start` / `turn/end`），
+ * 但**没有**任何机制会自动调用本平台的 reviewer。此前 reviewer 只暴露
+ * HTTP 端点（`/review/note-turn`），客户端从不调用 ⇒ 计数恒为 0 ⇒ 自审永不到期。
+ * 这等于把 PDCA 的 Check 引擎写死了。
+ *
+ * 本钩子的三条纪律（与 dispatcher 的 fail-open 同源）：
+ *   ① **绝不抛**：钩子内部任何异常只 warn，绝不影响回合本身；
+ *   ② **多路兜底**：优先按 session 事件判断回合边界；拿不到就退化为「每次
+ *      `agent/turn-stopping` 也算一回合」（后者是宿主在回合收尾时发的）；
+ *   ③ **每会话每回合最多记一次**：防事件重投导致计数虚高。
+ */
+function installTurnHook(ctx, { warn, reviewer, metrics, suggest }) {
+  if (typeof ctx.on !== 'function') {
+    warn('[cs-bots] ctx.on 不可用 → PDCA 回合钩子未装（自审计数将不自动推进）')
+    return
+  }
+  if (!reviewer) {
+    warn('[cs-bots] 无 ReviewerService → PDCA 回合钩子未装')
+    return
+  }
+
+  /** sessionId → 最近一次计数的标记（防重复计数） */
+  const lastCounted = new Map()
+
+  /** 从钩子 payload 里取会话 id（多路兜底：可能是字符串或 Session/agent 对象）。 */
+  function sessionIdOf(subject) {
+    if (typeof subject === 'string' && subject.trim() !== '') return subject
+    if (subject && typeof subject === 'object') {
+      const id = subject.id ?? subject.sessionId ?? subject.session?.id
+      if (typeof id === 'string' && id.trim() !== '') return id
+    }
+    return null
+  }
+
+  /** 到期时提一条「自审提醒」记忆建议（L2 全局，无需 scopeId ⇒ 任何场景都合法）。 */
+  function proposeSelfReview(sessionId, out) {
+    try {
+      suggest?.suggest?.({
+        kind: 'memory',
+        layer: 'L2',
+        payload: {
+          content: `【自审提醒】本会话已累计 ${out.turnsSinceLastReview} 回合未自审（阈值 ${out.interval}）。下一次回复前请先自检：目标是否漂移？有无未兑现的承诺？有无过期/阻塞的待办或任务？必要时用 bot_memory_search 检索近期上下文。`,
+          tags: ['self-review', 'pdca'],
+        },
+        reason: `reviewer：会话 ${sessionId} 已 ${out.turnsSinceLastReview} 回合未自审（阈值 ${out.interval}）`,
+        source: 'reviewer',
+        by: sessionId,
+        confidence: 0.8,
+      })
+    } catch (e) {
+      warn(`[cs-bots] PDCA 自审建议提议失败（session=${sessionId}）：${e?.message ?? e}`)
+    }
+  }
+
+  try {
+    // ── 主通道：session 事件（宿主在回合开始/结束时写入 turn/start / turn/end）──
+    ctx.on('session/event', (subject, event) => {
+      try {
+        if (!event || typeof event.type !== 'string') return
+        if (event.type !== 'turn/end' && event.type !== 'turn/start') return
+        const sessionId = sessionIdOf(subject)
+        if (!sessionId) return
+
+        // 用回合序号做幂等：同 session 同一 turn 序号只计一次
+        const turn = Number.isFinite(event.data?.turn) ? event.data.turn : null
+        const key = turn !== null ? `${sessionId}:t${turn}` : null
+        if (key && lastCounted.get(sessionId) === key) return
+        if (key) lastCounted.set(sessionId, key)
+
+        const out = reviewer.noteTurn({ sessionId })
+        if (out.due) proposeSelfReview(sessionId, out)
+        try { metrics?.record?.({ kind: 'turn_end', sessionId, by: sessionId }) } catch { /* 测量失败不影响回合 */ }
+      } catch (error) {
+        warn(`[cs-bots] PDCA 回合钩子处理失败：${error?.message ?? error}`)
+      }
+    })
+
+    // ── 兜底通道：agent 回合收尾（session 事件拿不到时仍有一次计数机会）──
+    // ⚠️ 只在主通道没记过该会话时才计（用 lastCounted 防双计）。
+    ctx.on('agent/turn-stopping', (payload) => {
+      try {
+        const sessionId = sessionIdOf(payload?.session ?? payload?.agent ?? payload)
+        if (!sessionId || lastCounted.has(sessionId)) return
+        lastCounted.set(sessionId, 'fallback')
+        const out = reviewer.noteTurn({ sessionId })
+        if (out.due) proposeSelfReview(sessionId, out)
+        try { metrics?.record?.({ kind: 'turn_end', sessionId, by: sessionId }) } catch { /* */ }
+      } catch (error) {
+        warn(`[cs-bots] PDCA 回合兜底钩子处理失败：${error?.message ?? error}`)
+      }
+    })
+  } catch (error) {
+    warn(`[cs-bots] 注册 PDCA 回合钩子失败：${error?.message ?? error}`)
+  }
+}
+

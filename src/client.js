@@ -3914,6 +3914,220 @@ window.__ModuleLoader__.load({
         }) : null)
     }
 
+    // ── PDCA 复盘周期（Cycles）──────────────────────────────────────────────
+    const PHASES = ['planned', 'doing', 'checking', 'acting', 'done']
+    const PHASE_LABEL = { planned: '计划', doing: '执行', checking: '检查', acting: '改进', done: '完成' }
+
+    function CyclesTab() {
+      const listQ = useApi('/cycles', [])
+      const [taskId, setTaskId] = useState('')
+      const [objective, setObjective] = useState('')
+      const [expanded, setExpanded] = useState(null)
+      const [reviewSummary, setReviewSummary] = useState('')
+      const [reviewLessons, setReviewLessons] = useState('')
+      const [reviewStandards, setReviewStandards] = useState('')
+      const [msg, setMsg] = useState(null)
+      const act = (p, body) => call(p, { method: 'POST', body })
+
+      const cycles = listQ.data?.items ?? []
+
+      const createCycle = async () => {
+        if (!taskId.trim() || !objective.trim()) { setMsg('任务 id 与目标都要填'); return }
+        try {
+          const r = await act('/cycles', { taskId: taskId.trim(), objective: objective.trim(), by: 'ui' })
+          setMsg(`周期 ${r.cycle.id} 已开启（${PHASE_LABEL[r.cycle.phase]}）`)
+          setTaskId(''); setObjective('')
+          listQ.reload()
+        } catch (e) { setMsg(String(e)) }
+      }
+
+      const advance = async (c) => {
+        const nextPhase = PHASES[PHASES.indexOf(c.phase) + 1]
+        if (!nextPhase) return
+        try {
+          const r = await act('/cycles/advance', { id: c.id, expectedRev: c.rev, phase: nextPhase, by: 'ui' })
+          setMsg(`周期 ${c.id} → ${PHASE_LABEL[nextPhase]}`)
+          listQ.reload()
+        } catch (e) { setMsg(String(e)) }
+      }
+
+      const check = async (c, result) => {
+        try {
+          const r = await act('/cycles/check', { id: c.id, expectedRev: c.rev, result, by: 'ui' })
+          setMsg(`周期 ${c.id} 检查 ${result}`)
+          listQ.reload()
+        } catch (e) { setMsg(String(e)) }
+      }
+
+      const doReview = async (c) => {
+        const lessons = reviewLessons.split('\n').filter(Boolean)
+        const standards = reviewStandards.split('\n').filter(Boolean).map((line) => {
+          const [title, content] = line.split('：').map((s) => s?.trim())
+          return { scope: 'global', kind: 'rule', title: title || '未命名', content: content || '' }
+        })
+        try {
+          const r = await act('/cycles/review', {
+            id: c.id, expectedRev: c.rev, summary: reviewSummary, lessons, standards, by: 'ui',
+          })
+          setMsg(`复盘完成，提议 ${r.proposedCount} 条标准化建议`)
+          setReviewSummary(''); setReviewLessons(''); setReviewStandards('')
+          listQ.reload()
+        } catch (e) { setMsg(String(e)) }
+      }
+
+      return h('div', { className: 'csb-wrap' },
+        h(Section, {
+          title: 'PDCA 复盘周期',
+          desc: '每个任务一个周期，强制走完 计划→执行→检查→改进→完成。不许跳步——这正是「持续优化」的纪律。',
+        }),
+        h('div', { className: 'csb-bar', style: { marginTop: 10, flexWrap: 'wrap', gap: 6 } },
+          h('input', { className: 'csb-in', style: { width: 120 }, placeholder: '任务 id（t-x）', value: taskId, onChange: (e) => setTaskId(e.target.value) }),
+          h('input', { className: 'csb-in', style: { width: 260 }, placeholder: '目标原文（防漂移锚）', value: objective, onChange: (e) => setObjective(e.target.value) }),
+          h('button', { className: 'csb-btn csb-btn-s', onClick: createCycle }, '开启周期')),
+        msg ? h('div', { className: 'csb-notice csb-notice-ok', style: { marginTop: 8 } }, h('span', { className: 'csb-notice-t' }, msg)) : null,
+        listQ.error ? h('div', { className: 'csb-err' }, listQ.error) : null,
+        listQ.loading ? h(Skeleton, { n: 3 }) : null,
+        cycles.length === 0 && !listQ.loading
+          ? h(Empty, { icon: '🔄', title: '还没有复盘周期', hint: '输入任务 id 和目标，点「开启周期」开始 PDCA。' })
+          : h('div', { className: 'csb-list' }, cycles.map((c) => {
+            const nextPhase = PHASES[PHASES.indexOf(c.phase) + 1]
+            const isOpen = expanded === c.id
+            return h('div', { key: c.id, className: 'csb-card', style: { marginBottom: 8 } },
+              h('div', { className: 'csb-card-main' },
+                h('div', { className: 'csb-card-t' },
+                  h('span', { className: `csb-b ${c.status === 'closed' ? 'csb-b-ok' : 'csb-b-run'}` }, PHASE_LABEL[c.phase] ?? c.phase),
+                  ` · ${c.taskId} · ${(c.objective ?? '').slice(0, 40)}`),
+                h('div', { className: 'csb-card-m' },
+                  h('span', null, `状态 ${c.status}`),
+                  c.progress !== undefined ? h('span', null, ` · 进度 ${c.progress}%`) : null,
+                  c.rejectCount ? h('span', { className: 'csb-b csb-b-err' }, ` · 驳回 ${c.rejectCount} 次`) : null,
+                  c.review ? h('span', null, ' · 已复盘') : null)),
+              h('div', { className: 'csb-bar', style: { flexWrap: 'wrap' } },
+                nextPhase ? h('button', { className: 'csb-btn csb-btn-s', onClick: () => advance(c) }, `→ ${PHASE_LABEL[nextPhase]}`) : null,
+                c.phase === 'checking' ? h('button', { className: 'csb-btn csb-btn-s csb-btn-ok', onClick: () => check(c, 'pass') }, '检查通过') : null,
+                c.phase === 'checking' ? h('button', { className: 'csb-btn csb-btn-s csb-btn-err', onClick: () => check(c, 'reject') }, '打回') : null,
+                c.phase === 'acting' ? h('button', { className: 'csb-btn csb-btn-s', onClick: () => setExpanded(isOpen ? null : c.id) }, isOpen ? '收起复盘' : '写复盘') : null),
+              isOpen ? h('div', { style: { marginTop: 8, paddingTop: 8, borderTop: '1px solid var(--dsw-alias-border)' } },
+                h('div', { className: 'csb-hint', style: { marginBottom: 4 } }, '复盘总结'),
+                h('textarea', { className: 'csb-in', style: { width: '100%', minHeight: 60, boxSizing: 'border-box' }, placeholder: '这个周期学到了什么？', value: reviewSummary, onChange: (e) => setReviewSummary(e.target.value) }),
+                h('div', { className: 'csb-hint', style: { marginTop: 8, marginBottom: 4 } }, '经验教训（每行一条）'),
+                h('textarea', { className: 'csb-in', style: { width: '100%', minHeight: 40, boxSizing: 'border-box' }, placeholder: '先写测试再写实现\n接口要先定契约', value: reviewLessons, onChange: (e) => setReviewLessons(e.target.value) }),
+                h('div', { className: 'csb-hint', style: { marginTop: 8, marginBottom: 4 } }, '标准化建议（每行一条：标题：内容）'),
+                h('textarea', { className: 'csb-in', style: { width: '100%', minHeight: 40, boxSizing: 'border-box' }, placeholder: 'TDD：先写测试再写实现', value: reviewStandards, onChange: (e) => setReviewStandards(e.target.value) }),
+                h('button', { className: 'csb-btn csb-btn-s', style: { marginTop: 6 }, onClick: () => doReview(c) }, '提交复盘（提议建议）')) : null)})))
+    }
+
+    // ── 大/小团队（Teams）────────────────────────────────────────────────────
+    function TeamsTab() {
+      const listQ = useApi('/teams', [])
+      const [name, setName] = useState('')
+      const [type, setType] = useState('big')
+      const [leadId, setLeadId] = useState('')
+      const [purpose, setPurpose] = useState('')
+      const [newMember, setNewMember] = useState('')
+      const [msg, setMsg] = useState(null)
+      const act = (p, body) => call(p, { method: 'POST', body })
+
+      const teams = listQ.data?.items ?? []
+
+      const createTeam = async () => {
+        if (!name.trim()) { setMsg('团队名必填'); return }
+        try {
+          const r = await act('/teams', { name: name.trim(), type, leadId: leadId || undefined, purpose, by: 'ui' })
+          setMsg(`团队 ${r.team.id}（${r.team.name}）已创建`)
+          setName(''); setLeadId(''); setPurpose('')
+          listQ.reload()
+        } catch (e) { setMsg(String(e)) }
+      }
+
+      const addMember = async (t) => {
+        if (!newMember.trim()) return
+        try {
+          const r = await act('/teams/add', { id: t.id, expectedRev: t.rev, memberId: newMember.trim(), by: 'ui' })
+          setMsg(`已加入 ${newMember.trim()}`); setNewMember('')
+          listQ.reload()
+        } catch (e) { setMsg(String(e)) }
+      }
+
+      const closeTeam = async (t) => {
+        try {
+          const r = await act('/teams/close', { id: t.id, expectedRev: t.rev, by: 'ui' })
+          setMsg(`团队 ${t.name} 已关闭`); listQ.reload()
+        } catch (e) { setMsg(String(e)) }
+      }
+
+      return h('div', { className: 'csb-wrap' },
+        h(Section, {
+          title: '团队',
+          desc: '大团队（big）：人建的稳定协作结构，跨多个 lead bot；小团队（small）：智能体自建的临时小组。',
+        }),
+        h('div', { className: 'csb-bar', style: { marginTop: 10, flexWrap: 'wrap', gap: 6 } },
+          h('input', { className: 'csb-in', style: { width: 160 }, placeholder: '团队名', value: name, onChange: (e) => setName(e.target.value) }),
+          h('select', { className: 'csb-sel', value: type, onChange: (e) => setType(e.target.value) },
+            h('option', { value: 'big' }, '大团队'), h('option', { value: 'small' }, '小团队')),
+          h('input', { className: 'csb-in', style: { width: 120 }, placeholder: 'leadId（大团队必填）', value: leadId, onChange: (e) => setLeadId(e.target.value) }),
+          h('input', { className: 'csb-in', style: { width: 160 }, placeholder: '用途说明', value: purpose, onChange: (e) => setPurpose(e.target.value) }),
+          h('button', { className: 'csb-btn csb-btn-s', onClick: createTeam }, '创建团队')),
+        msg ? h('div', { className: 'csb-notice csb-notice-ok', style: { marginTop: 8 } }, h('span', { className: 'csb-notice-t' }, msg)) : null,
+        listQ.error ? h('div', { className: 'csb-err' }, listQ.error) : null,
+        listQ.loading ? h(Skeleton, { n: 3 }) : null,
+        teams.length === 0 && !listQ.loading
+          ? h(Empty, { icon: '👥', title: '还没有团队', hint: '填好团队名和 leadId，点「创建团队」开始聚合管理。' })
+          : h('div', { className: 'csb-list' }, teams.map((t) =>
+            h('div', { key: t.id, className: 'csb-card', style: { marginBottom: 8 } },
+              h('div', { className: 'csb-card-main' },
+                h('div', { className: 'csb-card-t' },
+                  h('span', { className: `csb-b ${t.status === 'closed' ? 'csb-b-idle' : 'csb-b-run'}` }, t.type === 'big' ? '大' : '小'),
+                  ` · ${t.name}`,
+                  t.purpose ? ` · ${(t.purpose ?? '').slice(0, 30)}` : null),
+                h('div', { className: 'csb-card-m' },
+                  h('span', null, `lead ${t.leadId ?? '（无）'}`),
+                  h('span', null, ` · 成员 ${(t.members ?? []).length} 人`),
+                  (t.members ?? []).slice(0, 5).map((m) => h('span', { key: m, className: 'csb-chip' }, m)),
+                  (t.members ?? []).length > 5 ? h('span', { className: 'csb-chip' }, `…+${(t.members ?? []).length - 5}`) : null)),
+              t.status === 'open' ? h('div', { className: 'csb-bar', style: { flexWrap: 'wrap' } },
+                h('input', { className: 'csb-in', style: { width: 140 }, placeholder: '成员 id', value: newMember, onChange: (e) => setNewMember(e.target.value) }),
+                h('button', { className: 'csb-btn csb-btn-s', onClick: () => addMember(t) }, '加入'),
+                h('button', { className: 'csb-btn csb-btn-s csb-btn-err', onClick: () => closeTeam(t) }, '关闭')) : null))))
+    }
+
+    // ── PDCA 测量（Metrics）───────────────────────────────────────────────────
+    function MetricsTab() {
+      const statsQ = useApi('/metrics', [])
+      const aggQ = useApi('/metrics/aggregate', [])
+      const stats = statsQ.data ?? {}
+      const byKind = aggQ.data?.byKind ?? {}
+
+      return h('div', { className: 'csb-wrap' },
+        h(Section, {
+          title: 'PDCA 测量',
+          desc: 'PDCA 的「持续优化」没有测量就是空话。这里显示周期/吞吐/驳回率等指标。',
+        }),
+        h('div', { className: 'csb-kv', style: { marginTop: 10 } },
+          h('div', { className: 'csb-kv-i' }, h('span', { className: 'csb-k' }, '总记录'), h('span', { className: 'csb-v' }, String(stats.total ?? 0))),
+          h('div', { className: 'csb-kv-i' }, h('span', { className: 'csb-k' }, '事件流'), h('span', { className: 'csb-v' }, String(stats.events ?? 0))),
+          h('div', { className: 'csb-kv-i' }, h('span', { className: 'csb-k' }, '首条时间'), h('span', { className: 'csb-v' }, aggQ.data?.firstAt ? new Date(aggQ.data.firstAt).toLocaleString('zh-CN') : '—')),
+          h('div', { className: 'csb-kv-i' }, h('span', { className: 'csb-k' }, '末条时间'), h('span', { className: 'csb-v' }, aggQ.data?.lastAt ? new Date(aggQ.data.lastAt).toLocaleString('zh-CN') : '—'))),
+        h(Section, { title: '按指标种类', desc: '每种指标各记了多少条。' },
+          Object.keys(byKind).length === 0
+            ? h(Empty, { title: '还没有测量记录' })
+            : h('div', { className: 'csb-kv', style: { marginTop: 8 } },
+                Object.entries(byKind).sort((a, b) => b[1] - a[1]).map(([k, v]) =>
+                  h('div', { key: k, className: 'csb-kv-i' },
+                    h('span', { className: 'csb-k' }, k),
+                    h('span', { className: 'csb-v' }, String(v))))),
+        h(Section, { title: '驳回率', desc: 'accept_reject / (accept_pass + accept_reject)：越低说明交付质量越高。' },
+          h('div', { className: 'csb-kv', style: { marginTop: 8 } },
+            h('div', { className: 'csb-kv-i' }, h('span', { className: 'csb-k' }, '验收通过'), h('span', { className: 'csb-v' }, String(byKind.accept_pass ?? 0))),
+            h('div', { className: 'csb-kv-i' }, h('span', { className: 'csb-k' }, '验收驳回'), h('span', { className: 'csb-v csb-v-err' }, String(byKind.accept_reject ?? 0))),
+            h('div', { className: 'csb-kv-i' }, h('span', { className: 'csb-k' }, '驳回率'),
+              h('span', { className: 'csb-v' }, ((byKind.accept_reject ?? 0) + (byKind.accept_pass ?? 0)) === 0 ? '—' :
+                `${Math.round((byKind.accept_reject ?? 0) / ((byKind.accept_reject ?? 0) + (byKind.accept_pass ?? 0)) * 100)}%`)),
+          )),
+        h('div', { className: 'csb-bar', style: { marginTop: 10 } },
+          h('button', { className: 'csb-btn csb-btn-s', onClick: statsQ.reload }, '刷新测量'))))
+    }
+
     // ── 数据（只读浏览）──────────────────────────────────────────────────────
 
     /**
@@ -5542,12 +5756,14 @@ window.__ModuleLoader__.load({
         id: 'tasks', label: '任务',
         subs: [
           { id: 'board', label: '协作看板', Comp: TasksTab },
+          { id: 'cycles', label: '复盘周期', Comp: CyclesTab },
           { id: 'todo', label: '我的待办', Comp: TodoTab },
           { id: 'scratch', label: '便签', Comp: ScratchTab },
         ],
       },
       { id: 'bots', label: 'Bot', Comp: BotsTab },
       { id: 'rooms', label: '房间', Comp: RoomsTab },
+      { id: 'teams', label: '团队', Comp: TeamsTab },
       { id: 'artifacts', label: '成果', Comp: ArtifactsTab },
       {
         id: 'memory', label: '记忆',
@@ -5559,7 +5775,7 @@ window.__ModuleLoader__.load({
       },
       { id: 'skills', label: '技能库', Comp: SkillsTab },
       { id: 'workflows', label: '工作流库', Comp: WorkflowsTab },
-      { id: 'data', label: '数据', Comp: DataTab },
+      { id: 'data', label: '数据', subs: [ { id: 'files', label: '文件浏览', Comp: DataTab }, { id: 'metrics', label: 'PDCA 测量', Comp: MetricsTab } ] },
       { id: 'settings', label: '设置', Comp: SettingsBody },
     ]
 

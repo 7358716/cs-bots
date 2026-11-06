@@ -3,3 +3,6 @@ node_modules/
 *.log
 .DS_Store
 test/node_modules
+
+# 迁移测试临时产物
+.migration-test/
