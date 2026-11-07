@@ -138,10 +138,63 @@ text    = 【任务目标 · 原文锚定，禁止改写】…\n\n【新增补�
   - `dedupKey` 缺省由 `taskId+text` 的 sha1 前 16 位生成，保证幂等
 - 成功：`{ ok:true, sessionId, knownBot, wake, text }`（`text` 为实际投递文案，便于审计）
 
-### 2.5 `GET /tasks/source?id=<taskId>`（可选，若时间允许）
+### 2.5 `GET /tasks/source?id=<taskId>`
 
-返回任务来源（`source`/`sourceSeq`）与「若来源是房间消息则可跳转的 roomId/seq」。
-房间消息 → 建任务时前端会写 `sourceSeq = "room:<roomId>:<seq>"`，此端点负责解析。
+> **状态**：原标注「可选，若时间允许」，2026-11-07 收尾时判定为实现（它承载用户诉求里
+> 「**跳转定位到对话**」的另一半：`§3.4` 只做了「消息 → 建任务」，没有「任务 → 回消息」）。
+> 实现前先冻结本节，代码按本节字段名与状态码逐字对齐。
+
+返回任务来源（`source`/`sourceSeq`），并把 `sourceSeq = "room:<roomId>:<seq>"`
+解析成「可跳转的房间 + 消息序号」，供前端从任务详情**跳回消息出处**。
+
+**成功 200**（`kind = "room"` 时）：
+```json
+{
+  "ok": true,
+  "taskId": "t-5",
+  "source": "ai",
+  "sourceSeq": "room:room-a1b2c3d4:7",
+  "kind": "room",
+  "reason": null,
+  "room": {
+    "roomId": "room-a1b2c3d4",
+    "name": "研发协调",
+    "seq": 7,
+    "messageId": "m-7",
+    "exists": true,
+    "messageExists": true,
+    "at": 1762300100000,
+    "preview": "把登录接口拆成三个子任务"
+  },
+  "jump": { "roomId": "room-a1b2c3d4", "seq": 7 },
+  "hint": "来源：房间消息 room-a1b2c3d4 #7"
+}
+```
+
+**`kind` 的取值与判定顺序**（按 `sourceSeq` 前缀，不做模糊匹配）：
+
+| `kind` | 条件 | `room` / `jump` |
+|---|---|---|
+| `room` | `room:<roomId>:<seq>`，且 `roomId` 非空、`seq` 为正整数 | 有（见下） |
+| `todo` | `todo:<id>` | `null` / `null` |
+| `evolve` | `evolve:<id>:<seq>` | `null` / `null` |
+| `none` | 任务没有 `sourceSeq` | `null` / `null` |
+| `unparsed` | `sourceSeq` 存在但**不匹配任何已知前缀**，或格式残缺 | `null` / `null` |
+
+**绝不猜测**：`kind = "unparsed"` 时 `reason` 写明
+`无法解析来源标记 "<sourceSeq>"（不是 room:/todo:/evolve: 前缀）`，
+前端据此提示用户「来源已失效，可手动在房间里找」，而不是渲染一个跳不动的按钮。
+`kind = "room"` 但 `room.exists = false`（房间已删）时 `jump` 仍返回，
+由前端判断——**数据要如实给出，是否可跳由前端决定**。
+
+`room.preview`：来源消息正文首行截 80 字（与 §3.4 建任务时取标题的口径一致）。
+`room.messageExists`：读房间消息日志确认该 `seq` 真实存在；取不到时 `null` + 不静默。
+
+**错误**：`400` 缺 `id` → `{ok:false, reason:"id 必填"}`；`404` 任务不存在 →
+`{ok:false, reason:"任务 t-99 不存在"}`（与 §2.1/§2.3 逐字一致）。**只读。**
+
+> 房间 id 恒为 `room-<uuid8>`（`src/room.js:1032`），**内部不含冒号**，
+> 故 `sourceSeq.split(':')` 的三段切分是安全的；这一点写进测试断言以防将来改 id 规则时被误判。
 
 ---
 
@@ -167,6 +220,21 @@ text    = 【任务目标 · 原文锚定，禁止改写】…\n\n【新增补�
 4. **去对话**：有 ownerId → 从 `GET /roster` 找 `sessionId` → `hostUiWorkspace.openSession({sessionId})`；
    找不到 → 提示「该负责人不是本平台的 Bot，无法跳转」+ 复制 ID
 5. **复制派发文案**：调 `GET /tasks/brief` 复制 `text`（用于手工粘贴给任意会话）
+6. **来源跳转（§2.5 落地，2026-11-07 补）**：调 `GET /tasks/source`
+   - `kind === 'room'` 且 `room.exists !== false` → 按钮「回到消息出处（房间名 #7）」
+     → 切到「房间」页签并选中该房间、滚到该 `seq` 的消息；`messageExists === false` 时
+     仍可切房间，但要在提示里写明「消息 #7 已不在（可能被清理）」，不许假装跳成功。
+   - `room.exists === false` → 按钮禁用 + 提示「来源房间已删除」。
+   - `kind === 'none'` → **不渲染任何来源区块**（人建的任务没有来源，不占位）。
+   - `kind === 'todo' / 'evolve' / 'unparsed'` → 显示只读一行 `「来源：<sourceSeq>」`
+     并附后端 `reason`（`unparsed` 时）——**绝不渲染跳不动的按钮**。
+
+> 跨页签定位的最小机制（不引入路由库、不重排页签）：
+> `Workbench` 持有 `tab` 状态并已把 `onGoto` 传给页签（`ArtifactsTab` 已用同一手法）。
+> §2.5 的跳转**复用 `onGoto`**，追加一个可选的「目标定位」参数
+> `onGoto('rooms', { roomId, seq })`；`RoomsTab` 收到后设置 `active` 并记 `focusSeq`，
+> 渲染时给该 `seq` 的消息行加高亮 class 并 `scrollIntoView`。
+> 向后兼容：`onGoto('tasks')` 等既有调用（单参数）行为**逐字不变**。
 
 ### 3.3 任务创建表单：选负责人 = 一步派活
 
@@ -195,3 +263,16 @@ text    = 【任务目标 · 原文锚定，禁止改写】…\n\n【新增补�
 - [ ] 路径穿越/超长/空文本 均有 400 与可读 `reason`
 - [ ] 前端 `client.js` 通过 `__ModuleLoader__` 静态装载测试（既有 A1–A12 不回归）
 - [ ] 新增测试覆盖：brief 文案结构、note 追加语义、note 唤醒 dedupKey、bots/message 404/400
+
+### 4.1 §2.5 来源跳转的追加验收（2026-11-07 补）
+
+- [ ] `GET /tasks/source`：缺 id → 400（`id 必填`）；任务不存在 → 404（`任务 t-99 不存在`）
+- [ ] 无 `sourceSeq` 的任务 → `kind:"none"`，`room`/`jump` 均为 `null`
+- [ ] `room:<roomId>:<seq>` → `kind:"room"`，`jump` 与 `room` 字段齐全，`roomId`/`seq` 与 `sourceSeq` 逐字一致
+- [ ] 来源消息真实存在 → `room.messageExists === true`；不存在 → `false` 且**不静默**
+- [ ] `todo:` / `evolve:` 前缀 → `kind` 正确、`room`/`jump` 为 `null`
+- [ ] 无法解析的 `sourceSeq` → `kind:"unparsed"` 且 `reason` 指明原因
+- [ ] 房间已删除 → `room.exists === false`，`jump` 仍如实返回（数据不丢）
+- [ ] 前端：`kind:"none"` 不渲染来源区块；`kind:"room"` 渲染可跳转按钮；`unparsed` 只显示只读来源 + reason
+- [ ] 前端：既有 `onGoto('tasks')` 单参数调用行为**逐字不变**（回归）
+

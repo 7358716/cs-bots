@@ -284,3 +284,607 @@ test('C11 新增代码没有引入相对 require', () => {
   const relative = matches.filter((s) => s.startsWith('.') || s.startsWith('/'))
   assert.deepEqual(relative, [], `不得 require 相对路径，实际=${relative}`)
 })
+
+// ══════════════════════════════════════════════════════════════════════════════
+// §2.5 / §3.2 第 6 条：来源跳转（任务 → 回消息出处）前端测试
+//
+// 测什么（契约 §4.1 第 8、9 条）：
+//   · `kind:'none'` 不渲染来源区块；`kind:'room'` 渲染可跳转按钮；
+//     `unparsed` 只显示只读来源 + reason；
+//   · 房间已删 → 按钮禁用 + 「来源房间已删除」；消息已清理 → 提示「消息 #N 已不在（可能被清理）」；
+//   · 点击按钮真的调用 `onGoto('rooms', { roomId, seq })`；
+//   · 既有 `onGoto('tasks')` 单参数调用行为**逐字不变**（回归）；
+//   · RoomsTab 收到定位参数后给目标消息行加高亮 class 并 scrollIntoView。
+//
+// 手法：与 C7 相同（假 fetch 桩 + 静态装载），但 hooks 是**有状态**的 ——
+// 否则 `useState` 的 setter 全是 no-op，点击按钮后界面不会变，测不到任何东西。
+// ══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * 有状态的假 React（同一文件里 C 层用的是 no-op 版本，这里要真的能重渲染）。
+ *
+ * 必须像真 React 一样（否则测试会假通过或死循环）：
+ *   1. hooks 按调用顺序对齐（`useState`/`useEffect`/`useCallback` 同序出现）；
+ *   2. `useState` 的 setter 做浅比较后 bailout —— 值没变就不重渲染，
+ *      否则 `setShownCount((n) => Math.max(n, x))` 这种「不变」的更新会无限重渲染；
+ *   3. `useEffect(fn, deps)` 做 deps 比较 —— 依赖没变就不重跑（否则每次渲染都
+ *      重新发起 fetch，测试会变成「每次都新请求」的噪音源）；
+ *   4. `useCallback` 按位置记忆 —— 返回稳定引用（否则 `reload` 每次都是新函数，
+ *      `useEffect([reload, ...deps])` 会每次都重跑，形成 fetch 风暴）；
+ *   5. `ref` 真的挂到节点上，并给节点补一个 `scrollIntoView` 桩 ——
+ *      这样 RoomsTab 的「滚到目标消息」可以断言调用次数与参数（不只是源码里有这个词）。
+ */
+function makeStatefulReact(records) {
+  const slots = []         // useState 的值槽（跨渲染保留）
+  const callbacks = []     // useCallback 的记忆槽（跨渲染保留 → 引用稳定）
+  const effectFns = []     // 本轮渲染登记的 effect
+  const effectDeps = []    // 本轮渲染登记的 deps
+  const ranDeps = []       // 上次真正执行时的 deps（用于比较）
+  let hookIndex = -1
+  let currentComp = null
+  let currentProps = null
+  let rendering = false
+  let queued = false
+
+  const runEffects = () => {
+    if (rendering) { queued = true; return }
+    rendering = true
+    try {
+      for (let i = 0; i < effectFns.length; i += 1) {
+        const fn = effectFns[i]
+        if (typeof fn !== 'function') continue
+        const deps = effectDeps[i] ?? null
+        const prev = ranDeps[i]
+        const same = prev !== undefined && deps !== null
+          && prev.length === deps.length
+          && prev.every((v, j) => Object.is(v, deps[j]))
+        if (same) continue
+        try { fn() } catch (e) { records.errors.push(e) }
+        ranDeps[i] = deps
+      }
+      effectFns.length = 0
+      effectDeps.length = 0
+    } finally {
+      rendering = false
+      if (queued) { queued = false; doRender() }
+    }
+  }
+
+  const doRender = () => {
+    if (!currentComp) return
+    hookIndex = -1
+    effectFns.length = 0
+    effectDeps.length = 0
+    let tree
+    try {
+      tree = currentComp(currentProps)
+    } catch (e) {
+      records.errors.push(e)
+      return
+    }
+    records.renders.push(tree)
+    runEffects()
+  }
+
+  const createElement = (type, props, ...children) => {
+    const node = { type, props: props ?? {}, children }
+    const ref = props?.ref
+    if (ref && typeof ref === 'object') {
+      node.scrollIntoView = (opts) => { records.scrolls.push({ id: node.props?.key ?? null, ...(opts ?? {}) }) }
+      ref.current = node
+    }
+    return node
+  }
+
+  const fakeReact = {
+    createElement,
+    Component: class {
+      constructor(props) { this.props = props; this.state = {} }
+      setState(updater) {
+        const next = typeof updater === 'function' ? updater(this.state) : updater
+        if (Object.keys(next ?? {}).every((k) => this.state[k] === next[k])) return
+        this.state = { ...this.state, ...next }
+        doRender()
+      }
+    },
+    useState: (initial) => {
+      const i = hookIndex + 1
+      hookIndex = i
+      if (!slots[i]) slots[i] = { value: typeof initial === 'function' ? initial() : initial }
+      const slot = slots[i]
+      return [slot.value, (u) => {
+        // 与真 React 同语义：函数式更新拿上一个值，否则**整体替换**
+        // （浅合并是错的：`setErr('x')` 会把字符串按索引合并进去）
+        const next = typeof u === 'function' ? u(slot.value) : u
+        if (Object.is(slot.value, next)) return
+        slot.value = next
+        doRender()
+      }]
+    },
+    useEffect: (fn, deps) => {
+      const i = hookIndex + 1
+      hookIndex = i
+      effectFns[i] = fn
+      effectDeps[i] = deps ?? null
+    },
+    useCallback: (fn) => {
+      const i = hookIndex + 1
+      hookIndex = i
+      if (!callbacks[i]) callbacks[i] = fn
+      return callbacks[i]
+    },
+    useRef: (v) => ({ current: v ?? null }),
+  }
+
+  fakeReact.__setComponent = (comp, props) => { currentComp = comp; currentProps = props }
+  fakeReact.__doRender = doRender
+  return fakeReact
+}
+
+/**
+ * 有状态装载 client.js。
+ * @returns {{ exports, render(props): tree, flush(): Promise<void>, restore(): void, records, setResponder }}
+ */
+function loadClientStateful() {
+  const records = { errors: [], scrolls: [], fetches: [], renders: [], responder: () => ({ ok: true }) }
+  const fakeReact = makeStatefulReact(records)
+  let captured = null
+  const fakeRequire = (spec) => {
+    if (spec.startsWith('.') || spec.startsWith('/')) throw new Error(`客户端不得 require 相对路径: ${spec}`)
+    if (spec === 'react') return fakeReact
+    throw new Error(`未注册的包: ${spec}`)
+  }
+  const fakeWindow = { __ModuleLoader__: { load({ factory }) { captured = factory(fakeRequire) } } }
+  const prevWindow = globalThis.window
+  const prevFetch = globalThis.fetch
+  globalThis.window = fakeWindow
+  try {
+    // eslint-disable-next-line no-new-func
+    new Function('window', SOURCE)(fakeWindow)
+  } finally {
+    globalThis.window = prevWindow
+  }
+  if (!captured) throw new Error('client.js 没有调用 window.__ModuleLoader__.load')
+
+  // 假 fetch：同一 URL 复用同一个响应对象（避免「每次都是新对象」触发无意义重渲染）
+  const seen = new Map()
+  globalThis.fetch = async (url) => {
+    const key = String(url)
+    records.fetches.push(key)
+    if (!seen.has(key)) {
+      seen.set(key, { status: 200, json: async () => records.responder(key) })
+    }
+    return seen.get(key)
+  }
+
+  const render = (props) => {
+    fakeReact.__setComponent(props.Comp, props.props)
+    fakeReact.__doRender()
+    return records.renders.at(-1)
+  }
+  // 等所有「setState → 重渲染 → effect → 再 setState」的链跑完
+  const flush = async () => {
+    for (let i = 0; i < 10; i += 1) {
+      await Promise.resolve()
+      fakeReact.__doRender()
+    }
+  }
+  return {
+    exports: captured,
+    records,
+    render,
+    flush,
+    restore: () => { globalThis.fetch = prevFetch },
+    setResponder: (fn) => { records.responder = fn },
+  }
+}
+
+/** 找一个元素树里所有匹配文本的按钮节点。 */
+function findButtonsByText(node, label, out = []) {
+  if (!node || typeof node !== 'object') return out
+  if (Array.isArray(node)) { for (const n of node) findButtonsByText(n, label, out); return out }
+  if (node.type === 'button' && allText(node).includes(label)) out.push(node)
+  findButtonsByText(node.children, label, out)
+  for (const v of Object.values(node.props ?? {})) {
+    if (Array.isArray(v)) findButtonsByText(v, label, out)
+  }
+  return out
+}
+
+/** 找 className 含某个片段的元素节点。 */
+function findByClass(node, part, out = []) {
+  if (!node || typeof node !== 'object') return out
+  if (Array.isArray(node)) { for (const n of node) findByClass(n, part, out); return out }
+  if (typeof node.props?.className === 'string' && node.props.className.includes(part)) out.push(node)
+  findByClass(node.children, part, out)
+  for (const v of Object.values(node.props ?? {})) {
+    if (Array.isArray(v)) findByClass(v, part, out)
+  }
+  return out
+}
+
+/** 默认应答器：任何端点都返回 ok:true + 空数据（测试按需覆盖）。 */
+const EMPTY_RESPONSE = () => ({ ok: true })
+
+// ── S1 来源区块真的请求 GET /tasks/source ─────────────────────────────────────
+
+test('S1 来源跳转：TaskAnchorPanel 挂载即请求 GET /tasks/source?id=', async () => {
+  const h = loadClientStateful()
+  h.setResponder((url) => {
+    if (url.includes('/tasks/source')) {
+      return {
+        ok: true, taskId: 't-5', source: 'ai', sourceSeq: 'room:room-a1b2c3d4:7', kind: 'room',
+        reason: null,
+        room: {
+          roomId: 'room-a1b2c3d4', name: '研发协调', seq: 7, messageId: 'm-7',
+          exists: true, messageExists: true, at: 1762300100000, preview: '把登录接口拆成三个子任务',
+        },
+        jump: { roomId: 'room-a1b2c3d4', seq: 7 },
+        hint: '来源：房间消息 room-a1b2c3d4 #7',
+      }
+    }
+    return EMPTY_RESPONSE()
+  })
+  try {
+    h.render({
+      Comp: h.exports.TaskAnchorPanel,
+      props: { taskId: 't-5', task: { id: 't-5', rev: 1, subject: '拆登录接口' }, onChange: () => {} },
+    })
+    await h.flush()
+    assert.match(
+      h.records.fetches.join('\n'),
+      /\/tasks\/source\?id=t-5/,
+      '来源区块必须请求 /tasks/source（契约 §2.5 的落地入口）',
+    )
+  } finally {
+    h.restore()
+  }
+})
+
+// ── S2 kind === 'none' → 不渲染任何来源区块 ───────────────────────────────────
+
+test('S2 来源跳转：kind:"none" 不渲染来源区块（人建的任务不占位）', async () => {
+  const h = loadClientStateful()
+  h.setResponder((url) => {
+    if (url.includes('/tasks/source')) return { ok: true, taskId: 't-1', kind: 'none', sourceSeq: null, room: null, jump: null, reason: null }
+    return EMPTY_RESPONSE()
+  })
+  try {
+    const tree = h.render({
+      Comp: h.exports.TaskAnchorPanel,
+      props: { taskId: 't-1', task: { id: 't-1', rev: 1, subject: '人建的任务' }, onChange: () => {} },
+    })
+    await h.flush()
+    const text = allText(h.records.renders.at(-1))
+    assert.ok(!text.includes('回到消息出处'), 'kind:none 绝不能渲染跳转按钮')
+    assert.ok(!text.includes('来源：'), 'kind:none 不渲染来源区块（契约 §3.2 第 6 条）')
+    assert.equal(findButtonsByText(h.records.renders.at(-1), '回到消息出处').length, 0)
+  } finally {
+    h.restore()
+  }
+})
+
+// ── S3 kind === 'room' 且消息存在 → 可跳转按钮 + 真的调 onGoto ───────────────
+
+test('S3 来源跳转：kind:"room" 渲染「回到消息出处（房间名 #7）」，点击调 onGoto("rooms",{roomId,seq})', async () => {
+  const h = loadClientStateful()
+  const gotos = []
+  h.setResponder((url) => {
+    if (url.includes('/tasks/source')) {
+      return {
+        ok: true, taskId: 't-5', source: 'ai', sourceSeq: 'room:room-a1b2c3d4:7', kind: 'room', reason: null,
+        room: {
+          roomId: 'room-a1b2c3d4', name: '研发协调', seq: 7, messageId: 'm-7',
+          exists: true, messageExists: true, at: 1762300100000, preview: '把登录接口拆成三个子任务',
+        },
+        jump: { roomId: 'room-a1b2c3d4', seq: 7 }, hint: '来源：房间消息 room-a1b2c3d4 #7',
+      }
+    }
+    return EMPTY_RESPONSE()
+  })
+  try {
+    h.render({
+      Comp: h.exports.TaskAnchorPanel,
+      props: {
+        taskId: 't-5',
+        task: { id: 't-5', rev: 1, subject: '拆登录接口' },
+        onChange: () => {},
+        onGotoSource: (...args) => gotos.push(args),
+      },
+    })
+    await h.flush()
+    const tree = h.records.renders.at(-1)
+    const text = allText(tree)
+    assert.match(text, /回到消息出处（研发协调 #7）/, '按钮文案必须是「回到消息出处（房间名 #N）」')
+    assert.match(text, /把登录接口拆成三个子任务/, '应显示来源消息预览')
+    assert.ok(!text.includes('已不在'), '消息存在时不得显示「已不在」')
+    assert.ok(!text.includes('来源房间已删除'), '房间存在时不得显示「已删除」')
+
+    const btn = findButtonsByText(tree, '回到消息出处')[0]
+    assert.ok(btn, '必须有「回到消息出处」按钮')
+    assert.notEqual(btn.props.disabled, true, '可跳时按钮不得禁用')
+    assert.equal(typeof btn.props.onClick, 'function')
+    await btn.props.onClick()
+    assert.deepEqual(gotos, [['rooms', { roomId: 'room-a1b2c3d4', seq: 7 }]], '必须调 onGoto("rooms", {roomId, seq})')
+  } finally {
+    h.restore()
+  }
+})
+
+// ── S4 消息已不在 → 仍可切房间，但提示「消息 #7 已不在（可能被清理）」 ────────
+
+test('S4 来源跳转：messageExists:false → 提示「消息 #7 已不在（可能被清理）」，不假装跳成功', async () => {
+  const h = loadClientStateful()
+  const gotos = []
+  h.setResponder((url) => {
+    if (url.includes('/tasks/source')) {
+      return {
+        ok: true, taskId: 't-6', sourceSeq: 'room:room-a1b2c3d4:7', kind: 'room', reason: null,
+        room: {
+          roomId: 'room-a1b2c3d4', name: '研发协调', seq: 7, messageId: 'm-7',
+          exists: true, messageExists: false, at: null, preview: null,
+        },
+        jump: { roomId: 'room-a1b2c3d4', seq: 7 }, hint: '来源：房间消息 room-a1b2c3d4 #7',
+      }
+    }
+    return EMPTY_RESPONSE()
+  })
+  try {
+    h.render({
+      Comp: h.exports.TaskAnchorPanel,
+      props: {
+        taskId: 't-6', task: { id: 't-6', rev: 1, subject: '清理过的消息' },
+        onChange: () => {},
+        onGotoSource: (...args) => gotos.push(args),
+      },
+    })
+    await h.flush()
+    const tree = h.records.renders.at(-1)
+    assert.match(allText(tree), /消息 #7 已不在（可能被清理）/, '就地提示必须写清「消息已不在」')
+
+    const btn = findButtonsByText(tree, '回到消息出处')[0]
+    assert.ok(btn, '消息不在但房间还在 → 仍可切房间')
+    assert.notEqual(btn.props.disabled, true, '消息不在时按钮仍可用（能切到房间）')
+    await btn.props.onClick()
+    assert.deepEqual(gotos, [['rooms', { roomId: 'room-a1b2c3d4', seq: 7 }]], '仍要切到房间页签')
+  } finally {
+    h.restore()
+  }
+})
+
+// ── S5 房间已删 → 按钮禁用 + 「来源房间已删除」，点击不跳 ────────────────────
+
+test('S5 来源跳转：room.exists:false → 按钮禁用 + 「来源房间已删除」，点击不调 onGoto', async () => {
+  const h = loadClientStateful()
+  const gotos = []
+  h.setResponder((url) => {
+    if (url.includes('/tasks/source')) {
+      return {
+        ok: true, taskId: 't-7', sourceSeq: 'room:room-gone12:3', kind: 'room', reason: null,
+        room: {
+          roomId: 'room-gone12', name: null, seq: 3, messageId: 'm-3',
+          exists: false, messageExists: null, at: null, preview: null,
+        },
+        jump: { roomId: 'room-gone12', seq: 3 }, hint: '来源：房间消息 room-gone12 #3',
+      }
+    }
+    return EMPTY_RESPONSE()
+  })
+  try {
+    h.render({
+      Comp: h.exports.TaskAnchorPanel,
+      props: {
+        taskId: 't-7', task: { id: 't-7', rev: 1, subject: '房间没了' },
+        onChange: () => {},
+        onGotoSource: (...args) => gotos.push(args),
+      },
+    })
+    await h.flush()
+    const tree = h.records.renders.at(-1)
+    const text = allText(tree)
+    assert.match(text, /来源房间已删除/, '必须提示「来源房间已删除」')
+    const btn = findButtonsByText(tree, '回到消息出处')[0]
+    assert.ok(btn, '契约：房间已删 → 按钮禁用（不是不渲染）')
+    assert.equal(btn.props.disabled, true, '房间已删时按钮必须禁用')
+    await btn.props.onClick()
+    assert.deepEqual(gotos, [], '房间已删时点击不得假装跳转')
+  } finally {
+    h.restore()
+  }
+})
+
+// ── S6 unparsed → 只读一行 + reason，绝不渲染跳不动的按钮 ────────────────────
+
+test('S6 来源跳转：kind:"unparsed" 只显示只读来源 + 后端 reason（无按钮）', async () => {
+  const h = loadClientStateful()
+  const reason = '无法解析来源标记 "weird-marker-9"（不是 room:/todo:/evolve: 前缀）'
+  h.setResponder((url) => {
+    if (url.includes('/tasks/source')) {
+      return { ok: true, taskId: 't-8', sourceSeq: 'weird-marker-9', kind: 'unparsed', reason, room: null, jump: null }
+    }
+    return EMPTY_RESPONSE()
+  })
+  try {
+    const tree = h.render({
+      Comp: h.exports.TaskAnchorPanel,
+      props: { taskId: 't-8', task: { id: 't-8', rev: 1, subject: '来源坏了' }, onChange: () => {} },
+    })
+    await h.flush()
+    const shown = h.records.renders.at(-1)
+    const text = allText(shown)
+    assert.match(text, /来源：weird-marker-9/, '必须显示只读一行「来源：<sourceSeq>」')
+    assert.match(text, /无法解析来源标记/, '必须显示后端 reason（契约 §3.2 第 6 条）')
+    assert.equal(findButtonsByText(shown, '回到消息出处').length, 0, 'unparsed 绝不渲染跳转按钮')
+    assert.ok(!text.includes('回到消息出处'))
+  } finally {
+    h.restore()
+  }
+})
+
+// ── S7 todo / evolve → 只读一行，无按钮 ───────────────────────────────────────
+
+test('S7 来源跳转：kind:"todo"/"evolve" 只显示只读一行（无按钮）', async () => {
+  // 每种 kind 用一份**全新装载**的客户端：hooks 是有状态的，
+  // 同一个组件实例换 taskId 重渲染会串味（useApi 的槽位不会跟着换任务）。
+  const cases = [
+    ['todo', 'todo:t-12', 't-9'],
+    ['evolve', 'evolve:t-9:abc123def456', 't-10'],
+  ]
+  for (const [kind, marker, id] of cases) {
+    const h = loadClientStateful()
+    h.setResponder((url) => {
+      if (url.includes('/tasks/source')) {
+        return { ok: true, taskId: id, sourceSeq: marker, kind, room: null, jump: null, reason: null }
+      }
+      return EMPTY_RESPONSE()
+    })
+    try {
+      h.render({
+        Comp: h.exports.TaskAnchorPanel,
+        props: { taskId: id, task: { id, rev: 1, subject: '来自待办' }, onChange: () => {} },
+      })
+      await h.flush()
+      const shown = h.records.renders.at(-1)
+      const text = allText(shown)
+      assert.match(text, new RegExp(`来源：${marker.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`), `${marker} 应显示只读一行`)
+      assert.equal(findButtonsByText(shown, '回到消息出处').length, 0, `${marker} 绝不渲染跳转按钮`)
+    } finally {
+      h.restore()
+    }
+  }
+})
+
+// ── S8 既有 onGoto('tasks') 单参数调用行为逐字不变（回归） ────────────────────
+
+test('S8 回归：既有 onGoto("tasks") 单参数调用逐字不变（ArtifactsTab/页签按钮）', () => {
+  // 页签按钮：仍是单参数 `goTab(t.id)`
+  assert.match(SOURCE, /onClick:\s*\(\) => goTab\(t\.id\)/, '页签按钮仍是 goTab(t.id) 单参数')
+  // 成果页空态：仍是单参数 `onGoto('tasks')`
+  assert.match(SOURCE, /onClick:\s*\(\) => onGoto\('tasks'\)/, 'ArtifactsTab 仍是 onGoto(\'tasks\') 单参数')
+  // goTab 的第二参数必须是可选的（单参数时不产生任何定位副作用）
+  assert.match(SOURCE, /const goTab = \(id, opts\) => \{/, 'goTab 必须支持可选第二参数 opts')
+  assert.match(SOURCE, /setLocate\(opts && typeof opts === 'object' && opts\.roomId \? opts : null\)/,
+    '单参数调用时 locate 必须落回 null（行为逐字不变）')
+  assert.match(SOURCE, /id:\s*'tasks',\s*label:\s*'任务'/, '任务页签定义未被改动')
+})
+
+test('S8b 回归：单参数 onGoto 时 RoomsTab 不产生任何定位副作用（不发 /rooms/messages 定位请求）', async () => {
+  const h = loadClientStateful()
+  const calls = []
+  h.setResponder((url) => { calls.push(url); return EMPTY_RESPONSE() })
+  try {
+    h.render({ Comp: h.exports.RoomsTab, props: {} })
+    await h.flush()
+    const text = allText(h.records.renders.at(-1))
+    assert.ok(!text.includes('回到消息出处'))
+    // 没有任何定位：不渲染高亮行，也没有「滚到目标」的滚动
+    assert.equal(findByClass(h.records.renders.at(-1), 'csb-msg-focus').length, 0, '无定位参数时不得高亮任何消息行')
+    assert.equal(h.records.scrolls.filter((s) => s.block === 'center').length, 0, '无定位参数时不得滚到中心')
+  } finally {
+    h.restore()
+  }
+})
+
+// ── S9 Workbench：goTab 双参数 + locate 传给 RoomsTab ────────────────────────
+
+test('S9 Workbench：onGoto("rooms", {roomId,seq}) 会把定位参数传给 RoomsTab', () => {
+  assert.match(
+    SOURCE,
+    /locate:\s*current\.id === 'rooms' \? locate : undefined/,
+    '只有房间页签接收 locate 定位参数',
+  )
+  assert.match(SOURCE, /goTab,\s*$/m, '页签组件仍拿到 onGoto=goTab')
+  assert.match(SOURCE, /const \[locate, setLocate\] = useState\(null\)/, 'Workbench 持有 locate 状态')
+})
+
+test('S9b TasksTab 把 onGoto 透传给 TaskDrawer（来源跳转的跨页签路径）', () => {
+  assert.match(SOURCE, /function TasksTab\(\{ onGoto \}\)/, 'TasksTab 必须接 onGoto')
+  assert.match(
+    SOURCE,
+    /openId \? h\(TaskDrawer, \{\s*id: openId, bots, workflows,\s*onClose: \(\) => setOpenId\(null\),\s*onChange: reload,\s*onGotoSource: onGoto,/,
+    'TasksTab 必须把 onGoto 作为 onGotoSource 传给 TaskDrawer',
+  )
+})
+
+// ── S10 RoomsTab 收到定位参数 → 高亮目标消息行 + scrollIntoView ───────────────
+
+test('S10 RoomsTab：收到 locate → 选中房间、目标消息行高亮并滚到可见', async () => {
+  const h = loadClientStateful()
+  const callLog = []
+  const msgs = [
+    { id: 'm-1', seq: 1, from: 'user', text: '第一条' },
+    { id: 'm-2', seq: 2, from: 'user', text: '第二条' },
+    { id: 'm-3', seq: 3, from: 'user', text: '第三条：来源应该是它' },
+  ]
+  h.setResponder((url) => {
+    callLog.push(url)
+    if (url.includes('/rooms/messages')) return { ok: true, messages: msgs }
+    if (url.includes('/rooms')) {
+      return { ok: true, rooms: [{ id: 'room-a1b2c3d4', name: '研发协调', members: ['user'], mode: 'everyone', seq: 3 }] }
+    }
+    return EMPTY_RESPONSE()
+  })
+  try {
+    h.render({
+      Comp: h.exports.RoomsTab,
+      props: { locate: { roomId: 'room-a1b2c3d4', seq: 3 } },
+    })
+    await h.flush()
+    const tree = h.records.renders.at(-1)
+
+    // 1) 选中了目标房间
+    const focused = findByClass(tree, 'csb-msg-focus')
+    assert.equal(focused.length, 1, '目标消息行必须带高亮 class')
+    assert.match(focused[0].props.className, /csb-msg-focus/)
+    assert.match(allText(focused[0]), /第三条：来源应该是它/, '高亮的正是 seq=3 那条')
+
+    // 2) 加载了目标房间的消息（定位的前提是消息真的被取回来）
+    assert.ok(
+      callLog.some((u) => u.includes('/rooms/messages') && u.includes('room-a1b2c3d4')),
+      `必须加载目标房间的消息，实际请求：${callLog.join(' | ')}`,
+    )
+
+    // 3) 滚到了目标消息（不是滚到底）
+    assert.ok(
+      h.records.scrolls.some((s) => s.block === 'center'),
+      '定位时必须 scrollIntoView({block:"center"})，实际：' + JSON.stringify(h.records.scrolls),
+    )
+  } finally {
+    h.restore()
+  }
+})
+
+test('S10b RoomsTab：定位目标不在消息列表里（已被清理）→ 不崩、不高亮、滚到底', async () => {
+  const h = loadClientStateful()
+  const msgs = [{ id: 'm-1', seq: 1, from: 'user', text: '第一条' }]
+  h.setResponder((url) => {
+    if (url.includes('/rooms/messages')) return { ok: true, messages: msgs }
+    if (url.includes('/rooms')) {
+      return { ok: true, rooms: [{ id: 'room-a1b2c3d4', name: '研发协调', members: ['user'], mode: 'everyone', seq: 1 }] }
+    }
+    return EMPTY_RESPONSE()
+  })
+  try {
+    h.render({ Comp: h.exports.RoomsTab, props: { locate: { roomId: 'room-a1b2c3d4', seq: 99 } } })
+    await h.flush()
+    const tree = h.records.renders.at(-1)
+    assert.equal(findByClass(tree, 'csb-msg-focus').length, 0, '消息不在了就不该高亮任何一行')
+    assert.ok(
+      h.records.scrolls.some((s) => s.block === 'end'),
+      '消息已不在时应滚到底（让人看到最新状态）',
+    )
+    assert.equal(h.records.errors.length, 0, '定位到不存在的消息不得抛错：' + JSON.stringify(h.records.errors))
+  } finally {
+    h.restore()
+  }
+})
+
+// ── S11 新增代码没有引入相对 require（沿用 C11 的口径，覆盖本文件全部新增） ──
+
+test('S11 来源跳转新增代码没有引入相对 require', () => {
+  const matches = [...SOURCE.matchAll(/require\(\s*['"]([^'"]+)['"]\s*\)/g)].map((m) => m[1])
+  const relative = matches.filter((s) => s.startsWith('.') || s.startsWith('/'))
+  assert.deepEqual(relative, [], `不得 require 相对路径，实际=${relative}`)
+  // 客户端不得使用 window.prompt/confirm/alert（CI 机械禁止）
+  assert.equal([...SOURCE.matchAll(/window\.(prompt|confirm|alert)\(/g)].length, 0, '客户端不得用 prompt/confirm/alert')
+})

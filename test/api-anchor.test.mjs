@@ -14,7 +14,7 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync, mkdirSync, readFileSync } from 'node:fs'
+import { mkdtempSync, rmSync, mkdirSync, readFileSync, readdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Readable } from 'node:stream'
@@ -459,4 +459,286 @@ test('bots/message：taskId 不存在 → 404（绝不静默发出未锚定的�
   assert.equal(r.json.ok, false)
   assert.equal(r.json.reason, '任务 t-999 不存在')
   assert.deepEqual(calls, [], '任务不存在时不应投递')
+})
+
+// ── GET /tasks/source（契约 §2.5；2026-11-07 补）──────────────────────────────
+//
+// 这一组测试守护的是「任务 → 回消息出处」这条闭环：
+//   · 来源标记的三类前缀必须逐字判定，**不猜测**（unparsed 要如实上报）；
+//   · 房间侧信息全部来自 room 服务：房间在不在、那条消息在不在，必须如实给出
+//     （数据要如实返回，是否可跳由前端决定）；
+//   · 端点**只读**：不写任何文件（§2.1/§2.3 同口径）。
+
+/** 建一个房间 + 发若干条消息（走真实 HTTP 端点，与页面同路径）。 */
+async function makeRoom(h, name, messages = ['第一条消息']) {
+  const created = await h.req('POST', '/rooms', { name, members: ['user'], byId: 'user' })
+  assert.equal(created.status, 200, `建房间失败：${JSON.stringify(created.json)}`)
+  const roomId = created.json.room.id
+  let seq = 0
+  for (const text of messages) {
+    const posted = await h.req('POST', '/rooms/post', { roomId, text, from: 'user' })
+    assert.equal(posted.status, 200, `房间发言失败：${JSON.stringify(posted.json)}`)
+    seq = posted.json.message.seq
+  }
+  return { roomId, seq, room: created.json.room }
+}
+
+/**
+ * 造一个带 `sourceSeq` 的任务（幂等键即来源标记）。
+ * 若 `seq` 与已有任务重复，board 会按 sourceSeq 幂等返回同一张 —— 这里不关心，
+ * 只要拿到一条带指定 sourceSeq 的任务即可。
+ */
+function taskWithSource(h, sourceSeq, over = {}) {
+  return h.createTask({ subject: `来源测试 ${sourceSeq}`, sourceSeq, ...over })
+}
+
+test('source：缺 id → 400（id 必填）；任务不存在 → 404（逐字对齐 §2.1/§2.3）', async (t) => {
+  const h = boot()
+  t.after(() => h.cleanup())
+
+  const missing = await h.req('GET', '/tasks/source')
+  assert.equal(missing.status, 400)
+  assert.equal(missing.json.ok, false)
+  assert.equal(missing.json.reason, 'id 必填')
+
+  const notFound = await h.req('GET', '/tasks/source?id=t-99')
+  assert.equal(notFound.status, 404)
+  assert.equal(notFound.json.ok, false)
+  assert.equal(notFound.json.reason, '任务 t-99 不存在')
+})
+
+test('source：kind 判定顺序 —— room / todo / evolve / none / unparsed（契约 §2.5 表格）', async (t) => {
+  const h = boot()
+  t.after(() => h.cleanup())
+
+  // 房间 id 恒为 `room-<uuid8>`（src/room.js:1032），**内部不含冒号**
+  // → `sourceSeq.split(':')` 的三段切分是安全的（契约 §2.5 的口径说明）
+  const room = await makeRoom(h, '来源判定房', ['把登录接口拆成三个子任务'])
+  assert.match(room.roomId, /^room-[0-9a-f]{8}$/, '房间 id 必须是 room-<uuid8>')
+  assert.ok(!room.roomId.includes(':'), '房间 id 内部不得含冒号（否则三段切分会错）')
+
+  const roomTask = taskWithSource(h, `room:${room.roomId}:${room.seq}`)
+  const todoTask = taskWithSource(h, 'todo:t-12')
+  const evolveTask = taskWithSource(h, `evolve:${todoTask.id}:abc123def456`)
+  const noneTask = h.createTask({ subject: '人建的任务' })
+  const unparsedTask = taskWithSource(h, 'weird-marker-9')
+
+  const rRoom = await h.req('GET', `/tasks/source?id=${roomTask.id}`)
+  assert.equal(rRoom.status, 200, JSON.stringify(rRoom.json))
+  assert.equal(rRoom.json.kind, 'room')
+  assert.equal(rRoom.json.sourceSeq, `room:${room.roomId}:${room.seq}`)
+  assert.equal(rRoom.json.source, roomTask.source, 'source 原样透出（不做二次推断）')
+  assert.equal(rRoom.json.reason, null)
+  assert.equal(rRoom.json.room.roomId, room.roomId)
+  assert.equal(rRoom.json.room.name, '来源判定房')
+  assert.equal(rRoom.json.room.seq, room.seq)
+  assert.equal(rRoom.json.room.messageId, `m-${room.seq}`)
+  assert.equal(rRoom.json.room.exists, true)
+  assert.equal(rRoom.json.room.messageExists, true)
+  assert.equal(rRoom.json.room.preview, '把登录接口拆成三个子任务')
+  assert.equal(typeof rRoom.json.room.at, 'number')
+  assert.deepEqual(rRoom.json.jump, { roomId: room.roomId, seq: room.seq })
+  assert.equal(rRoom.json.hint, `来源：房间消息 ${room.roomId} #${room.seq}`)
+
+  const rTodo = await h.req('GET', `/tasks/source?id=${todoTask.id}`)
+  assert.equal(rTodo.status, 200)
+  assert.equal(rTodo.json.kind, 'todo')
+  assert.equal(rTodo.json.sourceSeq, 'todo:t-12')
+  assert.equal(rTodo.json.room, null)
+  assert.equal(rTodo.json.jump, null)
+  assert.equal(rTodo.json.reason, null)
+
+  const rEvolve = await h.req('GET', `/tasks/source?id=${evolveTask.id}`)
+  assert.equal(rEvolve.status, 200)
+  assert.equal(rEvolve.json.kind, 'evolve')
+  assert.equal(rEvolve.json.sourceSeq, `evolve:${todoTask.id}:abc123def456`)
+  assert.equal(rEvolve.json.room, null)
+  assert.equal(rEvolve.json.jump, null)
+  assert.equal(rEvolve.json.reason, null)
+
+  const rNone = await h.req('GET', `/tasks/source?id=${noneTask.id}`)
+  assert.equal(rNone.status, 200)
+  assert.equal(rNone.json.kind, 'none')
+  assert.equal(rNone.json.room, null)
+  assert.equal(rNone.json.jump, null)
+  assert.equal(rNone.json.sourceSeq, null, '没有 sourceSeq 时 sourceSeq 为 null（不是 undefined）')
+  assert.equal(rNone.json.reason, null)
+
+  const rBad = await h.req('GET', `/tasks/source?id=${unparsedTask.id}`)
+  assert.equal(rBad.status, 200)
+  assert.equal(rBad.json.kind, 'unparsed')
+  assert.equal(rBad.json.sourceSeq, 'weird-marker-9')
+  assert.equal(rBad.json.room, null)
+  assert.equal(rBad.json.jump, null)
+  assert.equal(
+    rBad.json.reason,
+    '无法解析来源标记 "weird-marker-9"（不是 room:/todo:/evolve: 前缀）',
+    'unparsed 的 reason 必须写明原始标记（契约 §2.5 原文）',
+  )
+})
+
+test('source：room 判定必须真的看格式 —— 残缺/畸形标记一律 unparsed（绝不猜测）', async (t) => {
+  const h = boot()
+  t.after(() => h.cleanup())
+  const room = await makeRoom(h, '畸形标记房', ['x'])
+
+  const bad = [
+    `room:${room.roomId}`,              // 缺 seq 段
+    `room:${room.roomId}:`,             // seq 段为空
+    `room::${room.seq}`,                // roomId 段为空
+    `room:${room.roomId}:0`,            // seq 非正
+    `room:${room.roomId}:-3`,           // seq 为负
+    `room:${room.roomId}:1.5`,          // seq 非整数
+    `room:${room.roomId}:1e2`,          // seq 是科学计数法（不是十进制整数字面量）
+    `room:${room.roomId}:${room.seq}:x`, // 段数不对
+    `todo:`,                            // 空 id
+    `evolve:${room.roomId}:`,           // 尾段为空
+    `todo:t-1:extra`,                   // 段数不对
+  ]
+  for (const marker of bad) {
+    const task = taskWithSource(h, marker)
+    const r = await h.req('GET', `/tasks/source?id=${task.id}`)
+    assert.equal(r.status, 200, `${marker} → HTTP ${r.status}`)
+    assert.equal(r.json.kind, 'unparsed', `${marker} 必须判 unparsed（实际 ${r.json.kind}）`)
+    assert.equal(r.json.room, null)
+    assert.equal(r.json.jump, null)
+    assert.equal(r.json.reason, `无法解析来源标记 "${marker}"（不是 room:/todo:/evolve: 前缀）`)
+  }
+
+  // 边界：`room:<roomId>:07` 仍是数值 7（十进制整数字面量），必须判 room
+  const padded = taskWithSource(h, `room:${room.roomId}:07`)
+  const rPadded = await h.req('GET', `/tasks/source?id=${padded.id}`)
+  assert.equal(rPadded.json.kind, 'room')
+  assert.equal(rPadded.json.room.seq, 7)
+})
+
+test('source：来源消息真实存在 → messageExists true；被清理 → false 且不静默', async (t) => {
+  const h = boot()
+  t.after(() => h.cleanup())
+  const room = await makeRoom(h, '消息存在性房', ['第一条', '第二条，来源应该是它'])
+  const task = taskWithSource(h, `room:${room.roomId}:${room.seq}`)
+
+  const r = await h.req('GET', `/tasks/source?id=${task.id}`)
+  assert.equal(r.status, 200)
+  assert.equal(r.json.room.messageExists, true)
+  assert.equal(r.json.room.preview, '第二条，来源应该是它')
+  assert.deepEqual(r.json.jump, { roomId: room.roomId, seq: room.seq })
+
+  // 消息已不在（seq 不在日志里）：messageExists=false，且**不静默**
+  // —— room 仍是真实存在的房间，所以 exists 仍为 true（两者必须区分）
+  const ghostTask = taskWithSource(h, `room:${room.roomId}:99999`)
+  const rGhost = await h.req('GET', `/tasks/source?id=${ghostTask.id}`)
+  assert.equal(rGhost.status, 200)
+  assert.equal(rGhost.json.kind, 'room')
+  assert.equal(rGhost.json.room.exists, true)
+  assert.equal(rGhost.json.room.messageExists, false)
+  assert.equal(rGhost.json.room.preview, null, '取不到消息就没有预览（不编）')
+  assert.equal(rGhost.json.room.at, null)
+  // 数据如实给出：jump 照常返回（是否可跳由前端决定）
+  assert.deepEqual(rGhost.json.jump, { roomId: room.roomId, seq: 99999 })
+})
+
+test('source：preview = 正文首行截 80 字（含长正文走旁路文件的口径）', async (t) => {
+  const h = boot()
+  t.after(() => h.cleanup())
+
+  const longFirstLine = '第一行标题'.repeat(40) // 200 字 > 80
+  const body = `${longFirstLine}\n第二行细节（预览只取首行）`
+  const room = await makeRoom(h, '预览房', [body])
+  const task = taskWithSource(h, `room:${room.roomId}:${room.seq}`)
+
+  const r = await h.req('GET', `/tasks/source?id=${task.id}`)
+  assert.equal(r.status, 200)
+  assert.equal(r.json.room.messageExists, true)
+  assert.equal(r.json.room.preview.length, 80, '首行截 80 字')
+  assert.ok(r.json.room.preview.startsWith('第一行标题'))
+  assert.ok(!r.json.room.preview.includes('\n'), '预览不含换行（只取首行）')
+  assert.ok(!r.json.room.preview.includes('第二行'), '预览不取第二行')
+})
+
+test('source：房间已删除 → room.exists false，jump 仍如实返回（数据不丢）', async (t) => {
+  const h = boot()
+  t.after(() => h.cleanup())
+  const room = await makeRoom(h, '待删房', ['会被一起删掉的消息'])
+  const task = taskWithSource(h, `room:${room.roomId}:${room.seq}`)
+
+  const removed = await h.req('POST', '/rooms/remove', { roomId: room.roomId, byId: 'user', force: true })
+  assert.equal(removed.status, 200, `硬删房间失败：${JSON.stringify(removed.json)}`)
+
+  const r = await h.req('GET', `/tasks/source?id=${task.id}`)
+  assert.equal(r.status, 200)
+  assert.equal(r.json.kind, 'room')
+  assert.equal(r.json.room.exists, false, '房间已删必须如实给出 exists:false')
+  assert.equal(r.json.room.name, null, '房间不在就不该编一个名字')
+  assert.equal(r.json.room.messageExists, null, '房间不存在时「消息在不在」无从谈起（不猜 false）')
+  assert.equal(r.json.room.at, null)
+  assert.equal(r.json.room.preview, null)
+  assert.deepEqual(r.json.jump, { roomId: room.roomId, seq: room.seq }, 'jump 仍如实返回（前端据此判断能否跳）')
+})
+
+test('source：端点只读 —— 不新增任何文件（§2.1/§2.3 同口径）', async (t) => {
+  const h = boot()
+  t.after(() => h.cleanup())
+  const room = await makeRoom(h, '只读房', ['只读检查'])
+  const task = taskWithSource(h, `room:${room.roomId}:${room.seq}`)
+
+  const before = new Set(readdirSync(h.stateDir))
+  await h.req('GET', `/tasks/source?id=${task.id}`)
+  await h.req('GET', '/tasks/source?id=t-99')
+  await h.req('GET', '/tasks/source')
+  const after = new Set(readdirSync(h.stateDir))
+  assert.deepEqual([...after].filter((x) => !before.has(x)), [], '只读端点不得新增状态文件')
+})
+
+test('source：鉴权走既有 createFence（不新增绕过；公网代理路径仍 403）', async (t) => {
+  // 走真实 handler（而非 fence.judge 单测）：构造"经代理 + 宿主无 connection 服务"
+  // 的请求，必须被既有围栏挡下 —— 新端点不能成为绕过鉴权的口子。
+  const stateDir = mkdtempSync(join(tmpdir(), 'cs-bots-source-fence-'))
+  let handler = null
+  const ctx = {
+    logger: { info: () => {}, warn: () => {} },
+    get: (key) => {
+      if (key === 'agents') {
+        return {
+          async create(request) { return { id: request?.sessionId, sessionId: request?.sessionId } },
+          get: () => undefined, list: () => [],
+        }
+      }
+      if (key === 'tools') return { register: () => () => {}, guard: () => () => {}, schemas: () => [] }
+      if (key === 'webServer') {
+        return { register: ({ path, handler: fn }) => { assert.equal(path, API_BASE); handler = fn; return () => {} } }
+      }
+      return undefined
+    },
+    on: () => {}, effect: () => {},
+  }
+  apply(ctx, { stateDir })
+  t.after(() => {
+    try { getServices(ctx).dispatcher?.dispose?.() } catch {}
+    rmSync(stateDir, { recursive: true, force: true })
+  })
+
+  const make = (url) => {
+    const request = Object.assign(Readable.from([]), {
+      method: 'GET', url,
+      headers: { 'x-forwarded-for': '1.2.3.4', host: 'example.com' },
+    })
+    return new Promise((resolve) => {
+      let status = 0
+      let raw = ''
+      const response = {
+        writeHead(code) { status = code },
+        end(chunk) { raw += chunk ?? ''; resolve({ status, json: JSON.parse(raw || '{}') }) },
+      }
+      handler(request, response)
+    })
+  }
+
+  // 先建一个任务，才能验证「有 id 也被挡」
+  const services = getServices(ctx)
+  services.board.create({ subject: '围栏房任务', byId: 'user' })
+
+  const denied = await make(`${API_BASE}/tasks/source?id=t-1`)
+  assert.equal(denied.status, 403, '经代理的公网请求必须被既有围栏挡下')
+  assert.equal(denied.json.ok, false)
 })

@@ -259,6 +259,8 @@ window.__ModuleLoader__.load({
 .csb-msg-me{background:var(--dsw-alias-bg-layer-2);margin-left:auto}
 .csb-msg-row{display:flex;flex-direction:column;margin-bottom:8px}
 .csb-msg-row-me{align-items:flex-end}
+/* 来源跳转（契约 §2.5）：从任务详情跳回消息出处时，那条消息要一眼能看见 */
+.csb-msg-focus{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:2px;border-radius:10px;background:var(--dsw-alias-bg-layer-2)}
 .csb-msg-h{display:flex;align-items:center;gap:7px;margin-bottom:3px;font-size:11px;color:var(--dsw-alias-label-secondary)}
 .csb-msg-b{font-size:12.5px;line-height:1.6;white-space:pre-wrap;word-break:break-word}
 .csb-msg-time{font-size:10px;color:var(--dsw-alias-label-tertiary);margin-top:2px}
@@ -857,7 +859,15 @@ window.__ModuleLoader__.load({
 
     // ── 任务 ────────────────────────────────────────────────────────────────
 
-    function TaskDrawer({ id, bots, workflows, onClose, onChange }) {
+    /**
+     * 任务详情抽屉。
+     *
+     * `onGotoSource` 是「来源跳转」的跨页签定位回调（契约 §3.2 第 6 条）：
+     *   `onGotoSource('rooms', { roomId, seq })` → 切到房间页签并定位到那条消息。
+     * 没有传（例如从成果库打开）时，点击会明确提示「当前页面不支持跨页签跳转」，
+     * 绝不假装跳成功。
+     */
+    function TaskDrawer({ id, bots, workflows, onClose, onChange, onGotoSource }) {
       const { data, loading, error, reload } = useApi(`/tasks/detail?id=${encodeURIComponent(id)}`, [id])
       const [err, setErr] = useState(null)
       const [picking, setPicking] = useState(null) // 'complete' | 'abort'
@@ -943,7 +953,7 @@ window.__ModuleLoader__.load({
           task.description ? h('div', { className: 'csb-pre', style: { marginBottom: 4 } }, task.description) : null,
 
           // 改造04：目标锚（只读）+ 补充说明 + 补充历史 + 去对话 + 复制派发文案
-          h(TaskAnchorPanel, { taskId: task.id, task, onChange }),
+          h(TaskAnchorPanel, { taskId: task.id, task, onChange, onGotoSource }),
 
           h(Section, {
             title: task.status === 'completed'
@@ -1326,10 +1336,12 @@ window.__ModuleLoader__.load({
      * 写入：
      *   POST /tasks/note      → 追加补充说明（有执行者时顺带唤醒）
      */
-    function TaskAnchorPanel({ taskId, task, onChange }) {
+    function TaskAnchorPanel({ taskId, task, onChange, onGotoSource }) {
       const briefQ = useApi(`/tasks/brief?id=${encodeURIComponent(taskId)}`, [taskId])
       const notesQ = useApi(`/tasks/notes?id=${encodeURIComponent(taskId)}`, [taskId])
       const rosterQ = useApi('/roster')
+      // 来源跳转（契约 §2.5）：任务详情的「来源」区块数据
+      const sourceQ = useApi(`/tasks/source?id=${encodeURIComponent(taskId)}`, [taskId])
       const [noteText, setNoteText] = useState('')
       const [busy, setBusy] = useState(false)
       const [err, setErr] = useState(null)
@@ -1411,6 +1423,39 @@ window.__ModuleLoader__.load({
         } catch (e) {
           setErr(`无法打开会话：${e.message}`)
         }
+      }
+
+      /**
+       * 来源跳转（契约 §3.2 第 6 条 + §2.5）：
+       *
+       * 数据由后端如实给出，**不猜、不装成功**：
+       *   - `room.exists === false` → 后端数据里已经没有这个房间，按钮禁用，
+       *     点击不跳（只提示「来源房间已删除」）。
+       *   - `messageExists === false` → 房间还在，但那条消息已经不在了（被清理）：
+       *     仍然切到房间页签（人可以在里面手动找），但提示必须说清
+       *     「消息 #N 已不在（可能被清理）」，不许假装跳成功。
+       *   - 两者都不是 → 正常切页签并定位。
+       */
+      const gotoSource = () => {
+        setErr(null)
+        const src = sourceQ.data
+        const room = src?.room
+        if (!room) {
+          setErr('来源信息还没读到，稍后再试')
+          return
+        }
+        const seq = room.seq
+        if (room.exists === false) {
+          setErr('来源房间已删除')
+          return
+        }
+        if (room.messageExists === false) {
+          // 人看到这条提示就知道「跳过去也找不到那条消息」，而不是以为跳成功了
+          setErr(`消息 #${seq} 已不在（可能被清理）`)
+        }
+        // 切到「房间」页签并带上定位参数（§3.2：`onGoto('rooms', { roomId, seq })`）
+        if (typeof onGotoSource === 'function') onGotoSource('rooms', { roomId: room.roomId, seq })
+        else setErr('当前页面不支持跨页签跳转，请手动打开房间列表')
       }
 
       /** 追加补充说明：成功后清空、刷新历史、显示唤醒结果。 */
@@ -1536,7 +1581,51 @@ window.__ModuleLoader__.load({
               className: 'csb-mono',
               style: { padding: 10, background: 'var(--dsw-alias-bg-layer-2)', borderRadius: 8, wordBreak: 'break-all' },
             }, jump.id))
-          : null)
+          : null,
+
+          // ── 来源跳转（契约 §3.2 第 6 条；§2.5 的落地）───────────────────
+          //
+          // 规则（契约原文，逐条实现，不自作主张）：
+          //   room + exists !== false → 按钮「回到消息出处（房间名 #N）」
+          //   room + exists === false → 按钮禁用 + 提示「来源房间已删除」
+          //   none                    → **不渲染任何来源区块**（人建的任务不占位）
+          //   todo/evolve             → 只读一行「来源：<sourceSeq>」
+          //   unparsed                → 只读一行 + 后端 reason（绝不渲染跳不动的按钮）
+          sourceQ.error
+            ? h('div', { className: 'csb-note', style: { marginTop: 10 } }, `来源信息读取失败：${sourceQ.error}`)
+            : (() => {
+                const src = sourceQ.data
+                const kind = src?.kind ?? 'none'
+                if (kind === 'none') return null
+                if (kind === 'room') {
+                  const room = src.room ?? {}
+                  const disabled = room.exists === false
+                  return h(Section, {
+                    title: '来源',
+                    desc: '这个任务是从房间消息创建的，可以跳回消息出处。',
+                  },
+                    h('div', { className: 'csb-bar', style: { marginTop: 10 } },
+                      h('button', {
+                        className: 'csb-btn csb-btn-s',
+                        disabled,
+                        onClick: gotoSource,
+                      }, disabled
+                        ? '回到消息出处（来源房间已删除）'
+                        : `回到消息出处（${room.name ?? room.roomId} #${room.seq}）`),
+                      room.preview ? h('span', { className: 'csb-set-d' }, `「${room.preview}」`) : null,
+                      room.exists === false ? h('span', { className: 'csb-set-d' }, '来源房间已删除') : null,
+                      room.messageExists === false
+                        ? h('span', { className: 'csb-set-d' }, `消息 #${room.seq} 已不在（可能被清理）`)
+                        : null))
+                }
+                // todo / evolve / unparsed：只读一行 + reason（unparsed 时）
+                return h(Section, { title: '来源' },
+                  h('div', { className: 'csb-set-d', style: { marginTop: 10 } },
+                    `来源：${src?.sourceSeq ?? ''}`,
+                    kind === 'unparsed' && src?.reason
+                      ? h('div', { className: 'csb-err', style: { marginTop: 6 } }, src.reason)
+                      : null))
+              })())
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -1771,8 +1860,28 @@ window.__ModuleLoader__.load({
         setBusy(true)
         setErr(null)
         setDone(null)
+        // 换负责人**不传 expectedRev**（2026-11-07 实测修复）：
+        //   弹窗打开时拿到的 task 是抽屉里的旧快照；期间若发生「重开/完成/别人改」，
+        //   旧 rev 会让后端预检直接抛 BOARD_REV_CONFLICT（用户看到的正是这个错）。
+        //   后端处理器**自己** b.get() 拿最新 rev、并在每次 b.update() 里做 CAS，
+        //   所以传 stale rev 不增加任何安全性，只会制造假冲突。
+        //
+        // 真·并发冲突（两次点击撞车）仍由后端 CAS 兜住；这里额外做**一次自动重试**：
+        //   刷新抽屉数据 → 重新提交，用户不用手动「刷新后重试」。
+        const doSubmit = () => postReassign({ id: task?.id, ownerId })
         try {
-          const d = await postReassign({ id: task?.id, ownerId, expectedRev: task?.rev })
+          let d
+          try {
+            d = await doSubmit()
+          } catch (e) {
+            if (e?.code === 'BOARD_REV_CONFLICT') {
+              // 让抽屉重新拉一次最新 task（onChange 会触发 reload），再试一次
+              await Promise.resolve(onChange?.())
+              d = await doSubmit()
+            } else {
+              throw e
+            }
+          }
           const fromName = current ? botName(liveBots.length ? liveBots : bots, current) : '未派人'
           const toName = botName(liveBots, d?.to ?? ownerId)
           setDone(`已从 ${fromName} 换到 ${toName}${reassignWakeText(d?.wake)}`)
@@ -1781,6 +1890,10 @@ window.__ModuleLoader__.load({
           if (e?.code === 'TASK_COMPLETED') {
             setErr('任务已完成，不能直接换负责人。'
               + '请先用下方「变更」区的「重开（纠错/继续做）」或「派生优化单」，再换负责人。'
+              + `（后端说明：${e.message}）`)
+          } else if (e?.code === 'BOARD_REV_CONFLICT') {
+            setErr('任务刚被别处改动过（版本冲突），已自动重试仍不成功。'
+              + '请关闭弹窗后重新打开再试。'
               + `（后端说明：${e.message}）`)
           } else {
             setErr(`换负责人失败：${e.message}`)
@@ -2071,7 +2184,7 @@ window.__ModuleLoader__.load({
           : null)
     }
 
-    function TasksTab() {
+    function TasksTab({ onGoto }) {
       const [filter, setFilter] = useState('')
       const [subject, setSubject] = useState('')
       const [desc, setDesc] = useState('')
@@ -2308,7 +2421,13 @@ window.__ModuleLoader__.load({
                         })))
               }))
           : null,
-        openId ? h(TaskDrawer, { id: openId, bots, workflows, onClose: () => setOpenId(null), onChange: reload }) : null)
+        // 任务详情里的「来源跳转」需要跨页签定位能力（契约 §3.2 第 6 条）：透传 onGoto
+        openId ? h(TaskDrawer, {
+          id: openId, bots, workflows,
+          onClose: () => setOpenId(null),
+          onChange: reload,
+          onGotoSource: onGoto,
+        }) : null)
     }
 
     // ── 技能库 / 工作流库 ───────────────────────────────────────────────────
@@ -3443,11 +3562,23 @@ window.__ModuleLoader__.load({
 
     // ── 房间 ────────────────────────────────────────────────────────────────
 
-    function RoomsTab() {
+    /**
+     * 房间页签（契约 §3.2）：接收来源跳转的定位参数 `locate = { roomId, seq }`。
+     *
+     * 机制（不引入路由库、不重排页签）：
+     *   - `locate` 变化 → 选中该房间（`active`）并记 `focusSeq`；
+     *   - 渲染时给 `focusSeq` 那条消息行加高亮 class（`csb-msg-focus`）
+     *     并在消息加载完成后 `scrollIntoView`。
+     *
+     * 没带 `locate`（普通点击页签）时 `focusSeq` 为 null，行为与改造前逐字一致。
+     */
+    function RoomsTab({ locate }) {
       const [showArchived, setShowArchived] = useState(false)
       const { data, loading, error, reload } = useApi(`/rooms${showArchived ? '?includeArchived=1' : ''}`, [showArchived])
       const { data: rosterData } = useApi('/roster')
       const [active, setActive] = useState(null)
+      // 跨页签定位（契约 §2.5 / §3.2 第 6 条）：要高亮并滚过去的消息 seq
+      const [focusSeq, setFocusSeq] = useState(null)
       const [msgs, setMsgs] = useState([])
       const [text, setText] = useState('')
       const [roomName, setRoomName] = useState('')
@@ -3463,6 +3594,8 @@ window.__ModuleLoader__.load({
       const [shownCount, setShownCount] = useState(50)
       const endRef = useRef(null)
       const roomNameRef = useRef(null)
+      // 高亮行的 DOM 句柄（消息渲染时挂 ref；加载完成后滚动过去）
+      const focusSeqRef = useRef(null)
 
       const bots = rosterData?.bots ?? []
       const rooms = data?.rooms ?? []
@@ -3483,6 +3616,32 @@ window.__ModuleLoader__.load({
       useEffect(() => {
         endRef.current?.scrollIntoView?.({ block: 'end' })
       }, [msgs])
+
+      // 定位参数变化 → 选中房间 + 记 focusSeq（只做这两件事，加载由 active 的 effect 触发）
+      useEffect(() => {
+        const roomId = locate?.roomId
+        const seq = locate?.seq
+        if (!roomId) {
+          setFocusSeq(null)
+          return
+        }
+        setActive(roomId)
+        setFocusSeq(Number.isInteger(seq) && seq > 0 ? seq : null)
+      }, [locate])
+
+      // 定位到的消息加载出来后：滚过去 + 高亮（§3.2：`scrollIntoView`）
+      useEffect(() => {
+        if (focusSeq === null) return
+        const idx = msgs.findIndex((m) => Number(m?.seq) === focusSeq)
+        if (idx < 0) {
+          // 消息已不在（可能被清理）：至少把列表滚到底，让人看到最新状态
+          endRef.current?.scrollIntoView?.({ block: 'end' })
+          return
+        }
+        // 目标在「加载更早」之前 → 先把窗口开到能看见它，否则滚过去也是空
+        setShownCount((n) => Math.max(n, msgs.length - idx))
+        focusSeqRef.current?.scrollIntoView?.({ block: 'center' })
+      }, [msgs, focusSeq])
 
       const create = async () => {
         const n = roomName.trim()
@@ -3570,7 +3729,7 @@ window.__ModuleLoader__.load({
         h('div', { className: 'csb-list' }, rooms.map((r) =>
           h('div', {
             key: r.id, className: `csb-card csb-card-c${active === r.id ? ' csb-card-on' : ''}`,
-            onClick: () => setActive(r.id),
+            onClick: () => { setActive(r.id); setFocusSeq(null) },
           },
             h('div', { className: 'csb-card-main' },
               h('div', { className: 'csb-card-t' }, r.name),
@@ -3618,7 +3777,13 @@ window.__ModuleLoader__.load({
                     const body = m.body ?? m.text ?? ''
                     const long = body.length > 300
                     const isMe = m.from === 'user' || m.from === 'ui'
-                    return h('div', { key: m.id, className: `csb-msg-row${isMe ? ' csb-msg-row-me' : ''}` },
+                    // 来源跳转定位（契约 §3.2）：目标消息行高亮
+                    const focused = Number(m?.seq) === focusSeq
+                    return h('div', {
+                      key: m.id,
+                      className: `csb-msg-row${isMe ? ' csb-msg-row-me' : ''}${focused ? ' csb-msg-focus' : ''}`,
+                      ref: focused ? focusSeqRef : undefined,
+                    },
                       h('div', { className: 'csb-msg-h' },
                         h('span', { className: 'csb-msg-sender' }, botName(bots, m.from)),
                         h('span', null, `#${m.seq}`),
@@ -3911,6 +4076,7 @@ window.__ModuleLoader__.load({
           id: openId, bots, workflows: [],
           onClose: () => setOpenId(null),
           onChange: reload,
+          onGotoSource: onGoto,
         }) : null)
     }
 
@@ -5787,15 +5953,23 @@ window.__ModuleLoader__.load({
     function Workbench() {
       const [tab, setTab] = useState('tasks')
       const [view, setView] = useState(null)
+      // 跨页签定位参数（契约 §3.2 第 6 条）：`onGoto('rooms', { roomId, seq })`
+      // 由 goTab 的第二参数带入，RoomsTab 据此选中房间并高亮/滚动到那条消息。
+      const [locate, setLocate] = useState(null)
       const current = TABS.find((t) => t.id === tab) ?? TABS[0]
       const views = viewsOf(current)
       const activeView = views.find((v) => v.id === view) ?? views[0]
       const Comp = activeView.Comp
 
       // 切主页签时把子视图重置为该页签的第一个，避免"停在任务→便签，切到记忆还是便签"
-      const goTab = (id) => {
+      //
+      // 契约 §3.2：`onGoto(tab, opts?)` —— 第二参数是可选的「目标定位」。
+      // **向后兼容**：`onGoto('tasks')` 等既有单参数调用行为逐字不变
+      // （opts 为 undefined 时只切页签，不产生任何定位副作用）。
+      const goTab = (id, opts) => {
         setTab(id)
         setView(null)
+        setLocate(opts && typeof opts === 'object' && opts.roomId ? opts : null)
       }
 
       return h('div', { className: 'csb' },
@@ -5821,7 +5995,12 @@ window.__ModuleLoader__.load({
             : null),
         h('div', { className: 'csb-body' },
           h(Boundary, { tab: `${current.label}/${activeView.label}` },
-            h(Comp, { key: `${current.id}:${activeView.id}`, onGoto: goTab }))))
+            h(Comp, {
+              key: `${current.id}:${activeView.id}`,
+              onGoto: goTab,
+              // 只给房间页签传定位参数（其它页签不消费，传了也无害，但语义要清楚）
+              locate: current.id === 'rooms' ? locate : undefined,
+            }))))
     }
 
     function PanelIcon() {

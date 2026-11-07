@@ -531,6 +531,118 @@ function buildTaskAnchorText(task, notes = [], longrun = null) {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
+// 来源跳转（契约 bots04 §2.5，2026-11-07 补）
+//
+// `sourceSeq` 是任务的**幂等键**，顺带承载「这个任务是从哪儿来的」。
+// 契约冻结的三类前缀：
+//   `room:<roomId>:<seq>` → 房间消息出处（可跳回房间定位那条消息）
+//   `todo:<id>`           → 待办（room/jump 均为 null）
+//   `evolve:<id>:<seq>`   → 变更派生（room/jump 均为 null）
+// 判定顺序**按前缀逐字匹配**，不做模糊猜测：匹配不上就 `unparsed`，
+// 把原始标记如实返回，由前端提示「来源已失效」。
+// ══════════════════════════════════════════════════════════════════════════════
+
+/** 来源消息正文预览的截断长度（契约 §2.5：首行截 80 字，与 §3.4 建任务时取标题同口径）。 */
+const SOURCE_PREVIEW_MAX = 80
+
+/**
+ * 解析 `sourceSeq` 的前缀（契约 §2.5 的判定顺序）。
+ *
+ * 返回 `null` 表示「匹配不上任何已知前缀」（→ 后端判 `unparsed`）。
+ * 注意 `room:<roomId>:<seq>` 的三段切分是安全的：房间 id 恒为 `room-<uuid8>`
+ * （`src/room.js:1032`），**内部不含冒号**；测试里也固化这一点，防止将来
+ * 改 id 规则时被静默误判。
+ *
+ * @param {string} sourceSeq
+ * @returns {{ kind: 'room'|'todo'|'evolve', roomId?: string, seq?: number } | null}
+ */
+function parseSourceSeq(sourceSeq) {
+  if (typeof sourceSeq !== 'string' || sourceSeq === '') return null
+  const parts = sourceSeq.split(':')
+  if (parts.length === 3 && parts[0] === 'room' && parts[1] !== '' && parts[2] !== '') {
+    // 「seq 为正整数」的判定：字符串必须**全是数字**且数值 > 0。
+    // 用 `^\d+$` 而不是 `Number.isInteger(Number(...))`：后者会把 `"7.0"`、
+    // `"1e2"`、`"0x10"` 之类全收进来，语义含糊；前者只认十进制正整数字面量
+    // （`"07"` 仍是数值 7，允许），把格式残缺的形态留给 `unparsed` 如实上报。
+    if (/^\d+$/.test(parts[2]) && Number(parts[2]) > 0) {
+      return { kind: 'room', roomId: parts[1], seq: Number(parts[2]) }
+    }
+    return null
+  }
+  if (parts.length === 2 && parts[0] === 'todo' && parts[1] !== '') {
+    return { kind: 'todo' }
+  }
+  if (parts.length === 3 && parts[0] === 'evolve' && parts[1] !== '' && parts[2] !== '') {
+    return { kind: 'evolve' }
+  }
+  return null
+}
+
+/** 来源消息正文 → 预览（首行截 80 字；与 §3.4 建任务时取标题的口径一致）。 */
+function sourcePreview(message) {
+  const body = typeof message?.body === 'string' ? message.body : message?.text ?? ''
+  const firstLine = body.split('\n').map((line) => line.trim()).find((line) => line !== '') ?? ''
+  return firstLine.slice(0, SOURCE_PREVIEW_MAX)
+}
+
+/**
+ * 组装来源响应的公共部分（契约 §2.5 的字段形状）。
+ *
+ * 所有 kind 都带：`source` / `sourceSeq` / `kind` / `room` / `jump` / `reason` / `hint`。
+ * `room`/`jump` 只在 `kind: 'room'` 时有值；`reason` 只在 `kind: 'unparsed'` 时有值
+ * （契约原文：绝不猜测，reason 写明无法解析的来源标记）。
+ *
+ * @param {object} task 任务对象（只读）
+ * @param {object} [parsed] `parseSourceSeq` 的命中结果
+ */
+function buildSourcePayload(task, parsed) {
+  const sourceSeq = typeof task?.sourceSeq === 'string' ? task.sourceSeq : ''
+  const base = {
+    taskId: task?.id ?? null,
+    source: task?.source ?? null,
+    sourceSeq: sourceSeq === '' ? null : sourceSeq,
+    room: null,
+    jump: null,
+    reason: null,
+  }
+
+  if (!sourceSeq) {
+    return { ...base, kind: 'none', hint: '这个任务不是从房间消息创建的' }
+  }
+
+  if (!parsed) {
+    return {
+      ...base,
+      kind: 'unparsed',
+      reason: `无法解析来源标记 "${sourceSeq}"（不是 room:/todo:/evolve: 前缀）`,
+      hint: '来源已失效，无法自动跳转',
+    }
+  }
+
+  if (parsed.kind === 'room') {
+    return {
+      ...base,
+      kind: 'room',
+      room: {
+        roomId: parsed.roomId,
+        name: null,
+        seq: parsed.seq,
+        messageId: `m-${parsed.seq}`,
+        exists: null,
+        messageExists: null,
+        at: null,
+        preview: null,
+      },
+      jump: { roomId: parsed.roomId, seq: parsed.seq },
+      hint: `来源：房间消息 ${parsed.roomId} #${parsed.seq}`,
+    }
+  }
+
+  if (parsed.kind === 'todo') return { ...base, kind: 'todo', hint: '来源：待办' }
+  return { ...base, kind: 'evolve', hint: '来源：任务变更派生' }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
 // bots改造05：唤醒前自动复活会话（修「派活报 agent-not-live」）
 //
 // 设计依据：`design/CONTRACT-bots05.md` §2（**已冻结**）。
@@ -1427,6 +1539,67 @@ export function installApi(ctx, { warn } = {}) {
           return
         }
         sendJson(response, 200, { ok: true, taskId: task.id, notes: readTaskNotes(services, task.id) })
+        return
+      }
+
+      // ── 来源跳转（契约 bots04 §2.5）：任务 → 消息出处 ──────────────────
+      //
+      // 只读端点：**不写任何文件**（与 §2.1/§2.3 同口径）。
+      // 房间侧信息全部来自 room 服务：
+      //   - `get(roomId)` 拿名字、判断房间是否还在（已删 → exists:false）；
+      //   - `listMessages({roomId, sinceSeq: seq-1, limit:1, withBody:true})`
+      //     精确判断那条消息是否存在（seq 连续 → 取不到就是真的不存在）。
+      // 房间已删时 `listMessages` 会抛 `ROOM_NOT_FOUND`：那是**房间不存在**
+      // 的事实，不是「消息不存在」，两者必须区分开（契约要求不静默、不猜测）。
+      if (request.method === 'GET' && path === '/tasks/source') {
+        const id = qp(url, 'id')
+        if (!id) {
+          sendJson(response, 400, { ok: false, reason: 'id 必填' })
+          return
+        }
+        const task = await withService(services, 'board', (b) => b.get(id))
+        if (!task) {
+          sendJson(response, 404, { ok: false, reason: `任务 ${id} 不存在` })
+          return
+        }
+
+        const parsed = parseSourceSeq(task.sourceSeq)
+        let payload = buildSourcePayload(task, parsed)
+
+        if (parsed?.kind === 'room') {
+          const room = await withService(services, 'room', (r) => r.get(parsed.roomId))
+          const roomExists = room !== undefined && room !== null
+          let messageExists = null
+          let messageAt = null
+          let preview = null
+
+          if (roomExists) {
+            // seq 连续：sinceSeq = seq-1 + limit 1 只会命中 seq 那一条
+            const rows = await withService(services, 'room', (r) =>
+              r.listMessages({ roomId: parsed.roomId, sinceSeq: parsed.seq - 1, limit: 1, withBody: true }),
+            )
+            const hit = Array.isArray(rows) ? rows.find((m) => Number(m?.seq) === parsed.seq) : undefined
+            messageExists = hit !== undefined
+            messageAt = hit?.at ?? null
+            preview = hit ? sourcePreview(hit) : null
+          }
+
+          payload = {
+            ...payload,
+            room: {
+              ...payload.room,
+              name: room?.name ?? null,
+              exists: roomExists,
+              messageExists,
+              at: messageAt,
+              preview,
+            },
+            // 房间已删也如实返回 jump（数据不丢，是否可跳由前端决定 —— 契约 §2.5）
+            jump: payload.jump,
+          }
+        }
+
+        sendJson(response, 200, payload)
         return
       }
 
