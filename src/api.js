@@ -12,9 +12,9 @@
  *   - **前缀路由**：`/cs-bots/api`（与包名一致，避免和其他插件撞路径）。
  */
 
-import { readFileSync, readdirSync, statSync } from 'node:fs'
+import { readFileSync, readdirSync, statSync, existsSync } from 'node:fs'
 import { createHash } from 'node:crypto'
-import { join } from 'node:path'
+import { join, resolve, sep as pathSep } from 'node:path'
 import { registerRoute, listPresets, defaultPreset, getAgent, resumeSession } from './kernel.js'
 import { createLibrary } from './library.js'
 import { createDirBrowser } from './dirbrowse.js'
@@ -690,6 +690,201 @@ function reviveFields(revive) {
   return out
 }
 
+// ══════════════════════════════════════════════════════════════════════════════
+// 改造06 §2：团队 L2 记忆 / 交付物文件预览 / 任务结论摘要 / CS-BOTS 工作区
+//
+// 设计依据：`design/CONTRACT-bots06.md`（字段名/文案/状态码逐字照做）。
+// 这四块都是**纯新增**端点：不改任何既有路由的行为，只追加私有 helper + 分支。
+// ══════════════════════════════════════════════════════════════════════════════
+
+/** 团队记忆的标签（L2 层，一个团队一个 tag）。 */
+function teamMemoryTag(teamId) {
+  return `team:${teamId}`
+}
+
+/**
+ * 读某团队的 L2 记忆（按 `at` 升序）。
+ * 从 memory 服务读（`list({ layer:'L2' })` 后按 tags 精确匹配），不碰记忆文件。
+ */
+function readTeamMemories(services, teamId) {
+  if (!services?.memory) return []
+  const tag = teamMemoryTag(teamId)
+  let rows
+  try {
+    rows = services.memory.list({ layer: 'L2', includeArchived: true })
+  } catch {
+    return []
+  }
+  return rows
+    .filter((row) => Array.isArray(row?.tags) && row.tags.includes(tag))
+    .map((row) => ({
+      id: row.id,
+      layer: 'L2',
+      content: row.content,
+      by: row.createdBy ?? row.by,
+      at: row.createdAt ?? row.at,
+      tags: Array.isArray(row.tags) ? [...row.tags] : [],
+    }))
+    .sort((a, b) => (Number(a.at) || 0) - (Number(b.at) || 0))
+}
+
+/** 团队记忆渲染文本：`- [时间] content（by）`；空列表 → 空串。 */
+function buildTeamMemoryText(memories) {
+  return (Array.isArray(memories) ? memories : [])
+    .map((m) => `- [${formatAnchorTime(m.at)}] ${m.content}（${m.by ?? '?'}）`)
+    .join('\n')
+}
+
+/** 简单扩展名 → MIME 映射（只覆盖预览场景常见的文本类型）。 */
+const MIME_BY_EXT = {
+  '.txt': 'text/plain; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.jsonl': 'application/x-ndjson; charset=utf-8',
+  '.md': 'text/markdown; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.mjs': 'text/javascript; charset=utf-8',
+  '.cjs': 'text/javascript; charset=utf-8',
+  '.ts': 'text/typescript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.html': 'text/html; charset=utf-8',
+  '.csv': 'text/csv; charset=utf-8',
+  '.log': 'text/plain; charset=utf-8',
+  '.yml': 'text/yaml; charset=utf-8',
+  '.yaml': 'text/yaml; charset=utf-8',
+}
+
+/** 按扩展名取 MIME（未知 → `application/octet-stream`）。 */
+function mimeFor(path) {
+  const m = /\.[A-Za-z0-9]+$/.exec(String(path ?? ''))
+  const ext = m ? m[0].toLowerCase() : ''
+  return MIME_BY_EXT[ext] ?? 'application/octet-stream'
+}
+
+/**
+ * 粗判二进制：NUL 字节或过高的非文本比例即判为不可预览。
+ * 只用内置能力，不引第三方依赖。
+ */
+function isBinaryBuffer(buf) {
+  const n = buf?.length ?? 0
+  if (n === 0) return false
+  const sample = buf.subarray(0, Math.min(n, 8192))
+  let suspicious = 0
+  for (let i = 0; i < sample.length; i += 1) {
+    const b = sample[i]
+    if (b === 0) return true
+    // 控制字符（除常见的 \t \n \r）占比高 → 二进制
+    if (b < 0x09 || (b > 0x0d && b < 0x20)) suspicious += 1
+  }
+  return suspicious / sample.length > 0.02
+}
+
+/** 按码点截断（不切断代理对，避免产生半个字符）。 */
+function truncateCodepoints(text, max) {
+  const s = String(text ?? '')
+  const limit = Number.isFinite(max) && max >= 0 ? max : 200
+  const arr = Array.from(s)
+  return arr.length > limit ? arr.slice(0, limit).join('') : s
+}
+
+/** 任务状态 → 中文（与契约 §3 的 progressText 口径一致）。 */
+const STATUS_TEXT = {
+  pending: '待办',
+  in_progress: '进行中',
+  blocked: '阻塞',
+  completed: '已完成',
+}
+
+/** 唤醒记录里是否属于该任务（按投递文案的任务锚定串或 dedupKey 中的 taskId 判定）。 */
+function wakeBelongsToTask(row, taskId) {
+  const anchor = `任务 ${taskId}：`
+  const text = typeof row?.text === 'string' ? row.text : ''
+  if (text.includes(anchor)) return true
+  const key = typeof row?.dedupKey === 'string' ? row.dedupKey : ''
+  return key.includes(`:${taskId}:`) || key.endsWith(`:${taskId}`)
+}
+
+/** 唤醒投递文本的首段（首行非空内容），截 200 字；无文本 → null。 */
+function wakeExcerpt(text, max = 200) {
+  const s = typeof text === 'string' ? text : ''
+  for (const line of s.split('\n')) {
+    const t = line.trim()
+    if (t) return truncateCodepoints(t, max)
+  }
+  return null
+}
+
+/**
+ * 从最近一条 L4 笔记里提取「下一步」行。
+ * 关键词：下一步 / todo / 计划 / 接下来 / 待（大小写不敏感）。
+ * 无匹配 → null；命中行截 200 字。
+ */
+function extractNextStep(content, max = 200) {
+  const s = typeof content === 'string' ? content : ''
+  const lines = s.split('\n')
+  for (const line of lines) {
+    const t = line.trim()
+    if (!t) continue
+    if (/下一步|todo|计划|接下来|待/i.test(t)) return truncateCodepoints(t, max)
+  }
+  return null
+}
+
+/** 任务结论摘要的固定说明文案（契约逐字）。 */
+const SUMMARY_NOTE = '结论由唤醒记录与 L4 任务笔记提炼；队长可通过任务笔记补充下一步方向'
+
+/** 取某任务最近一条 L4 笔记（notesForTask 已是倒序）；无 → null。 */
+function latestTaskNote(services, taskId) {
+  const mem = services?.memory
+  if (!mem || typeof mem.notesForTask !== 'function') return null
+  try {
+    const rows = mem.notesForTask({ taskId })
+    return Array.isArray(rows) && rows.length ? rows[0] : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * 读某任务的唤醒记录。
+ * 优先用 dispatcher 暴露的读取能力（`list()` 读盘，进程重启后仍可审计）；
+ * 若该能力缺失或读盘失败，再退回直接读 `wakes.jsonl`（契约 §2.3 的兜底口径）。
+ */
+function readTaskWakes(services, taskId) {
+  const dispatcher = services?.dispatcher
+  if (dispatcher && typeof dispatcher.list === 'function') {
+    try {
+      const rows = dispatcher.list({})
+      if (Array.isArray(rows)) return rows.filter((row) => wakeBelongsToTask(row, taskId))
+    } catch {
+      /* 落到下面的读盘兜底 */
+    }
+  }
+  const dir = anchorStateDir(services)
+  if (!dir) return []
+  try {
+    const { rows } = readJsonl(statePath(dir, 'wakes.jsonl'))
+    return rows.filter((row) => wakeBelongsToTask(row, taskId))
+  } catch {
+    return []
+  }
+}
+
+/** 唤醒记录 → 摘要行 `{ at, result, excerpt }`。 */
+function toStepConclusion(row) {
+  const at = row?.updatedAt ?? row?.sentAt ?? row?.scheduledAt ?? null
+  return {
+    at: Number.isFinite(Number(at)) ? Number(at) : null,
+    result: row?.result ?? 'unknown',
+    excerpt: wakeExcerpt(row?.text),
+  }
+}
+
+/** 状态 → 中文（未知状态原样返回，不静默丢信息）。 */
+function statusText(status) {
+  return STATUS_TEXT[status] ?? String(status ?? '未知')
+}
+
+
 /**
  * 注册全部 API 路由。
  *
@@ -830,8 +1025,15 @@ export function installApi(ctx, { warn } = {}) {
 
       if (request.method === 'POST' && path === '/roster') {
         const body = (await readBody(request)) ?? {}
+        // cwd 兜底（契约 bots06 §2.4）：未提供/空白时用 settings.botWorkspaceRoot；
+        // 两者都空则保持原行为 —— roster 自己抛 400。
+        const bodyWithFallback = { ...body }
+        if (typeof body.cwd !== 'string' || body.cwd.trim() === '') {
+          const fallback = services.settings?.botWorkspaceRoot
+          if (typeof fallback === 'string' && fallback.trim() !== '') bodyWithFallback.cwd = fallback.trim()
+        }
         const bot = await withService(services, 'roster', (r) =>
-          r.create({ ...body, byId: body.byId ?? 'ui' }),
+          r.create({ ...bodyWithFallback, byId: body.byId ?? 'ui' }),
         )
         // 预制记忆同步（建 Bot 与改档案必须一致）
         const memory = seedBotMemory(services, bot, body.byId ?? 'ui')
@@ -1194,6 +1396,87 @@ export function installApi(ctx, { warn } = {}) {
         return
       }
 
+      // ── 单文件只读预览（契约 bots06 §2.2）────────────────────────────────
+      // 只允许在状态目录内读：先按段校验（防 `..` / 通配符），再 resolve 后
+      // 断言仍在 stateDir 内（防符号链接与绝对路径逃逸）。**绝不写任何文件**。
+      if (request.method === 'GET' && path === '/data/file') {
+        const rel = qp(url, 'path')
+        if (!rel) {
+          sendJson(response, 400, { ok: false, reason: 'path 必填' })
+          return
+        }
+        const raw = String(rel)
+        // 含 `..` 一律拒绝（段级判定对绝对路径不适用，但仍先挡穿越）。
+        if (raw.includes('..')) {
+          sendJson(response, 400, { ok: false, reason: '非法路径' })
+          return
+        }
+        // 相对路径：逐段必须都是安全片段（空段 = 绝对路径 / 重复斜杠，另作处理）。
+        const isAbs = raw.startsWith('/')
+        if (!isAbs) {
+          const segs = raw.split('/')
+          if (segs.some((s) => s === '' || s === '.' || s === '..' || !SAFE_SEGMENT.test(s))) {
+            sendJson(response, 400, { ok: false, reason: '非法路径' })
+            return
+          }
+        }
+        const stateDir = services.board?.paths?.stateDir ?? services.roster?.paths?.stateDir
+        if (!stateDir) {
+          sendJson(response, 503, { ok: false, reason: '状态目录不可用（域服务均未装配）' })
+          return
+        }
+        const root = resolve(stateDir)
+        const abs = resolve(root, raw)
+        // 必须在 stateDir 内（含 stateDir 本身，但那必然是目录 → 后面 404）。
+        if (abs !== root && !abs.startsWith(root + pathSep)) {
+          sendJson(response, 403, { ok: false, reason: '越权访问（路径超出状态目录）' })
+          return
+        }
+        let st
+        try {
+          st = statSync(abs)
+        } catch {
+          sendJson(response, 404, { ok: false, reason: '文件不存在' })
+          return
+        }
+        if (!st.isFile()) {
+          sendJson(response, 404, { ok: false, reason: '文件不存在' })
+          return
+        }
+        let buf
+        try {
+          buf = readFileSync(abs)
+        } catch {
+          sendJson(response, 404, { ok: false, reason: '文件不存在' })
+          return
+        }
+        if (isBinaryBuffer(buf)) {
+          sendJson(response, 415, { ok: false, reason: '不支持的文件类型（仅预览文本）' })
+          return
+        }
+        const content = buf.toString('utf8')
+        const bytes = buf.length
+        const PREVIEW_MAX = 100 * 1024
+        let shown = content
+        let truncated = false
+        if (bytes > PREVIEW_MAX) {
+          truncated = true
+          shown = buf.subarray(0, PREVIEW_MAX).toString('utf8')
+        }
+        sendJson(response, 200, {
+          ok: true,
+          path: raw,
+          content: shown,
+          bytes,
+          truncated,
+          ...(truncated
+            ? { shownBytes: Buffer.byteLength(shown, 'utf8'), totalBytes: bytes }
+            : {}),
+          mime: mimeFor(raw),
+        })
+        return
+      }
+
       if (request.method === 'GET' && path === '/data/rows') {
         const name = qp(url, 'name')
         if (!name) {
@@ -1539,6 +1822,37 @@ export function installApi(ctx, { warn } = {}) {
           return
         }
         sendJson(response, 200, { ok: true, taskId: task.id, notes: readTaskNotes(services, task.id) })
+        return
+      }
+
+      // ── 任务结论摘要（契约 bots06 §2.3）：只读 ────────────────────────────
+      if (request.method === 'GET' && path === '/tasks/summary') {
+        const id = qp(url, 'id')
+        if (!id) {
+          sendJson(response, 400, { ok: false, reason: 'id 必填' })
+          return
+        }
+        const task = await withService(services, 'board', (b) => b.get(id))
+        if (!task) {
+          sendJson(response, 404, { ok: false, reason: `任务 ${id} 不存在` })
+          return
+        }
+        const note = latestTaskNote(services, task.id)
+        const lastNoteContent = note ? String(note.content ?? '') : null
+        const stepConclusions = readTaskWakes(services, task.id).map(toStepConclusion)
+        sendJson(response, 200, {
+          ok: true,
+          taskId: task.id,
+          currentProgress: {
+            status: task.status,
+            progress: task.progress ?? 0,
+            progressText: `${task.progress ?? 0}% · ${statusText(task.status)}`,
+            lastNote: lastNoteContent,
+          },
+          stepConclusions,
+          nextStep: lastNoteContent ? extractNextStep(lastNoteContent) : null,
+          note: SUMMARY_NOTE,
+        })
         return
       }
 
@@ -2973,6 +3287,97 @@ export function installApi(ctx, { warn } = {}) {
         const out = await withService(services, 'teams', (t) =>
           t.close({ ...body, by: body.by ?? OWNER }))
         sendJson(response, 200, { ok: true, team: out })
+        return
+      }
+
+      // ── CS-BOTS 工作区（契约 bots06 §2.4）：只读 ───────────────────────────
+      if (request.method === 'GET' && path === '/workspace') {
+        const root = typeof services.settings?.botWorkspaceRoot === 'string'
+          ? services.settings.botWorkspaceRoot
+          : null
+        let exists = false
+        if (root) {
+          try {
+            exists = existsSync(root) && statSync(root).isDirectory()
+          } catch {
+            exists = false
+          }
+        }
+        const dshHome = resolve(process.env.DSH_HOME || `${process.env.HOME ?? '.'}/.dsh`)
+        sendJson(response, 200, {
+          ok: true,
+          root,
+          exists,
+          dshHome,
+          note: 'CS-BOTS 所有会话的默认工作区：shared/ 放交付物，scratch/ 放草稿，archive/ 放归档',
+        })
+        return
+      }
+
+      // ── 团队 L2 记忆（契约 bots06 §2.1）────────────────────────────────
+      // 读：只从 memory 服务取 L2 + tag=team:<id>，按 at 升序；不写任何文件。
+      if (request.method === 'GET' && path === '/teams/memory') {
+        const id = qp(url, 'id')
+        if (!id) {
+          sendJson(response, 400, { ok: false, reason: 'id 必填' })
+          return
+        }
+        const team = await withService(services, 'teams', (t) => t.get(id))
+        if (!team) {
+          sendJson(response, 404, { ok: false, reason: `团队 ${id} 不存在` })
+          return
+        }
+        const memories = readTeamMemories(services, id)
+        sendJson(response, 200, {
+          ok: true,
+          teamId: id,
+          memories,
+          text: buildTeamMemoryText(memories),
+          note: '团队记忆属 L2 团队层，全队可见；任务进度另记在 L4 任务笔记',
+        })
+        return
+      }
+
+      // 写：append-only；权限只认队长（leadId）或管理员（'user'）。
+      if (request.method === 'POST' && path === '/teams/memory') {
+        const body = (await readBody(request)) ?? {}
+        if (!body.id) {
+          sendJson(response, 400, { ok: false, reason: 'id 必填' })
+          return
+        }
+        const text = typeof body.text === 'string' ? body.text.trim() : ''
+        if (!text) {
+          sendJson(response, 400, { ok: false, reason: '团队记忆不能为空' })
+          return
+        }
+        if (text.length > ANCHOR_TEXT_MAX) {
+          sendJson(response, 400, { ok: false, reason: `团队记忆过长（最多 ${ANCHOR_TEXT_MAX} 字）` })
+          return
+        }
+        const team = await withService(services, 'teams', (t) => t.get(body.id))
+        if (!team) {
+          sendJson(response, 404, { ok: false, reason: `团队 ${body.id} 不存在` })
+          return
+        }
+        const by = typeof body.by === 'string' && body.by.trim() ? body.by.trim() : ''
+        if (by !== team.leadId && by !== OWNER) {
+          sendJson(response, 403, { ok: false, reason: '只有队长或管理员能写团队记忆' })
+          return
+        }
+        // 落盘走 memory 服务（L2 + tag=team:<id>）；memory 缺失时 503。
+        const entry = await withService(services, 'memory', (m) =>
+          m.add({ layer: 'L2', content: text, by, tags: [teamMemoryTag(body.id)] }))
+        const saved = Array.isArray(entry) ? entry[0] : entry
+        sendJson(response, 200, {
+          ok: true,
+          memory: {
+            id: saved?.id,
+            content: saved?.content ?? text,
+            by: saved?.createdBy ?? by,
+            at: saved?.createdAt ?? Date.now(),
+          },
+          note: '已写入团队记忆（L2，全队可见）',
+        })
         return
       }
 

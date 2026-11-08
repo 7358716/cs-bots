@@ -879,6 +879,138 @@ test('S10b RoomsTab：定位目标不在消息列表里（已被清理）→ 不
   }
 })
 
+// ── N1 任务结论区（需求4）：TaskAnchorPanel 渲染 /tasks/summary 摘要 ─────────
+
+test('N1 任务结论区：挂载即请求 GET /tasks/summary?id=，并渲染进度/结论/下一步', async () => {
+  const h = loadClientStateful()
+  h.setResponder((url) => {
+    if (url.includes('/tasks/summary')) {
+      return {
+        ok: true, taskId: 't-7',
+        currentProgress: { status: 'in_progress', progress: 40, progressText: '40% · 进行中', lastNote: '已完成接口定义' },
+        stepConclusions: [{ at: 1762300100000, result: 'sent', excerpt: '登录接口已拆分' }],
+        nextStep: '下一步：实现限流', note: '结论由唤醒记录与 L4 任务笔记提炼',
+      }
+    }
+    return EMPTY_RESPONSE()
+  })
+  try {
+    h.render({
+      Comp: h.exports.TaskAnchorPanel,
+      props: { taskId: 't-7', task: { id: 't-7', rev: 1, subject: '鉴权模块' }, onChange: () => {} },
+    })
+    await h.flush()
+    assert.match(
+      h.records.fetches.join('\n'),
+      /\/tasks\/summary\?id=t-7/,
+      '任务结论区必须请求 /tasks/summary（需求4 的入口）',
+    )
+    const text = allText(h.records.renders.at(-1))
+    assert.match(text, /任务结论/, '应有「任务结论」区块')
+    assert.match(text, /当前进度/, '应有「当前进度」')
+    assert.match(text, /40% · 进行中/, '应渲染进度文案')
+    assert.match(text, /每步结论/, '应有「每步结论」')
+    assert.match(text, /下一步方向/, '应有「下一步方向」')
+    assert.match(text, /下一步：实现限流/, '应渲染后端提取的下一步')
+  } finally {
+    h.restore()
+  }
+})
+
+test('N1b 任务结论区：无摘要数据时不渲染区块（空区块比没有更烦人）', async () => {
+  const h = loadClientStateful()
+  h.setResponder((url) => (url.includes('/tasks/summary') ? { ok: true } : EMPTY_RESPONSE()))
+  try {
+    const tree = h.render({
+      Comp: h.exports.TaskAnchorPanel,
+      props: { taskId: 't-8', task: { id: 't-8', rev: 1, subject: '空结论' }, onChange: () => {} },
+    })
+    await h.flush()
+    const text = allText(h.records.renders.at(-1))
+    assert.ok(!text.includes('任务结论'), '没有 summary 数据时不应渲染「任务结论」区块')
+  } finally {
+    h.restore()
+  }
+})
+
+// ── N2 交付物预览（需求3）：TaskDrawer 渲染预览按钮 + FilePreviewModal ──────
+
+test('N2 交付物预览：本地文件渲染「预览文件」按钮，点击打开 FilePreviewModal', async () => {
+  const h = loadClientStateful()
+  h.setResponder((url) => {
+    if (url.includes('/tasks/detail')) {
+      return { ok: true, task: { id: 't-9', rev: 1, subject: '改造', artifacts: ['shared/report.md'] }, history: [] }
+    }
+    if (url.includes('/data/file')) return { ok: true, path: 'shared/report.md', content: '# 交付报告', bytes: 12, truncated: false }
+    return EMPTY_RESPONSE()
+  })
+  try {
+    h.render({
+      Comp: h.exports.TaskDrawer,
+      props: {
+        id: 't-9', bots: [], workflows: [], onClose: () => {}, onChange: () => {},
+        task: { id: 't-9', rev: 1, subject: '改造', artifacts: ['shared/report.md'] },
+      },
+    })
+    await h.flush()
+    // TaskDrawer 的 artifacts 来自异步 /tasks/detail，所以必须断言 flush 后的树
+    const tree = h.records.renders.at(-1)
+    const btns = findButtonsByText(tree, '预览文件')
+    assert.ok(btns.length >= 1, '本地路径交付物应有「预览文件」按钮')
+    // 点击预览 → 弹窗组件出现并请求 /data/file
+    btns[0].props.onClick?.()
+    await h.flush()
+    assert.match(
+      h.records.fetches.join('\n'),
+      /\/data\/file\?path=shared%2Freport\.md/,
+      '预览必须请求 /data/file 拿只读内容',
+    )
+  } finally {
+    h.restore()
+  }
+})
+
+test('N2b 交付物预览：http(s) 链接渲染「打开链接」，不渲染预览按钮', async () => {
+  const h = loadClientStateful()
+  h.setResponder((url) => {
+    if (url.includes('/tasks/detail')) {
+      return { ok: true, task: { id: 't-10', rev: 1, subject: '有链接', artifacts: ['https://example.com/r'] }, history: [] }
+    }
+    return EMPTY_RESPONSE()
+  })
+  try {
+    h.render({
+      Comp: h.exports.TaskDrawer,
+      props: {
+        id: 't-10', bots: [], workflows: [], onClose: () => {}, onChange: () => {},
+        task: { id: 't-10', rev: 1, subject: '有链接', artifacts: ['https://example.com/r'] },
+      },
+    })
+    await h.flush()
+    const tree = h.records.renders.at(-1)
+    const open = findButtonsByText(tree, '打开链接')
+    assert.ok(open.length >= 1, 'URL 交付物应有「打开链接」按钮')
+    assert.equal(findButtonsByText(tree, '预览文件').length, 0, 'URL 不该有「预览文件」按钮')
+  } finally {
+    h.restore()
+  }
+})
+
+// ── N3 大团队 leadId 选择器（需求1）：源码级断言 ─────────────────────────────
+
+test('N3 团队页：大团队 leadId 是下拉选择器，从 roster 选，且无队长时禁用创建', () => {
+  // TeamsTab 未导出，按源码级断言（客户端静态装载测试同口径）
+  assert.match(SOURCE, /rosterQ = useApi\('\/roster'\)/, 'TeamsTab 必须从 /roster 读队长候选')
+  assert.match(SOURCE, /function TeamsTab\(\{ onGoto \}\)/, 'TeamsTab 应接收 onGoto')
+  assert.match(SOURCE, /bots\.map\(\(b\) => h\('option'/, '队长选择器应列出每个 Bot 作为选项')
+  assert.match(SOURCE, /\$\{b\.name\}（\$\{b\.sessionId\}）/, '选项文案应是「名字（sessionId）」')
+  assert.match(SOURCE, /leadMissing/, '应计算「大团队缺队长」状态')
+  assert.match(SOURCE, /disabled: leadMissing/, '缺队长时创建按钮必须禁用')
+  assert.match(SOURCE, /大团队必须指定负责人/, '缺队长时应给出可读提示')
+  assert.match(SOURCE, /onGoto\?\.\('bots'\)/, '应提供「新建 Bot」跳转')
+  assert.match(SOURCE, /botName\(rosterQ\.data\?\.bots \?\? \[\], t\.leadId\)/, '团队卡片应显示队长名字而非裸 ID')
+})
+
 // ── S11 新增代码没有引入相对 require（沿用 C11 的口径，覆盖本文件全部新增） ──
 
 test('S11 来源跳转新增代码没有引入相对 require', () => {

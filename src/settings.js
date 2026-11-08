@@ -12,6 +12,7 @@
  */
 
 import { readJson, writeJsonAtomic, ensureDir, statePath } from './store.js'
+import { resolve, sep, isAbsolute, join } from 'node:path'
 
 /** 设置项定义：默认值 + 校验。 */
 export const SETTING_SPECS = Object.freeze({
@@ -59,7 +60,35 @@ export const SETTING_SPECS = Object.freeze({
   wipLimitPerBot: { def: 2, min: 1, max: 10, label: '每 Bot WIP 上限' },
   /** Feature Flag 集合：plain object，每个 value 必须是 boolean。 */
   featureFlags: { def: {}, object: true, label: 'Feature Flags' },
+  // ── CS-BOTS 专用工作区（改造06）─────────────────────────────────────────
+  /**
+   * 新建 Bot 的默认目录：绝对路径，且必须落在 $DSH_HOME 之外（见 validateSetting）。
+   *
+   * 默认值**不写死**，而是「$DSH_HOME 的兄弟目录 `cs-bots`」——这是为了**通用性**：
+   * 插件可能装在任意机器、任意用户下（`/home/alice`、`/Users/bob`、容器里 `/root`），
+   * 写死 `/home/ubuntu/...` 会让其他用户的默认工作区指向一个不存在或无权的目录。
+   *
+   * 为什么是兄弟而不是 $DSH_HOME 内：`roster.js` 的 cwd 校验明确禁止 Bot 工作目录
+   * 落在 $DSH_HOME 子树内（那是凭据/会话/记忆库所在，Bot 写进去 = 宿主数据污染）。
+   * 兄弟目录既满足「放在主目录附近、一眼能找到」，又不越过那条安全线。
+   *
+   * 用户可在设置页改成任意绝对路径（只要不在 $DSH_HOME 内）。
+   */
+  botWorkspaceRoot: { def: defaultBotWorkspaceRoot(), path: true, label: 'CS-BOTS 专用工作区（新建 Bot 默认目录）' },
 })
+
+/**
+ * 计算默认的 CS-BOTS 工作区根目录：`<$DSH_HOME 的父目录>/cs-bots`。
+ *
+ * 之所以暴露成函数：测试与 `GET /workspace` 需要知道「默认应该是哪」，
+ * 避免在多处重复同一段 resolve 逻辑导致口径漂移。
+ *
+ * @returns {string} 归一化绝对路径
+ */
+export function defaultBotWorkspaceRoot() {
+  const home = resolve(process.env.DSH_HOME || `${process.env.HOME ?? '.'}/.dsh`)
+  return join(resolve(home, '..'), 'cs-bots')
+}
 
 /** 默认设置。 */
 export function defaultSettings() {
@@ -99,6 +128,23 @@ export function validateSetting(key, raw) {
       }
     }
     return { ok: true, value: { ...raw } }
+  }
+  if (spec.path) {
+    // 工作区目录：必须是绝对路径，且不得落在 $DSH_HOME 子树内
+    //（那是宿主数据/凭据目录，Bot 写进去就是数据污染 —— 与 roster.js 的 cwd 校验同口径）。
+    if (typeof raw !== 'string' || raw.trim() === '') {
+      return { ok: false, reason: '工作区必须是非空字符串' }
+    }
+    const rawTrim = raw.trim()
+    if (!isAbsolute(rawTrim)) {
+      return { ok: false, reason: '工作区必须是绝对路径' }
+    }
+    const dir = resolve(rawTrim)
+    const home = resolve(process.env.DSH_HOME || `${process.env.HOME ?? '.'}/.dsh`)
+    if (dir === home || dir.startsWith(home + sep)) {
+      return { ok: false, reason: '工作区必须是 $DSH_HOME 之外的绝对路径' }
+    }
+    return { ok: true, value: dir }
   }
   const n = Number(raw)
   if (!Number.isFinite(n)) return { ok: false, reason: `${key} 必须是数字` }

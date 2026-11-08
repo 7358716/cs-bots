@@ -542,6 +542,17 @@ window.__ModuleLoader__.load({
         children)
     }
 
+    /**
+     * 判断一个交付物是不是可点开的网址。
+     *
+     * 只认 `http(s)://`：`file://`、`javascript:` 一律不算 URL —— 前者在不同机器上无意义，
+     * 后者是 XSS 入口。其余一律当本地路径处理（走只读预览）。
+     */
+    function isUrl(value) {
+      if (typeof value !== 'string') return false
+      return /^https?:\/\//i.test(value.trim())
+    }
+
     /** 复制文本（带降级）。失败要**显式告知**，不许静默假装复制成功。 */
     function copyText(text) {
       try {
@@ -879,6 +890,23 @@ window.__ModuleLoader__.load({
       const [graph, setGraph] = useState(null)
       const [graphLoading, setGraphLoading] = useState(false)
       const [graphError, setGraphError] = useState(null)
+      // 交付物文件预览弹窗
+      const [previewPath, setPreviewPath] = useState(null)
+      // 预览内容在这里统一取（需求3）：弹窗只是壳，由父组件拉数据，
+      // 否则弹窗自己的 effect 只在真实渲染器挂载子组件时才跑，测试桩与边缘场景都取不到内容。
+      const [preview, setPreview] = useState(null)
+      useEffect(() => {
+        if (!previewPath) {
+          setPreview(null)
+          return undefined
+        }
+        let alive = true
+        setPreview({ loading: true })
+        call(`/data/file?path=${encodeURIComponent(previewPath)}`)
+          .then((d) => { if (alive) setPreview({ loading: false, data: d }) })
+          .catch((e) => { if (alive) setPreview({ loading: false, error: e.message }) })
+        return () => { alive = false }
+      }, [previewPath])
       const task = data?.task
       const history = data?.history ?? []
       // 「下一步」按钮的落点（spec §8）
@@ -1010,7 +1038,20 @@ window.__ModuleLoader__.load({
                 (task.artifacts ?? []).map((a, i) =>
                   h('div', { key: i, className: 'csb-card', style: { padding: '9px 12px' } },
                     h('div', { className: 'csb-card-main' },
-                      h('div', { className: 'csb-card-t csb-mono' }, typeof a === 'string' ? a : JSON.stringify(a)))))),
+                      h('div', { className: 'csb-card-t csb-mono' }, typeof a === 'string' ? a : JSON.stringify(a)),
+                      h('div', { className: 'csb-bar', style: { marginTop: 6, gap: 6 } },
+                        isUrl(a) ? h('button', {
+                          className: 'csb-btn csb-btn-s', style: { height: 24, fontSize: 11.5 },
+                          onClick: () => window.open(a, '_blank', 'noopener'),
+                        }, '打开链接') : null,
+                        !isUrl(a) ? h('button', {
+                          className: 'csb-btn csb-btn-s', style: { height: 24, fontSize: 11.5 },
+                          onClick: () => setPreviewPath(a),
+                        }, '预览文件') : null,
+                        h('button', {
+                          className: 'csb-btn csb-btn-s', style: { height: 24, fontSize: 11.5 },
+                          onClick: async () => { try { await copyText(a) } catch { /* ignore */ } },
+                        }, '复制')))))),
 
           h(Section, { title: '审计流', desc: `共 ${history.length} 条，最新在前` }),
           history.length === 0
@@ -1043,7 +1084,15 @@ window.__ModuleLoader__.load({
               h('label', null, '终止原因'),
               h('input', { className: 'csb-in', value: abortReason, onChange: (e) => setAbortReason(e.target.value) }),
               h('div', { className: 'csb-fld-h' }, '任务会变成「已终止」并保留在列表里，之后可以重新打开。')))
-          : null)
+          : null,
+        // 交付物文件预览弹窗（只读；路径由后端安全校验后返回）
+        previewPath ? h(FilePreviewModal, {
+          path: previewPath,
+          loading: !!preview?.loading,
+          error: preview?.error ?? null,
+          data: preview?.data ?? null,
+          onClose: () => setPreviewPath(null),
+        }) : null)
     }
 
     /**
@@ -1287,6 +1336,32 @@ window.__ModuleLoader__.load({
           : null)
     }
 
+    /**
+     * 交付物文件预览弹窗 —— 只读。
+     *
+     * 为什么需要它（用户原话：「点任务只能看到交付物地址，无法打开或预览，不人性化」）：
+     *   Bot 交付的 `artifacts` 是文件路径，人以前只能看到一串路径文本，
+     *   想知道「这到底交付了什么」只能自己去文件系统里翻。现在点一下就能看到内容。
+     *
+     * 安全：内容由后端 `/data/file` 返回（限 stateDir 内、防穿越、二进制拒绝、大文件截断），
+     *   前端只负责展示，**不拼接任何路径**（避免前端自己做穿越）。
+     */
+    function FilePreviewModal({ path, data, loading, error, onClose }) {
+      return h('div', { className: 'csb-modal-backdrop', onClick: onClose },
+        h('div', { className: 'csb-modal', onClick: (e) => e.stopPropagation() },
+          h('div', { className: 'csb-modal-h' },
+            h('span', { className: 'csb-mono' }, path),
+            h('button', { className: 'csb-btn csb-btn-s csb-btn-d', onClick: onClose }, '关闭')),
+          loading ? h('div', { className: 'csb-note' }, '加载中…') : null,
+          error ? h('div', { className: 'csb-err' }, `预览失败：${error}`) : null,
+          data?.content != null ? h('div', null,
+            h('div', { className: 'csb-note', style: { marginBottom: 8 } },
+              `${data.bytes ?? 0} 字节${data.truncated ? ' · 文件过大，已截断到前 100KB' : ''}`),
+            h('pre', { className: 'csb-pre', style: { maxHeight: 420, overflow: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-word' } }, data.content)) : null,
+          h('div', { className: 'csb-bar', style: { marginTop: 10 } },
+            h('button', { className: 'csb-btn csb-btn-s', onClick: () => copyText(data?.content ?? '') }, '复制内容'))))
+    }
+
     /** 平台伪身份：这些值永远不可能是 Bot 会话 id。 */
     const PLATFORM_OWNER_IDS = ['ui', 'user', 'anyone', 'system']
 
@@ -1346,6 +1421,8 @@ window.__ModuleLoader__.load({
       const [busy, setBusy] = useState(false)
       const [err, setErr] = useState(null)
       const [wake, setWake] = useState(null)
+      // 改造06：任务结论摘要（/tasks/summary）—— 让人不点进对话就能看到进度和下一步
+      const summaryQ = useApi(`/tasks/summary?id=${encodeURIComponent(taskId)}`, [taskId])
       const [revived, setRevived] = useState(false)
       const [saved, setSaved] = useState(null)
       const [copied, setCopied] = useState(null)
@@ -1625,7 +1702,57 @@ window.__ModuleLoader__.load({
                     kind === 'unparsed' && src?.reason
                       ? h('div', { className: 'csb-err', style: { marginTop: 6 } }, src.reason)
                       : null))
-              })())
+              })(),
+
+          // ── 任务结论区（需求4）──────────────────────────────────────────
+          //
+          // 为什么需要它（用户原话：「点任务只能看到交付物地址，无法打开或预览，
+          // 另外如果无法跳转对话的话，可以设置成在任务栏展示当前对话的结论，
+          // 我需要能看到每一步的进度和结论，决定下一步的方向」）：
+          //   人打开任务详情，想知道「现在做到哪了、每一步结论是什么、下一步该做什么」，
+          //   但以前只能看到 artifacts 路径 + 一堆状态数字，对话内容要进会话翻。
+          //   现在从后端 /tasks/summary 直接拿到进度、每步结论、下一步，
+          //   一眼就能决定「这活接下来往哪走」，不用跳转到对话。
+          //
+          // 没数据时不占位（和 source 的 none 同口径）——空区块比没有区块更烦人。
+          (() => {
+            const sum = summaryQ.data
+            // 没有有效摘要就不渲染区块：空区块比没有区块更烦人（且 `{ok:true}` 无数据时
+            // 会渲染出一个只有标题、三条全「—」的壳子，属于误导）。
+            if (!sum || (!sum.currentProgress && !sum.nextStep && !(Array.isArray(sum.stepConclusions) && sum.stepConclusions.length))) return null
+            const { currentProgress, stepConclusions, nextStep } = sum
+            const progressItems = []
+            if (currentProgress) {
+              progressItems.push(h('div', { key: 'p', className: 'csb-kv', style: { marginTop: 10 } },
+                h('span', { className: 'csb-k' }, '当前进度'),
+                h('span', { className: 'csb-v' }, currentProgress.progressText ?? '—')))
+              if (currentProgress.lastNote) {
+                progressItems.push(h('div', { key: 'n', className: 'csb-note', style: { marginTop: 6 } },
+                  `最近笔记：${currentProgress.lastNote}`))
+              }
+            }
+            if (stepConclusions && stepConclusions.length > 0) {
+              progressItems.push(
+                h('div', { key: 'c', style: { marginTop: 10 } },
+                  h('div', { className: 'csb-k' }, `每步结论（${stepConclusions.length} 条）`),
+                  stepConclusions.map((c, i) => h('div', { key: i, className: 'csb-list', style: { marginTop: 6 } },
+                    h('div', { className: 'csb-card', style: { padding: '6px 10px' } },
+                      h('div', { className: 'csb-card-m', style: { fontSize: 12.5 } },
+                        h('span', { className: 'csb-b' }, c.result ?? '—'),
+                        h('span', null, ` · ${fmt(c.at ?? '')}`)),
+                      c.excerpt
+                        ? h('div', { className: 'csb-set-d', style: { marginTop: 4, fontSize: 12.5 } },
+                            h(CollapsibleText, { text: c.excerpt, limit: 200 }))
+                        : null)))))
+            }
+            progressItems.push(h('div', { key: 'next', className: 'csb-kv', style: { marginTop: 10 } },
+              h('span', { className: 'csb-k' }, '下一步方向'),
+              h('span', { className: 'csb-v' }, nextStep ?? '（待队长补充）')))
+            return h(Section, {
+              title: '任务结论',
+              desc: '从唤醒记录与任务笔记提炼。队长可在任务笔记里补充「下一步」以指导后续方向。',
+            }, ...progressItems)
+          })())
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -4184,8 +4311,12 @@ window.__ModuleLoader__.load({
     }
 
     // ── 大/小团队（Teams）────────────────────────────────────────────────────
-    function TeamsTab() {
+    function TeamsTab({ onGoto }) {
       const listQ = useApi('/teams', [])
+      // leadId 选择器要列出「可当队长的人」——本平台的 Bot 都在 roster 里。
+      // 为什么必须从 roster 选而不是手填 id：leadId 是 sessionId（形如 bot-6b65…-…），
+      // 人手抄 36 位 UUID 必然出错，且错了要到「建团队」提交后才报错。
+      const rosterQ = useApi('/roster')
       const [name, setName] = useState('')
       const [type, setType] = useState('big')
       const [leadId, setLeadId] = useState('')
@@ -4195,9 +4326,12 @@ window.__ModuleLoader__.load({
       const act = (p, body) => call(p, { method: 'POST', body })
 
       const teams = listQ.data?.items ?? []
+      const bots = (rosterQ.data?.bots ?? []).filter((b) => b.state !== 'retired')
+      const leadMissing = type === 'big' && !leadId
 
       const createTeam = async () => {
         if (!name.trim()) { setMsg('团队名必填'); return }
+        if (leadMissing) { setMsg('大团队必须指定负责人（队长）'); return }
         try {
           const r = await act('/teams', { name: name.trim(), type, leadId: leadId || undefined, purpose, by: 'ui' })
           setMsg(`团队 ${r.team.id}（${r.team.name}）已创建`)
@@ -4231,14 +4365,24 @@ window.__ModuleLoader__.load({
           h('input', { className: 'csb-in', style: { width: 160 }, placeholder: '团队名', value: name, onChange: (e) => setName(e.target.value) }),
           h('select', { className: 'csb-sel', value: type, onChange: (e) => setType(e.target.value) },
             h('option', { value: 'big' }, '大团队'), h('option', { value: 'small' }, '小团队')),
-          h('input', { className: 'csb-in', style: { width: 120 }, placeholder: 'leadId（大团队必填）', value: leadId, onChange: (e) => setLeadId(e.target.value) }),
+          h('select', { className: 'csb-sel', style: { width: 200 }, value: leadId, onChange: (e) => setLeadId(e.target.value) },
+            h('option', { value: '' }, type === 'small' ? '（可选）无负责人' : '选择队长…'),
+            bots.map((b) => h('option', { key: b.sessionId, value: b.sessionId }, `${b.name}（${b.sessionId}）`))),
+          h('button', { className: 'csb-btn csb-btn-s', onClick: () => onGoto?.('bots') }, '新建 Bot'),
           h('input', { className: 'csb-in', style: { width: 160 }, placeholder: '用途说明', value: purpose, onChange: (e) => setPurpose(e.target.value) }),
-          h('button', { className: 'csb-btn csb-btn-s', onClick: createTeam }, '创建团队')),
+          h('button', {
+            className: 'csb-btn csb-btn-s', disabled: leadMissing || !name.trim(), onClick: createTeam,
+            title: leadMissing ? '大团队必须指定负责人（队长）' : '创建团队',
+          }, '创建团队')),
+        leadMissing
+          ? h('div', { className: 'csb-note', style: { marginTop: 6 } },
+              '大团队必须指定负责人（队长）：大团队是跨多个 lead 的稳定结构，没有队长就没人管编制与派活。')
+          : null,
         msg ? h('div', { className: 'csb-notice csb-notice-ok', style: { marginTop: 8 } }, h('span', { className: 'csb-notice-t' }, msg)) : null,
         listQ.error ? h('div', { className: 'csb-err' }, listQ.error) : null,
         listQ.loading ? h(Skeleton, { n: 3 }) : null,
         teams.length === 0 && !listQ.loading
-          ? h(Empty, { icon: '👥', title: '还没有团队', hint: '填好团队名和 leadId，点「创建团队」开始聚合管理。' })
+          ? h(Empty, { icon: '👥', title: '还没有团队', hint: '填好团队名，选一个队长，点「创建团队」开始聚合管理。' })
           : h('div', { className: 'csb-list' }, teams.map((t) =>
             h('div', { key: t.id, className: 'csb-card', style: { marginBottom: 8 } },
               h('div', { className: 'csb-card-main' },
@@ -4247,7 +4391,7 @@ window.__ModuleLoader__.load({
                   ` · ${t.name}`,
                   t.purpose ? ` · ${(t.purpose ?? '').slice(0, 30)}` : null),
                 h('div', { className: 'csb-card-m' },
-                  h('span', null, `lead ${t.leadId ?? '（无）'}`),
+                  h('span', null, `lead ${t.leadId ? botName(rosterQ.data?.bots ?? [], t.leadId) : '（无）'}`),
                   h('span', null, ` · 成员 ${(t.members ?? []).length} 人`),
                   (t.members ?? []).slice(0, 5).map((m) => h('span', { key: m, className: 'csb-chip' }, m)),
                   (t.members ?? []).length > 5 ? h('span', { className: 'csb-chip' }, `…+${(t.members ?? []).length - 5}`) : null)),
@@ -6082,6 +6226,8 @@ window.__ModuleLoader__.load({
     exports.PromptsTab = PromptsTab
     exports.DisciplineTab = DisciplineTab
     exports.BotProfileDrawer = BotProfileDrawer
+    // 改造06（CONTRACT-bots06 §3）：TaskDrawer 交付物预览（需求3）—— 前端测试与跨页签复用都需要它
+    exports.TaskDrawer = TaskDrawer
     exports.DirPicker = DirPicker
     exports.Modal = Modal
     exports.ConfirmModal = ConfirmModal
