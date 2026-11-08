@@ -310,6 +310,18 @@ window.__ModuleLoader__.load({
 .csb-kanban-t{font-size:12.5px;font-weight:500;line-height:1.4;margin-bottom:5px;word-break:break-word}
 .csb-kanban-m{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--dsw-alias-label-secondary);margin-top:5px}
 
+/* 改造07：执行阶段徽章（借鉴 Super-agent stage table）
+   person = 需人动手（强调色）/ working = 机器推进（常规色）/ idle = 空闲（弱化色） */
+.csb-stage{display:inline-flex;align-items:center;height:19px;padding:0 7px;border-radius:5px;
+  font-size:10.5px;font-weight:500;border:1px solid var(--dsw-alias-border-l2);
+  color:var(--dsw-alias-label-secondary);white-space:nowrap}
+.csb-stage-person{color:var(--dsw-alias-state-warn-primary);
+  border-color:color-mix(in srgb,var(--dsw-alias-state-warn-primary) 45%,transparent);
+  background:color-mix(in srgb,var(--dsw-alias-state-warn-primary) 9%,transparent);font-weight:600}
+.csb-stage-working{color:var(--dsw-alias-label-primary);
+  border-color:var(--dsw-alias-border-l2)}
+.csb-stage-idle{color:var(--dsw-alias-label-tertiary);opacity:.8}
+
 /* @提及高亮 */
 .csb-at{color:var(--dsw-alias-label-primary);font-weight:600}
 
@@ -658,6 +670,12 @@ window.__ModuleLoader__.load({
     }
     const Badge = ({ status, children }) => h('span', { className: ST_CLS[status] ?? 'csb-b' }, children ?? ST_TEXT[status] ?? status)
     const Dot = ({ status }) => h('span', { className: DOT_CLS[status] ?? 'csb-dot' })
+    /** 改造07：阶段徽章类名（person 强调 / working 常规 / idle 弱化） */
+    const stageBadgeCls = (group) => ({
+      person: 'csb-stage csb-stage-person',
+      working: 'csb-stage csb-stage-working',
+      idle: 'csb-stage csb-stage-idle',
+    }[group] ?? 'csb-stage')
     const Switch = ({ checked, onChange }) =>
       h('button', {
         type: 'button', role: 'switch', 'aria-checked': checked === true,
@@ -966,6 +984,15 @@ window.__ModuleLoader__.load({
             h('span', { className: 'csb-k' }, '优先级'), h('span', { className: 'csb-v' }, task.priority !== undefined ? `${task.priority}（${task.priority >= 8 ? '紧急' : '一般'}）` : '未设'),
             h('span', { className: 'csb-k' }, '截止'), h('span', { className: 'csb-v' }, task.dueAt ? fmt(task.dueAt) : '未设'),
             h('span', { className: 'csb-k' }, '状态'), h('span', { className: 'csb-v' }, h(Badge, { status: task.status })),
+            // 改造07：执行阶段（借鉴 Super-agent stage table）—— 人一眼看出该谁动
+            data?.stageInfo
+              ? [
+                  h('span', { key: 'se', className: 'csb-k' }, '执行阶段'),
+                  h('span', { key: 'sv', className: 'csb-v' },
+                    h('span', { className: stageBadgeCls(data.stageInfo.group), title: data.stageInfo.reason }, data.stageInfo.label),
+                    data.stageInfo.needsPerson ? h('span', { className: 'csb-b csb-b-run', style: { marginLeft: 8 } }, '需要你处理') : null),
+                ]
+              : null,
             h('span', { className: 'csb-k' }, '任务编号'), h('span', { className: 'csb-v csb-mono' }, task.id),
             h('span', { className: 'csb-k' }, '谁在做'), h('span', { className: 'csb-v' }, task.ownerId ? botName(bots, task.ownerId) : '还没人领'),
             h('span', { className: 'csb-k' }, '进度'), h('span', { className: 'csb-v csb-kv-progress' },
@@ -2537,8 +2564,15 @@ window.__ModuleLoader__.load({
                     colTasks.length === 0
                       ? h('div', { className: 'csb-set-d', style: { padding: '8px 4px', fontSize: 11.5 } }, '空')
                       : colTasks.map((t) => {
+                          // 改造07：执行阶段徽章（借鉴 Super-agent stage table）
+                          const si = t.stageInfo
                           return h('div', { key: t.id, className: 'csb-kanban-card', onClick: () => setOpenId(t.id) },
                             h('div', { className: 'csb-kanban-t' }, t.subject),
+                            si ? h('div', { style: { marginTop: 4, display: 'flex', gap: 6, flexWrap: 'wrap' } },
+                              h('span', { className: stageBadgeCls(si.group) }, si.label),
+                              si.needsPerson
+                                ? h('span', { className: 'csb-b csb-b-run', title: si.reason }, '需你处理')
+                                : null) : null,
                             h('div', { className: 'csb-progress' },
                               h('div', { className: 'csb-progress-fill', style: { width: `${Math.max(0, Math.min(100, t.progress ?? 0))}%` } })),
                             h('div', { className: 'csb-kanban-m' },
@@ -6061,20 +6095,31 @@ window.__ModuleLoader__.load({
      *
      * `subs` 为空 = 单页（不渲染子页签行）；长度 > 1 才显示子页签。
      */
+    // ══════════════════════════════════════════════════════════════════════════════
+    // 改造07：分层架构——6个上层页签 + 穿透入口
+    //
+    // 上层（人类协作层）：工作台/团队/记忆/技能库/数据/设置
+    // 下层（AI基础设施层）：注册表/唤醒桥/存储/路由/验证/建议（穿透访问）
+    // ══════════════════════════════════════════════════════════════════════════════
     const TABS = [
       {
-        id: 'tasks', label: '任务',
+        id: 'workspace', label: '工作台',
         subs: [
           { id: 'board', label: '协作看板', Comp: TasksTab },
           { id: 'cycles', label: '复盘周期', Comp: CyclesTab },
           { id: 'todo', label: '我的待办', Comp: TodoTab },
           { id: 'scratch', label: '便签', Comp: ScratchTab },
+          { id: 'artifacts', label: '成果', Comp: ArtifactsTab },
         ],
       },
-      { id: 'bots', label: 'Bot', Comp: BotsTab },
-      { id: 'rooms', label: '房间', Comp: RoomsTab },
-      { id: 'teams', label: '团队', Comp: TeamsTab },
-      { id: 'artifacts', label: '成果', Comp: ArtifactsTab },
+      {
+        id: 'team', label: '团队',
+        subs: [
+          { id: 'bots', label: 'Bot 档案', Comp: BotsTab },
+          { id: 'teams', label: '团队', Comp: TeamsTab },
+          { id: 'rooms', label: '房间', Comp: RoomsTab },
+        ],
+      },
       {
         id: 'memory', label: '记忆',
         subs: [
@@ -6083,9 +6128,20 @@ window.__ModuleLoader__.load({
           { id: 'prompts', label: '提示词', Comp: PromptsTab },
         ],
       },
-      { id: 'skills', label: '技能库', Comp: SkillsTab },
-      { id: 'workflows', label: '工作流库', Comp: WorkflowsTab },
-      { id: 'data', label: '数据', subs: [ { id: 'files', label: '文件浏览', Comp: DataTab }, { id: 'metrics', label: 'PDCA 测量', Comp: MetricsTab } ] },
+      {
+        id: 'skills', label: '技能库',
+        subs: [
+          { id: 'skills', label: '技能', Comp: SkillsTab },
+          { id: 'workflows', label: '工作流', Comp: WorkflowsTab },
+        ],
+      },
+      {
+        id: 'data', label: '数据',
+        subs: [
+          { id: 'files', label: '文件浏览', Comp: DataTab },
+          { id: 'metrics', label: 'PDCA 测量', Comp: MetricsTab },
+        ],
+      },
       { id: 'settings', label: '设置', Comp: SettingsBody },
     ]
 
@@ -6094,33 +6150,180 @@ window.__ModuleLoader__.load({
       return tab.subs && tab.subs.length ? tab.subs : [{ id: tab.id, label: tab.label, Comp: tab.Comp }]
     }
 
+    // ══════════════════════════════════════════════════════════════════════════════
+    // 改造07：穿透面板（下层 AI 基础设施查看/操作）
+    // ══════════════════════════════════════════════════════════════════════════════
+
+    /** 穿透面板区块列表（从 API 拉取） */
+    function useDeepDive() {
+      const [blocks, setBlocks] = useState([])
+      const [loading, setLoading] = useState(true)
+      const [error, setError] = useState(null)
+      const reload = useCallback(() => {
+        setLoading(true)
+        call('/deepdive/blocks')
+          .then((d) => { setBlocks(d.blocks ?? []); setError(null) })
+          .catch((e) => setError(e.message))
+          .finally(() => setLoading(false))
+      }, [])
+      useEffect(() => { reload() }, [reload])
+      return { blocks, loading, error, reload }
+    }
+
+    /**
+     * 穿透面板——右侧抽屉，显示 6 个下层区块。
+     *
+     * 每个区块：概览统计 + 操作按钮 + 展开详情。
+     * 所有操作走 API，失败显示人话 + 下一步。
+     */
+    function DeepDivePanel({ onClose }) {
+      const { blocks, loading, error, reload } = useDeepDive()
+      const [expanded, setExpanded] = useState(null)
+      const [detail, setDetail] = useState(null)
+      const [detailLoading, setDetailLoading] = useState(false)
+      const [detailError, setDetailError] = useState(null)
+      const [opBusy, setOpBusy] = useState(null)
+      const [opMsg, setOpMsg] = useState(null)
+
+      const openBlock = async (id) => {
+        if (expanded === id) {
+          setExpanded(null)
+          setDetail(null)
+          return
+        }
+        setExpanded(id)
+        setDetail(null)
+        setDetailError(null)
+        setDetailLoading(true)
+        try {
+          const d = await call(`/deepdive/block/${encodeURIComponent(id)}`)
+          setDetail(d)
+        } catch (e) {
+          setDetailError(e.message)
+        } finally {
+          setDetailLoading(false)
+        }
+      }
+
+      const doOp = async (blockId, op, body) => {
+        setOpBusy(`${blockId}:${op}`)
+        setOpMsg(null)
+        try {
+          const d = await call(`/deepdive/op`, { method: 'POST', body: { block: blockId, op, ...body } })
+          setOpMsg({ ok: true, text: d.text ?? '操作成功' })
+          reload()
+          if (op === 'replay') openBlock(blockId)
+        } catch (e) {
+          setOpMsg({ ok: false, text: e.message })
+        } finally {
+          setOpBusy(null)
+        }
+      }
+
+      // 数据条目渲染（避免深嵌套三元）
+      const renderEntry = ([k, v]) =>
+        h('div', { key: k, style: { marginBottom: 8 } },
+          h('div', { className: 'csb-field-l' }, k),
+          h('pre', { className: 'csb-pre' },
+            typeof v === 'string' ? v : JSON.stringify(v, null, 2)))
+
+      // 操作按钮渲染
+      const renderOps = (list) =>
+        list && list.length > 0
+          ? h('div', { style: { marginTop: 12 } },
+              h('div', { className: 'csb-field-l' }, '操作'),
+              list.map((op) => {
+                const busy = opBusy === `${expanded}:${op.id}`
+                return h('button', {
+                  key: op.id,
+                  className: 'csb-btn csb-btn-s',
+                  disabled: busy,
+                  onClick: () => doOp(expanded, op.id, op.body ?? {}),
+                }, busy ? '…' : (op.label ?? op.id))
+              }))
+          : null
+
+      // 展开详情区块
+      const renderDetail = () => {
+        if (detailLoading) return h(Skeleton, { n: 3 })
+        if (detailError) return h('div', { className: 'csb-err' }, detailError)
+        if (!detail) return null
+        return h('div', null,
+          Object.entries(detail.data ?? {}).map(renderEntry),
+          renderOps(detail.operations))
+      }
+
+      return h(Drawer, {
+        title: '底层工具',
+        onClose,
+        footer: [
+          h('div', { key: 's', className: 'csb-spacer' }),
+          h('button', { key: 'c', className: 'csb-btn', onClick: onClose }, '关闭'),
+        ],
+      },
+        loading ? h(Skeleton, { n: 4 }) : null,
+        error ? h('div', { className: 'csb-err' }, `穿透面板加载失败：${error}`) : null,
+        blocks.length === 0 && !loading
+          ? h(Empty, { icon: '🔧', title: '没有底层区块', hint: '可能后端尚未暴露穿透接口' })
+          : null,
+        blocks.map((b) => {
+          const stats = h('div', { className: 'csb-card-m' },
+            Object.entries(b.stats ?? {}).map(([k, v]) =>
+              h('span', { key: k, className: 'csb-b' }, `${k}: ${v}`)))
+          const head = h('div', { className: 'csb-card', style: { cursor: 'pointer' }, onClick: () => openBlock(b.id) },
+            h('div', { className: 'csb-card-main' },
+              h('div', { className: 'csb-card-t2' }, h('strong', null, b.label ?? b.id)),
+              b.description ? h('div', { className: 'csb-card-m' }, b.description) : null,
+              stats),
+            h('span', { className: 'csb-btn-x' }, expanded === b.id ? '▾' : '▸'))
+          const body = expanded === b.id
+            ? h('div', { style: { marginTop: 8, padding: '0 4px' } },
+                renderDetail(),
+                opMsg ? h('div', { className: opMsg.ok ? 'csb-ok' : 'csb-err', style: { marginTop: 8 } }, opMsg.text) : null)
+            : null
+          return h('div', { key: b.id, style: { marginBottom: 14 } }, head, body)
+        }))
+    }
+
     function Workbench() {
-      const [tab, setTab] = useState('tasks')
+      const [tab, setTab] = useState('workspace')
       const [view, setView] = useState(null)
-      // 跨页签定位参数（契约 §3.2 第 6 条）：`onGoto('rooms', { roomId, seq })`
+      // 跨页签定位参数（契约 §3.2 第 6 条）：`onGoto('team', { roomId, seq })`
       // 由 goTab 的第二参数带入，RoomsTab 据此选中房间并高亮/滚动到那条消息。
       const [locate, setLocate] = useState(null)
+      // 改造07：穿透面板开关
+      const [deepOpen, setDeepOpen] = useState(false)
       const current = TABS.find((t) => t.id === tab) ?? TABS[0]
       const views = viewsOf(current)
       const activeView = views.find((v) => v.id === view) ?? views[0]
       const Comp = activeView.Comp
 
-      // 切主页签时把子视图重置为该页签的第一个，避免"停在任务→便签，切到记忆还是便签"
-      //
-      // 契约 §3.2：`onGoto(tab, opts?)` —— 第二参数是可选的「目标定位」。
-      // **向后兼容**：`onGoto('tasks')` 等既有单参数调用行为逐字不变
-      // （opts 为 undefined 时只切页签，不产生任何定位副作用）。
+      // 切主页签时把子视图重置为该页签的第一个
       const goTab = (id, opts) => {
         setTab(id)
         setView(null)
         setLocate(opts && typeof opts === 'object' && opts.roomId ? opts : null)
       }
 
+      // 兼容旧 goTab 调用：'tasks' → 'workspace', 'bots' → 'team'
+      const safeGoTab = (id, opts) => {
+        const mapped = ({
+          tasks: 'workspace', bots: 'team', rooms: 'team', teams: 'team', artifacts: 'workspace',
+        })[id] ?? id
+        goTab(mapped, opts)
+      }
+
       return h('div', { className: 'csb' },
         h('div', { className: 'csb-head' },
           h('div', { className: 'csb-hrow' },
             h('h2', null, '协作平台'),
-            h('span', { className: 'csb-hint' }, '任务 · Bot · 房间 · 成果 · 记忆 · 技能 · 工作流 · 数据 · 设置')),
+            h('span', { className: 'csb-hint' }, '任务 · 团队 · 记忆 · 技能 · 数据 · 设置'),
+            // 改造07：穿透入口（顶部右侧齿轮）
+            h('button', {
+              className: 'csb-btn csb-btn-s',
+              title: '底层工具（AI 基础设施）',
+              onClick: () => setDeepOpen(true),
+            }, '⚙ 穿透')),
           h('div', { className: 'csb-tabs', role: 'tablist' },
             TABS.map((t) =>
               h('button', {
@@ -6141,10 +6344,11 @@ window.__ModuleLoader__.load({
           h(Boundary, { tab: `${current.label}/${activeView.label}` },
             h(Comp, {
               key: `${current.id}:${activeView.id}`,
-              onGoto: goTab,
+              onGoto: safeGoTab,
               // 只给房间页签传定位参数（其它页签不消费，传了也无害，但语义要清楚）
-              locate: current.id === 'rooms' ? locate : undefined,
-            }))))
+              locate: current.id === 'team' && activeView.id === 'rooms' ? locate : undefined,
+            })),
+          deepOpen ? h(DeepDivePanel, { onClose: () => setDeepOpen(false) }) : null))
     }
 
     function PanelIcon() {
@@ -6254,6 +6458,9 @@ window.__ModuleLoader__.load({
     exports.evolveActionLabel = evolveActionLabel
     exports.evolveChangeText = evolveChangeText
     exports.reassignWakeText = reassignWakeText
+    // 改造07：分层架构——穿透面板 + 6 上层页签
+    exports.DeepDivePanel = DeepDivePanel
+    exports.TABS = TABS
     exports.PANEL_ID = PANEL_ID
     exports.API = API
 

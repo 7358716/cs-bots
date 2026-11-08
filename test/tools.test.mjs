@@ -75,8 +75,9 @@ test('工具全部注册成功，且数量与 TOOL_NAMES 一致', () => {
       TOOL_NAMES.length,
       `应注册 ${TOOL_NAMES.length} 个，实际 ${h.registered.length}；warnings=${JSON.stringify(h.warnings)}`,
     )
-    // PDCA 建设：cycle 4 + metrics 2 + verify 1 + teams 3 = 10 个（28 → 38）
-    assert.equal(TOOL_NAMES.length, 38, `工具总数应为 38，实际 ${TOOL_NAMES.length}`)
+    // PDCA 建设：cycle 4 + metrics 2 + verify 1 + teams 3 = 10 个（28 → 38）；
+// 改造07：subscription 3 个（task_subscribe / unsubscribe / subscriptions）→ 41
+    assert.equal(TOOL_NAMES.length, 41, `工具总数应为 41，实际 ${TOOL_NAMES.length}`)
   } finally {
     h.cleanup()
   }

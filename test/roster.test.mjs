@@ -607,3 +607,75 @@ test('2026-11-04 P0-1：getProfile 对不存在的 Bot 抛 ROSTER_BOT_NOT_FOUND'
     (e) => e instanceof RosterError && e.code === 'ROSTER_BOT_NOT_FOUND',
   )
 })
+
+// ── 改造07：prepare command（借鉴 Super-agent 的 prepare command）─────────────
+
+test('改造07 prepare：create 时带 prepareCommand 会落盘并记时间与操作者', async (t) => {
+  const h = setup(t)
+  const bot = await seed(h.roster, h.ws, { prepareCommand: 'git worktree add ../x main' })
+  assert.equal(bot.prepareCommand, 'git worktree add ../x main')
+  assert.equal(typeof bot.prepareCommandSetAt, 'number')
+  assert.equal(bot.prepareCommandSetBy, 'lead')
+})
+
+test('改造07 prepare：不带 prepareCommand 时无该字段（可选，缺省不写）', async (t) => {
+  const h = setup(t)
+  const bot = await seed(h.roster, h.ws)
+  assert.equal(bot.prepareCommand, undefined)
+  assert.equal(bot.prepareCommandSetAt, undefined)
+})
+
+test('改造07 prepare：setPrepareCommand 设置新值并递增 rev', async (t) => {
+  const h = setup(t)
+  const bot = await seed(h.roster, h.ws)
+  const updated = h.roster.setPrepareCommand({ id: bot.id, expectedRev: bot.rev, prepareCommand: 'pnpm install', byId: 'lead' })
+  assert.equal(updated.prepareCommand, 'pnpm install')
+  assert.equal(updated.rev, bot.rev + 1)
+  assert.equal(updated.prepareCommandSetBy, 'lead')
+})
+
+test('改造07 prepare：setPrepareCommand 传空串 = 清除（三字段一起清）', async (t) => {
+  const h = setup(t)
+  const bot = await seed(h.roster, h.ws, { prepareCommand: 'echo hi' })
+  const cleared = h.roster.setPrepareCommand({ id: bot.id, expectedRev: bot.rev, prepareCommand: '', byId: 'lead' })
+  assert.equal(cleared.prepareCommand, undefined)
+  assert.equal(cleared.prepareCommandSetAt, undefined)
+  assert.equal(cleared.prepareCommandSetBy, undefined)
+})
+
+test('改造07 prepare：对不存在的 Bot 抛 ROSTER_BOT_NOT_FOUND', (t) => {
+  const h = setup(t)
+  assert.throws(
+    () => h.roster.setPrepareCommand({ id: 'bot-nope', prepareCommand: 'echo hi', byId: 'lead' }),
+    (e) => e instanceof RosterError && e.code === 'ROSTER_NOT_FOUND',
+  )
+})
+
+test('改造07 prepare：CAS 冲突抛错（绝不静默覆盖）', async (t) => {
+  const h = setup(t)
+  const bot = await seed(h.roster, h.ws)
+  assert.throws(
+    () => h.roster.setPrepareCommand({ id: bot.id, expectedRev: bot.rev, prepareCommand: 'x', expectedRev: 999, byId: 'lead' }),
+    (e) => e instanceof RosterError && e.code === 'ROSTER_REV_CONFLICT',
+  )
+})
+
+test('改造07 prepare：已退役的 Bot 不可再设准备命令', async (t) => {
+  const h = setup(t)
+  const bot = await seed(h.roster, h.ws)
+  h.roster.retire({ id: bot.id, reason: 'bye', byId: 'lead' })
+  const latest = h.roster.get(bot.id)
+  assert.throws(
+    () => h.roster.setPrepareCommand({ id: bot.id, expectedRev: latest.rev, prepareCommand: 'x', byId: 'lead' }),
+    (e) => e instanceof RosterError && e.code === 'ROSTER_RETIRED',
+  )
+})
+
+test('改造07 prepare：prepare_command_set 动作写进事件流（审计可见）', async (t) => {
+  const h = setup(t)
+  const bot = await seed(h.roster, h.ws, { prepareCommand: 'echo hi' })
+  h.roster.setPrepareCommand({ id: bot.id, expectedRev: bot.rev, prepareCommand: 'echo bye', byId: 'lead' })
+  const prep = events(h.stateDir).filter((r) => r.action === 'prepare_command_set')
+  assert.equal(prep.length, 1)
+  assert.equal(prep[0].byId, 'lead')
+})

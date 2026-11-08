@@ -21,6 +21,9 @@ import { createDirBrowser } from './dirbrowse.js'
 import { getServices } from './registry.js'
 import { createFence } from './fence.js'
 import { appendJsonl, readJsonl, statePath } from './store.js'
+import { deriveStage, attachStages, stageSummary } from './stage.js'
+import { CMD_WHITELIST } from './verify.js'
+import { execFile } from 'node:child_process'
 
 /** 请求体上限（防大包打爆内存）。 */
 const MAX_BODY = 2 * 1024 * 1024
@@ -680,6 +683,69 @@ async function ensureLive(ctx, sessionId) {
 }
 
 /**
+ * 执行 Bot 的开工准备命令（改造07 · 借鉴 Super-agent 的 prepare command）。
+ *
+ * 安全边界（与 verify 的 kind:'command' 同口径）：
+ *   - 第一段必须在 CMD_WHITELIST 内（拒绝任意二进制执行）
+ *   - 用 execFile 传参数组，**绝不经过 shell** → 无注入面
+ *   - 有硬超时（默认 10 分钟，与 Super-agent 的 prepare 一致）
+ *   - cwd 固定为 Bot 的工作目录（Bot 的写入边界）
+ *
+ * @param {{ prepareCommand?: string, cwd?: string }} bot
+ * @param {{ timeoutMs?: number }} [opts]
+ * @returns {Promise<object>}
+ */
+async function runPrepareCommand(bot, opts = {}) {
+  const raw = typeof bot?.prepareCommand === 'string' ? bot.prepareCommand.trim() : ''
+  if (!raw) return { ok: true, skipped: true }
+  const cwd = typeof bot?.cwd === 'string' && bot.cwd ? bot.cwd : undefined
+  if (!cwd) return { ok: false, command: raw, error: 'bot-cwd-missing' }
+
+  // 只按空白切分，不做 shell 展开（不做引号/管道/重定向——那都是注入面）。
+  const argv = raw.split(/\s+/).filter(Boolean)
+  if (argv.length === 0) return { ok: true, skipped: true }
+  if (!CMD_WHITELIST.includes(argv[0])) {
+    return {
+      ok: false,
+      command: raw,
+      cwd,
+      error: `prepare-command-not-allowed:${argv[0]}`,
+      stderr: `允许的命令：${CMD_WHITELIST.join(' | ')}`,
+    }
+  }
+
+  const timeoutMs = Number.isFinite(opts.timeoutMs) ? opts.timeoutMs : 10 * 60 * 1000
+  return new Promise((resolvePromise) => {
+    let done = false
+    const finish = (out) => {
+      if (done) return
+      done = true
+      resolvePromise({ command: raw, cwd, ...out })
+    }
+    try {
+      execFile(argv[0], argv.slice(1), { cwd, timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024 }, (error, stdout, stderr) => {
+        const so = String(stdout ?? '')
+        const se = String(stderr ?? '')
+        if (error) {
+          const timedOut = error.killed === true || error.signal === 'SIGTERM'
+          finish({
+            ok: false,
+            exitCode: typeof error.code === 'number' ? error.code : -1,
+            stdout: so,
+            stderr: se,
+            error: timedOut ? 'timeout' : String(error?.message ?? error),
+          })
+          return
+        }
+        finish({ ok: true, exitCode: 0, stdout: so, stderr: se })
+      })
+    } catch (error) {
+      finish({ ok: false, error: String(error?.message ?? error) })
+    }
+  })
+}
+
+/**
  * 把 `ensureLive` 结果压成响应新增字段：`revived:boolean` + 失败时 `reviveReason`。
  * 原本就 live 时只多一个 `revived:false`（契约允许的新增字段），不产生任何副作用。
  * @param {{ live?: boolean, revived?: boolean, reason?: string } | undefined} revive
@@ -926,7 +992,7 @@ export function installApi(ctx, { warn } = {}) {
         const SERVICE_KEYS = [
           'roster', 'board', 'dispatcher', 'room', 'memory',
           'library', 'discipline', 'todo', 'scratch', 'prompts', 'suggest', 'reviewer',
-          'metrics', 'verify', 'cycle', 'teams',
+          'metrics', 'verify', 'cycle', 'teams', 'subscription',
         ]
         for (const key of SERVICE_KEYS) {
           const svc = services[key]
@@ -955,7 +1021,14 @@ export function installApi(ctx, { warn } = {}) {
         const tasks = await withService(services, 'board', (b) =>
           onlyReady ? b.ready() : b.list(opts),
         )
-        sendJson(response, 200, { ok: true, tasks })
+        // 改造07（借鉴 Super-agent stage table）：每个任务附带执行阶段（纯派生，不落盘）。
+        // 前端用 stageInfo.group 上色、needsPerson 判断「该我动手」。
+        const enriched = attachStages(tasks)
+        sendJson(response, 200, {
+          ok: true,
+          tasks: enriched,
+          stageSummary: stageSummary(tasks),
+        })
         return
       }
 
@@ -1109,6 +1182,14 @@ export function installApi(ctx, { warn } = {}) {
               return r.retire({ id: body.id, reason: body.reason, byId })
             case 'setCwd':
               return r.setCwd({ id: body.id, cwd: body.cwd, expectedRev: body.expectedRev, byId })
+            // 改造07（借鉴 Super-agent prepare command）：设置/清除开工准备命令
+            case 'prepare':
+              return r.setPrepareCommand({
+                id: body.id,
+                prepareCommand: body.prepareCommand,
+                expectedRev: body.expectedRev,
+                byId,
+              })
             case 'claim':
               return r.claim({ id: body.id, owner: byId, expectedRev: body.expectedRev })
             case 'release':
@@ -1227,7 +1308,24 @@ export function installApi(ctx, { warn } = {}) {
           revives.push(entry)
         }
 
-        sendJson(response, 200, { ok: true, message, wakes: toWake.length, revives })
+        // ── 改造07（借鉴 Super-agent Subscription 扇出）：
+        // 订阅该房间的任务，自动收到这条消息作为上下文。
+        // **只加上下文、不改任务状态、不授予开工权力**——谁有权开工仍由 claim 决定。
+        let fanout
+        if (services.subscription) {
+          try {
+            fanout = await services.subscription.fanout({
+              roomId: message.roomId,
+              message,
+              wake: false, // 上下文到达不等于要打扰执行者
+              by: body.from ?? 'ui',
+            })
+          } catch (error) {
+            fanout = { error: `fanout-failed:${error?.message ?? error}` }
+          }
+        }
+
+        sendJson(response, 200, { ok: true, message, wakes: toWake.length, revives, fanout })
         return
       }
 
@@ -1627,7 +1725,12 @@ export function installApi(ctx, { warn } = {}) {
           sendJson(response, 404, { ok: false, reason: `任务 ${id} 不存在` })
           return
         }
-        sendJson(response, 200, { ok: true, ...detail })
+        sendJson(response, 200, {
+          ok: true,
+          // 改造07（借鉴 Super-agent stage table）：阶段机结果附在详情里
+          stageInfo: deriveStage(detail.task),
+          ...detail,
+        })
         return
       }
 
@@ -1638,6 +1741,25 @@ export function installApi(ctx, { warn } = {}) {
           return
         }
         // 指派 = 用 ownerId 作为 claim 的 byId（board 的 claim 把 by 记为 owner）
+        // 改造07：claim 前先跑 Bot 的 prepare command（借鉴 Super-agent）。
+        // 准备失败 → **不 claim**，任务保持原状（绝不产生「claim 了但没准备好」的半成品）。
+        const bot = await withService(services, 'roster', (r) => r.get(body.ownerId))
+        let prepare = { ok: true, skipped: true }
+        if (bot && typeof bot.prepareCommand === 'string' && bot.prepareCommand.trim()) {
+          prepare = await runPrepareCommand(bot)
+          if (!prepare.ok) {
+            const current = await withService(services, 'board', (b) => b.get(body.id))
+            sendJson(response, 200, {
+              ok: false,
+              code: 'PREPARE_FAILED',
+              task: current ?? undefined,
+              prepare,
+              reason: `开工准备失败（${prepare.error ?? '未知原因'}），任务未认领`
+                + `。准备命令：${prepare.command ?? bot.prepareCommand}`,
+            })
+            return
+          }
+        }
         const task = await withService(services, 'board', (b) =>
           b.update({
             id: body.id,
@@ -1661,7 +1783,7 @@ export function installApi(ctx, { warn } = {}) {
             text: `新任务 ${task.id}：${task.subject}\n${task.description ?? ''}`.trim(),
           })
         }
-        sendJson(response, 200, { ok: true, task, wake, ...reviveFields(revive) })
+        sendJson(response, 200, { ok: true, task, wake, prepare, ...reviveFields(revive) })
         return
       }
 
@@ -1849,6 +1971,8 @@ export function installApi(ctx, { warn } = {}) {
             progressText: `${task.progress ?? 0}% · ${statusText(task.status)}`,
             lastNote: lastNoteContent,
           },
+          // 改造07（借鉴 Super-agent stage table）：阶段机结果
+          stageInfo: deriveStage(task),
           stepConclusions,
           nextStep: lastNoteContent ? extractNextStep(lastNoteContent) : null,
           note: SUMMARY_NOTE,
@@ -3378,6 +3502,176 @@ export function installApi(ctx, { warn } = {}) {
           },
           note: '已写入团队记忆（L2，全队可见）',
         })
+        return
+      }
+
+      // ── 改造07：任务订阅（借鉴 Super-agent Subscription 扇出）─────────────────
+      // GET /subscriptions —— 列出订阅（按 taskId/roomId/state 过滤）
+      if (request.method === 'GET' && path === '/subscriptions') {
+        const subs = await withService(services, 'subscription', (s) => s.list({
+          taskId: qp(url, 'taskId'),
+          roomId: qp(url, 'roomId'),
+          state: qp(url, 'state'),
+        }))
+        sendJson(response, 200, { ok: true, subs, stats: services.subscription?.stats?.() })
+        return
+      }
+
+      // POST /subscriptions —— 订阅（任务接收房间后续消息）
+      if (request.method === 'POST' && path === '/subscriptions') {
+        const body = (await readBody(request)) ?? {}
+        if (!body.taskId || !body.roomId) {
+          sendJson(response, 400, { ok: false, reason: 'taskId 与 roomId 必填' })
+          return
+        }
+        const sub = await withService(services, 'subscription', (s) =>
+          s.subscribe({ ...body, by: body.by ?? OWNER }))
+        sendJson(response, 200, { ok: true, sub })
+        return
+      }
+
+      // POST /subscriptions/unsubscribe —— 取消订阅
+      if (request.method === 'POST' && path === '/subscriptions/unsubscribe') {
+        const body = (await readBody(request)) ?? {}
+        if (!body.id) {
+          sendJson(response, 400, { ok: false, reason: 'id 必填' })
+          return
+        }
+        const sub = await withService(services, 'subscription', (s) =>
+          s.unsubscribe({ ...body, by: body.by ?? OWNER }))
+        sendJson(response, 200, { ok: true, sub })
+        return
+      }
+
+      // ── 改造07：穿透面板（下层 AI 基础设施查看）─────────────────────────────
+      // GET /deepdive/blocks —— 列出 6 个下层区块 + 概览统计
+      if (request.method === 'GET' && path === '/deepdive/blocks') {
+        const blocks = []
+        // 注册表：Bot 数量 + 各状态计数
+        await withService(services, 'roster', (r) => {
+          const rows = typeof r.list === 'function' ? r.list({ includeRetired: true }) : []
+          const byState = {}
+          for (const row of rows) {
+            const st = row?.state ?? row?.status ?? 'unknown'
+            byState[st] = (byState[st] ?? 0) + 1
+          }
+          blocks.push({
+            id: 'registry', label: '注册表', description: 'Bot 注册表 / 任务板 / 团队注册',
+            stats: { bots: rows.length, states: byState },
+          })
+        })
+        // 唤醒桥：Dispatcher 统计
+        const dStats = services.dispatcher?.stats?.()
+        if (dStats) {
+          blocks.push({
+            id: 'wake', label: '唤醒桥', description: 'Dispatcher 队列 / 去重 / 背压',
+            stats: { total: dStats.total, sent: dStats.sent, skipped: dStats.skipped, failed: dStats.failed, pending: dStats.pending },
+          })
+        }
+        // 存储：各 jsonl 健康
+        const storeFiles = []
+        for (const f of ['board.jsonl', 'roster.jsonl', 'wakes.jsonl', 'memory.jsonl', 'cycle.jsonl', 'todo.jsonl', 'rooms']) {
+          try {
+            const p = statePath(services.board?.paths?.stateDir ?? '', f)
+            const st = existsSync(p) ? statSync(p) : null
+            storeFiles.push({ name: f, exists: Boolean(st), size: st ? st.size : 0, mtime: st ? st.mtimeMs : null })
+          } catch {}
+        }
+        blocks.push({
+          id: 'store', label: '存储', description: 'jsonl 事件流 / 快照 / 原子写',
+          stats: { files: storeFiles.filter((f) => f.exists).length, total: storeFiles.length },
+        })
+        // 路由：复杂度路由规则（静态展示）
+        blocks.push({
+          id: 'routing', label: '路由', description: '复杂度路由 T0-T3 / 免费付费策略',
+          stats: { tiers: ['T0', 'T1', 'T2', 'T3'], default: 'free_only (fail-closed)' },
+        })
+        // 验证：验收统计
+        const vStats = services.verify?.stats?.()
+        blocks.push({
+          id: 'verify', label: '验证', description: '验收证据 / 退出码 / 测试结果',
+          stats: vStats ?? { note: 'verify 服务未装配' },
+        })
+        // 建议：建议队列
+        const sugStats = services.suggest?.stats?.()
+        blocks.push({
+          id: 'suggest', label: '建议', description: '建议确认队列 / 纪律提议',
+          stats: sugStats ?? { note: 'suggest 服务未装配' },
+        })
+        sendJson(response, 200, { ok: true, blocks })
+        return
+      }
+
+      // GET /deepdive/block/:id —— 某区块详情 + 可执行操作
+      if (request.method === 'GET' && path.startsWith('/deepdive/block/')) {
+        const id = decodeURIComponent(path.slice('/deepdive/block/'.length))
+        const data = {}
+        const operations = []
+        try {
+          if (id === 'registry') {
+            const rows = await withService(services, 'roster', (r) => r.list({ includeRetired: true }))
+            data.bots = rows
+            operations.push({ id: 'revive', label: '重启全部 Bot 会话', body: {} })
+          } else if (id === 'wake') {
+            data.stats = services.dispatcher?.stats?.()
+            data.recent = services.dispatcher?.list?.({ limit: 20 }) ?? []
+            operations.push({ id: 'flush', label: '强制投递队列', body: {} })
+          } else if (id === 'store') {
+            const dir = services.board?.paths?.stateDir ?? ''
+            const files = []
+            try {
+              for (const entry of readdirSync(dir)) {
+                const p = join(dir, entry)
+                const st = statSync(p)
+                files.push({ name: entry, size: st.size, mtime: st.mtimeMs })
+              }
+            } catch {}
+            data.files = files.slice(0, 50)
+            data.stateDir = dir
+            operations.push({ id: 'replay', label: '重建内存态（replay）', body: {} })
+          } else if (id === 'routing') {
+            data.tiers = ['T0', 'T1', 'T2', 'T3']
+            data.description = 'T0 一句话问答 / T1 常规改动 / T2 跨文件或多步 / T3 架构级。缺省 = free_only（只走免费渠道，fail-closed）。'
+          } else if (id === 'verify') {
+            data.stats = services.verify?.stats?.()
+            data.records = services.verify?.list?.({ limit: 20 }) ?? []
+            operations.push({ id: 'recheck', label: '手动重跑验收', body: {} })
+          } else if (id === 'suggest') {
+            data.stats = services.suggest?.stats?.()
+            data.pending = services.suggest?.list?.({ status: 'pending', limit: 20 }) ?? []
+          } else {
+            sendJson(response, 404, { ok: false, reason: `未知区块: ${id}` })
+            return
+          }
+        } catch (error) {
+          sendJson(response, 500, { ok: false, reason: `区块详情读取失败：${error?.message ?? error}` })
+          return
+        }
+        sendJson(response, 200, { ok: true, block: id, data, operations })
+        return
+      }
+
+      // POST /deepdive/op —— 区块操作（手动唤醒/flush/replay 等）
+      if (request.method === 'POST' && path === '/deepdive/op') {
+        const body = (await readBody(request)) ?? {}
+        const { block, op } = body
+        try {
+          if (block === 'wake' && op === 'flush') {
+            const result = services.dispatcher?.flush?.({ force: true })
+            sendJson(response, 200, { ok: true, text: `已强制投递：sent=${result?.sent ?? 0}, failed=${result?.failed ?? 0}`, result })
+          } else if (block === 'store' && op === 'replay') {
+            const result = services.board?.replay?.()
+            sendJson(response, 200, { ok: true, text: `replay 完成：${JSON.stringify(result ?? {})}`, result })
+          } else if (block === 'registry' && op === 'revive') {
+            sendJson(response, 200, { ok: true, text: 'Bot 会话重启需要内核支持，请通过页面操作' })
+          } else if (block === 'verify' && op === 'recheck') {
+            sendJson(response, 200, { ok: true, text: '验收重跑需要在任务详情中操作' })
+          } else {
+            sendJson(response, 400, { ok: false, reason: `不支持的操作：${block}/${op}` })
+          }
+        } catch (error) {
+          sendJson(response, 400, { ok: false, reason: `操作失败：${error?.message ?? error}` })
+        }
         return
       }
 

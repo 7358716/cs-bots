@@ -457,3 +457,216 @@ test('2026-11-04 P0：API handler 对无会话的代理请求返回 403（端到
     h.cleanup()
   }
 })
+
+// ── 改造07：穿透面板（下层 AI 基础设施）─────────────────────────────────────
+
+test('改造07 穿透：GET /deepdive/blocks 返回 6 个下层区块', async () => {
+  const h = boot()
+  try {
+    const { status, json } = await h.req('GET', '/deepdive/blocks')
+    assert.equal(status, 200)
+    assert.equal(json.ok, true)
+    assert.ok(Array.isArray(json.blocks), 'blocks 应是数组')
+    const ids = json.blocks.map((b) => b.id)
+    for (const want of ['registry', 'wake', 'store', 'routing', 'verify', 'suggest']) {
+      assert.ok(ids.includes(want), `应含区块 ${want}，实际 ${ids.join(',')}`)
+    }
+  } finally {
+    h.cleanup()
+  }
+})
+
+test('改造07 穿透：每个区块带 label / description / stats', async () => {
+  const h = boot()
+  try {
+    const { json } = await h.req('GET', '/deepdive/blocks')
+    for (const b of json.blocks) {
+      assert.ok(typeof b.label === 'string' && b.label.length > 0, `区块 ${b.id} 应有 label`)
+      assert.ok(typeof b.description === 'string', `区块 ${b.id} 应有 description`)
+      assert.ok(b.stats && typeof b.stats === 'object', `区块 ${b.id} 应有 stats`)
+    }
+  } finally {
+    h.cleanup()
+  }
+})
+
+test('改造07 穿透：GET /deepdive/block/registry 返回 Bot 列表', async () => {
+  const h = boot()
+  try {
+    const { status, json } = await h.req('GET', '/deepdive/block/registry')
+    assert.equal(status, 200)
+    assert.equal(json.ok, true)
+    assert.equal(json.block, 'registry')
+    assert.ok(Array.isArray(json.data.bots), 'registry 区块应返回 bots 数组')
+  } finally {
+    h.cleanup()
+  }
+})
+
+test('改造07 穿透：GET /deepdive/block/store 返回状态目录文件列表', async () => {
+  const h = boot()
+  try {
+    const { status, json } = await h.req('GET', '/deepdive/block/store')
+    assert.equal(status, 200)
+    assert.ok(Array.isArray(json.data.files), 'store 区块应返回 files 数组')
+    assert.equal(typeof json.data.stateDir, 'string')
+  } finally {
+    h.cleanup()
+  }
+})
+
+test('改造07 穿透：GET /deepdive/block/wake 返回唤醒统计与最近记录', async () => {
+  const h = boot()
+  try {
+    const { status, json } = await h.req('GET', '/deepdive/block/wake')
+    assert.equal(status, 200)
+    assert.ok(json.data.stats && typeof json.data.stats === 'object')
+    assert.ok(Array.isArray(json.data.recent))
+  } finally {
+    h.cleanup()
+  }
+})
+
+test('改造07 穿透：未知区块返回 404 且带可读原因', async () => {
+  const h = boot()
+  try {
+    const { status, json } = await h.req('GET', '/deepdive/block/nope')
+    assert.equal(status, 404)
+    assert.equal(json.ok, false)
+    assert.match(json.reason, /未知区块/)
+  } finally {
+    h.cleanup()
+  }
+})
+
+test('改造07 穿透：POST /deepdive/op 不支持的操作返回 400', async () => {
+  const h = boot()
+  try {
+    const { status, json } = await h.req('POST', '/deepdive/op', { block: 'nope', op: 'nope' })
+    assert.equal(status, 400)
+    assert.equal(json.ok, false)
+  } finally {
+    h.cleanup()
+  }
+})
+
+test('改造07 穿透：POST /deepdive/op store/replay 执行成功', async () => {
+  const h = boot()
+  try {
+    const { status, json } = await h.req('POST', '/deepdive/op', { block: 'store', op: 'replay' })
+    assert.equal(status, 200)
+    assert.equal(json.ok, true)
+    assert.match(json.text, /replay/)
+  } finally {
+    h.cleanup()
+  }
+})
+
+// ── 改造07：任务订阅（借鉴 Super-agent Subscription 扇出）────────────────────
+
+test('改造07 订阅：POST /subscriptions 订阅后 GET 可查到', async () => {
+  const h = boot()
+  try {
+    const created = await h.req('POST', '/subscriptions', { taskId: 't-1', roomId: 'room-a' })
+    assert.equal(created.status, 200)
+    assert.equal(created.json.ok, true)
+    assert.equal(created.json.sub.state, 'active')
+
+    const listed = await h.req('GET', '/subscriptions?taskId=t-1')
+    assert.equal(listed.status, 200)
+    assert.equal(listed.json.subs.length, 1)
+    assert.equal(listed.json.subs[0].taskId, 't-1')
+  } finally {
+    h.cleanup()
+  }
+})
+
+test('改造07 订阅：缺 taskId/roomId 返回 400（绝不静默）', async () => {
+  const h = boot()
+  try {
+    const a = await h.req('POST', '/subscriptions', { roomId: 'r' })
+    assert.equal(a.status, 400)
+    const b = await h.req('POST', '/subscriptions', { taskId: 't' })
+    assert.equal(b.status, 400)
+  } finally {
+    h.cleanup()
+  }
+})
+
+test('改造07 订阅：POST /subscriptions/unsubscribe 取消订阅', async () => {
+  const h = boot()
+  try {
+    const created = await h.req('POST', '/subscriptions', { taskId: 't-2', roomId: 'room-b' })
+    const id = created.json.sub.id
+    const out = await h.req('POST', '/subscriptions/unsubscribe', { id })
+    assert.equal(out.status, 200)
+    assert.equal(out.json.sub.state, 'dropped')
+
+    const listed = await h.req('GET', '/subscriptions?state=active')
+    assert.equal(listed.json.subs.length, 0)
+  } finally {
+    h.cleanup()
+  }
+})
+
+test('改造07 订阅：/status 里能看到 subscription 服务', async () => {
+  const h = boot()
+  try {
+    const { json } = await h.req('GET', '/status')
+    assert.ok('subscription' in json.services, 'status 应含 subscription')
+    assert.equal(json.services.subscription.available, true)
+  } finally {
+    h.cleanup()
+  }
+})
+
+// ── 改造07：工单阶段机（任务列表带 stageInfo）────────────────────────────────
+
+test('改造07 阶段：GET /tasks 每条任务带 stageInfo，且返回 stageSummary', async () => {
+  const h = boot()
+  try {
+    await h.req('POST', '/tasks', { subject: 'T1', byId: 'ui' })
+    const { status, json } = await h.req('GET', '/tasks')
+    assert.equal(status, 200)
+    assert.equal(json.tasks.length, 1)
+    const t = json.tasks[0]
+    assert.ok(t.stageInfo, '任务应带 stageInfo')
+    for (const k of ['stage', 'label', 'group', 'needsPerson', 'reason']) {
+      assert.ok(k in t.stageInfo, `stageInfo 应含 ${k}`)
+    }
+    // 新建未认领 → 排队中
+    assert.equal(t.stageInfo.stage, 'working/queued')
+    assert.ok(json.stageSummary, '应返回 stageSummary')
+    assert.equal(json.stageSummary.total, 1)
+  } finally {
+    h.cleanup()
+  }
+})
+
+test('改造07 阶段：GET /tasks/detail 带 stageInfo', async () => {
+  const h = boot()
+  try {
+    const created = await h.req('POST', '/tasks', { subject: 'T2', byId: 'ui' })
+    const id = created.json.task.id
+    const { status, json } = await h.req('GET', `/tasks/detail?id=${id}`)
+    assert.equal(status, 200)
+    assert.ok(json.stageInfo, 'detail 应带 stageInfo')
+    assert.equal(json.stageInfo.stage, 'working/queued')
+  } finally {
+    h.cleanup()
+  }
+})
+
+test('改造07 阶段：GET /tasks/summary 带 stageInfo', async () => {
+  const h = boot()
+  try {
+    const created = await h.req('POST', '/tasks', { subject: 'T3', byId: 'ui' })
+    const id = created.json.task.id
+    const { status, json } = await h.req('GET', `/tasks/summary?id=${id}`)
+    assert.equal(status, 200)
+    assert.ok(json.stageInfo, 'summary 应带 stageInfo')
+    assert.equal(json.stageInfo.needsPerson, false)
+  } finally {
+    h.cleanup()
+  }
+})

@@ -259,12 +259,14 @@ test('B1 真实渲染 Workbench（需 jsdom+react，缺则 SKIP）', async (t) =
     }
     await render()
 
-    // 关键断言：**没有白屏**，四个 Tab 按钮都在
+    // 关键断言：**没有白屏**，改造07 的 6 个上层页签按钮都在
     const text = dom.window.document.body.textContent ?? ''
-    assert.match(text, /任务/, '应渲染出「任务」Tab')
-    assert.match(text, /房间/, '应渲染出「房间」Tab')
+    assert.match(text, /工作台/, '应渲染出「工作台」Tab（改造07）')
+    assert.match(text, /团队/, '应渲染出「团队」Tab（改造07）')
     assert.match(text, /记忆/, '应渲染出「记忆」Tab')
-    assert.match(text, /Bot/, '应渲染出「Bot」Tab')
+    assert.match(text, /技能库/, '应渲染出「技能库」Tab')
+    assert.match(text, /数据/, '应渲染出「数据」Tab')
+    assert.match(text, /穿透/, '应有「穿透」入口（下层工具）')
 
     root.unmount()
   } finally {

@@ -31,6 +31,7 @@ import { createMetrics } from './metrics.js'
 import { createVerify } from './verify.js'
 import { createCycle } from './cycle.js'
 import { createTeams } from './teams.js'
+import { createSubscription } from './subscription.js'
 import { createDirBrowser } from './dirbrowse.js'
 import { loadSettings } from './settings.js'
 import { probeHost, formatReport } from './compat.js'
@@ -303,6 +304,15 @@ function applyInner(ctx, config, { log, warn }) {
     log(`[cs-bots] teams 就绪（${services.teams.stats().total} 个团队）`)
   } catch (error) {
     warn(`[cs-bots] teams 装配失败（团队不可用）：${error?.message ?? error}`)
+  }
+
+  // ── 任务订阅（改造07 · 借鉴 Super-agent Subscription 扇出）──────────────────
+  // 让房间讨论的后续消息自动到达相关任务，不需要再 @ Bot。
+  try {
+    services.subscription = createSubscription(ctx, { stateDir: config.stateDir ?? kernelStateDir() })
+    log(`[cs-bots] subscription 就绪（${services.subscription.stats().active} 条活订阅）`)
+  } catch (error) {
+    warn(`[cs-bots] subscription 装配失败（房间→任务扇出不可用）：${error?.message ?? error}`)
   }
 
   // ── 页面数据面：HTTP API（页面层靠它拿数据；没有它 UI 是空壳）──────────────

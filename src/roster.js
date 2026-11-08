@@ -110,6 +110,8 @@ const ACTIONS = [
   'profile_updated',
   'profile_memory_added',
   'profile_skills_linked',
+  // 改造07（借鉴 Super-agent 的 prepare command）：开工前准备命令的变更留痕
+  'prepare_command_set',
 ]
 
 // ── 错误 ────────────────────────────────────────────────────────────────────
@@ -692,7 +694,7 @@ export function createRoster(ctx, config = {}) {
    * @throws {RosterError} 缺字段 / 非法 cwd / 重名 / 会话创建失败 / 事件落盘失败
    */
   async function create(input = {}) {
-    const { name, cwd, label, model, instructions, preset, permission, profile, byId, now } = input ?? {}
+    const { name, cwd, label, model, instructions, preset, permission, profile, prepareCommand, byId, now } = input ?? {}
     const by = requireString(byId, 'byId', 'create')
     const displayName = requireString(name, 'name', 'create')
     const dir = assertBotCwd(cwd, 'create')
@@ -755,6 +757,12 @@ export function createRoster(ctx, config = {}) {
     if (roleLabel !== undefined) bot.label = roleLabel
     if (mdl !== undefined) bot.model = mdl
     if (inst !== undefined) bot.instructions = inst
+    // 改造07：开工准备命令（借鉴 Super-agent 的 prepare command）
+    if (prepareCommand !== undefined && prepareCommand !== null && prepareCommand !== '') {
+      bot.prepareCommand = String(prepareCommand).trim()
+      bot.prepareCommandSetAt = at
+      bot.prepareCommandSetBy = by
+    }
     // ── 档案（身份/经验/技能/预制记忆）→ 落到官方机制上 ──────────────────
     if (profile !== undefined) {
       try {
@@ -1163,6 +1171,39 @@ export function createRoster(ctx, config = {}) {
   }
 
   /**
+   * 设置/清除开工准备命令（改造07 · 借鉴 Super-agent 的 prepare command）。
+   *
+   * prepare command 在 Bot 首次 claim 任务时执行，用于 `git worktree`、拉代码等
+   * 开工前准备。失败会阻塞 claim（任务保持 pending，由上层记录原因）。
+   *
+   * @param {{ id: string, prepareCommand?: string|null, byId: string, now?: number }} input
+   * @returns {object} Bot
+   * @throws {RosterError} 已退役 / CAS 冲突
+   */
+  function setPrepareCommand(input = {}) {
+    const { prepareCommand, byId, now } = input ?? {}
+    const current = loadForCas(input, 'setPrepareCommand')
+    const by = requireString(byId, 'byId', 'setPrepareCommand')
+    assertNotRetired(current, 'setPrepareCommand', '设置准备命令')
+
+    const at = normalizeNow(now, 'setPrepareCommand')
+    const before = clone(current)
+    const next = clone(current)
+    next.rev = current.rev + 1
+    if (prepareCommand === null || prepareCommand === undefined || prepareCommand === '') {
+      delete next.prepareCommand
+      delete next.prepareCommandSetAt
+      delete next.prepareCommandSetBy
+    } else {
+      const cmd = String(prepareCommand).trim()
+      next.prepareCommand = cmd
+      next.prepareCommandSetAt = at
+      next.prepareCommandSetBy = by
+    }
+    return commit(current.id, 'prepare_command_set', by, at, before, next)
+  }
+
+  /**
    * 取租约（§3.1 草案未列，见文件头「必要增量」第 3 条）。
    *
    * 租约的作用与 board 的 owner lease 同构：**封死「持有者在 interrupt/崩溃后永不释放」**——
@@ -1367,6 +1408,7 @@ export function createRoster(ctx, config = {}) {
     rename,
     retire,
     setCwd,
+    setPrepareCommand,
     getProfile,
     setProfile,
     // v2 档案增强（DESIGN-v2 特性 ③）：追加预制记忆 / 关联技能（都走 CAS）

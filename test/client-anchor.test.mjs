@@ -756,16 +756,18 @@ test('S7 来源跳转：kind:"todo"/"evolve" 只显示只读一行（无按钮�
 
 // ── S8 既有 onGoto('tasks') 单参数调用行为逐字不变（回归） ────────────────────
 
-test('S8 回归：既有 onGoto("tasks") 单参数调用逐字不变（ArtifactsTab/页签按钮）', () => {
+test('S8 回归：onGoto("tasks") 经 safeGoTab 映射到 workspace（ArtifactsTab/页签按钮）', () => {
   // 页签按钮：仍是单参数 `goTab(t.id)`
   assert.match(SOURCE, /onClick:\s*\(\) => goTab\(t\.id\)/, '页签按钮仍是 goTab(t.id) 单参数')
-  // 成果页空态：仍是单参数 `onGoto('tasks')`
-  assert.match(SOURCE, /onClick:\s*\(\) => onGoto\('tasks'\)/, 'ArtifactsTab 仍是 onGoto(\'tasks\') 单参数')
+  // 成果页空态：映射到 workspace（改造07：任务→工作台）
+  assert.match(SOURCE, /onClick:\s*\(\) => onGoto\('tasks'\)/, 'ArtifactsTab 仍调 onGoto(\'tasks\')')
+  assert.match(SOURCE, /tasks:\s*'workspace'/, 'safeGoTab 把 tasks 映射到 workspace')
   // goTab 的第二参数必须是可选的（单参数时不产生任何定位副作用）
   assert.match(SOURCE, /const goTab = \(id, opts\) => \{/, 'goTab 必须支持可选第二参数 opts')
   assert.match(SOURCE, /setLocate\(opts && typeof opts === 'object' && opts\.roomId \? opts : null\)/,
     '单参数调用时 locate 必须落回 null（行为逐字不变）')
-  assert.match(SOURCE, /id:\s*'tasks',\s*label:\s*'任务'/, '任务页签定义未被改动')
+  // 改造07：任务页签已升级为工作台
+  assert.match(SOURCE, /id:\s*'workspace',\s*label:\s*'工作台'/, '任务页签已升级为工作台（改造07）')
 })
 
 test('S8b 回归：单参数 onGoto 时 RoomsTab 不产生任何定位副作用（不发 /rooms/messages 定位请求）', async () => {
@@ -790,10 +792,10 @@ test('S8b 回归：单参数 onGoto 时 RoomsTab 不产生任何定位副作用�
 test('S9 Workbench：onGoto("rooms", {roomId,seq}) 会把定位参数传给 RoomsTab', () => {
   assert.match(
     SOURCE,
-    /locate:\s*current\.id === 'rooms' \? locate : undefined/,
-    '只有房间页签接收 locate 定位参数',
+    /locate:\s*current\.id === 'team' && activeView\.id === 'rooms' \? locate : undefined/,
+    '只有团队/房间子视图接收 locate 定位参数（改造07）',
   )
-  assert.match(SOURCE, /goTab,\s*$/m, '页签组件仍拿到 onGoto=goTab')
+  assert.match(SOURCE, /safeGoTab,\s*$/m, '页签组件拿到 onGoto=safeGoTab（含旧 id 映射）')
   assert.match(SOURCE, /const \[locate, setLocate\] = useState\(null\)/, 'Workbench 持有 locate 状态')
 })
 

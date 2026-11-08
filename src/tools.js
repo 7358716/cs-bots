@@ -279,6 +279,12 @@ const DEFS = [
             'agent 预设 id（决定该 Bot 的人格/系统提示/技能/工具面）。' +
             '不传则用宿主默认预设。可用 bot_roster_list 的 presets 字段或 GET /cs-bots/api/presets 查可选项。',
         },
+        prepareCommand: {
+          type: 'string',
+          description:
+            '可选。改造07 · 借鉴 Super-agent：该 Bot 首次接活前在 cwd 下执行的准备命令，' +
+            '典型如 `git worktree add ../<name> main`。准备失败会让 claim 拒绝并记录原因。',
+        },
       },
       required: ['name', 'cwd'],
       additionalProperties: false,
@@ -314,14 +320,21 @@ const DEFS = [
     name: 'bot_roster_manage',
     description:
       '管理已注册的 Bot（**官方 roster 做不到的能力**）：rename=改名（旧名随即释放）/ ' +
-      'retire=退役（终态，名字与目录可被复用）/ setCwd=换工作目录 / claim=取租约 / release / heartbeat。',
+      'retire=退役（终态，名字与目录可被复用）/ setCwd=换工作目录 / prepare=设置或清除开工准备命令 / ' +
+      'claim=取租约 / release / heartbeat。',
     parameters: {
       type: 'object',
       properties: {
         id: { type: 'string' },
-        action: { type: 'string', enum: ['rename', 'retire', 'setCwd', 'claim', 'release', 'heartbeat'] },
+        action: { type: 'string', enum: ['rename', 'retire', 'setCwd', 'prepare', 'claim', 'release', 'heartbeat'] },
         name: { type: 'string', description: 'rename 用' },
         cwd: { type: 'string', description: 'setCwd 用（绝对路径）' },
+        prepareCommand: {
+          type: 'string',
+          description:
+            'prepare 用（改造07 · 借鉴 Super-agent）：Bot 首次接活前在该 cwd 下执行的准备命令，' +
+            '典型如 `git worktree add ...`。传空字符串 = 清除。',
+        },
         reason: { type: 'string' },
         expectedRev: { type: 'number' },
       },
@@ -339,6 +352,15 @@ const DEFS = [
             return success({ bot: s.roster.retire({ id: a.id, reason: a.reason, byId }) })
           case 'setCwd':
             return success({ bot: s.roster.setCwd({ id: a.id, cwd: a.cwd, expectedRev: a.expectedRev, byId }) })
+          case 'prepare':
+            return success({
+              bot: s.roster.setPrepareCommand({
+                id: a.id,
+                prepareCommand: a.prepareCommand,
+                expectedRev: a.expectedRev,
+                byId,
+              }),
+            })
           case 'claim':
             return success({ bot: s.roster.claim({ id: a.id, owner: byId, expectedRev: a.expectedRev }) })
           case 'release':
@@ -999,6 +1021,77 @@ const DEFS = [
         return success({ team: s.teams.addMember({ ...a, by: callerOf(exec) }) })
       } catch (error) {
         return failure(error?.code ?? 'teams-add-failed', { message: error?.message ?? String(error) })
+      }
+    },
+  },
+
+  // ── 任务订阅（改造07 · 借鉴 Super-agent Subscription 扇出）──────────────────
+  {
+    name: 'bot_task_subscribe',
+    description:
+      '让一个任务订阅某个房间：该房间的**后续消息自动到达这个任务**（作为上下文），'
+      + '不需要再 @ Bot。只加上下文，**不改变任务状态、不授予开工权力**。幂等：重复订阅返回既有记录。',
+    parameters: {
+      type: 'object',
+      properties: {
+        taskId: { type: 'string', description: '任务 id' },
+        roomId: { type: 'string', description: '房间 id' },
+        note: { type: 'string', description: '可选备注（为什么订阅）' },
+      },
+      required: ['taskId', 'roomId'],
+      additionalProperties: false,
+    },
+    run: (s, a, exec) => {
+      if (!s.subscription) return failure('subscription-unavailable')
+      try {
+        return success({ sub: s.subscription.subscribe({ ...a, by: callerOf(exec) }) })
+      } catch (error) {
+        return failure(error?.code ?? 'subscribe-failed', { message: error?.message ?? String(error) })
+      }
+    },
+  },
+  {
+    name: 'bot_task_unsubscribe',
+    description: '取消任务的房间订阅（终态，不可恢复；需要时重新订阅）。',
+    parameters: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', description: '订阅 id（不是 taskId）' },
+        expectedRev: { type: 'number' },
+      },
+      required: ['id'],
+      additionalProperties: false,
+    },
+    run: (s, a, exec) => {
+      if (!s.subscription) return failure('subscription-unavailable')
+      try {
+        return success({ sub: s.subscription.unsubscribe({ ...a, by: callerOf(exec) }) })
+      } catch (error) {
+        return failure(error?.code ?? 'unsubscribe-failed', { message: error?.message ?? String(error) })
+      }
+    },
+  },
+  {
+    name: 'bot_task_subscriptions',
+    description: '查看订阅：按 taskId / roomId / state 过滤。任务详情用 taskId 拉「订阅了什么」。',
+    parameters: {
+      type: 'object',
+      properties: {
+        taskId: { type: 'string' },
+        roomId: { type: 'string' },
+        state: { type: 'string', enum: ['active', 'dropped'] },
+      },
+      additionalProperties: false,
+    },
+    run: (s, a) => {
+      if (!s.subscription) return failure('subscription-unavailable')
+      try {
+        return success({
+          subs: s.subscription.list(a ?? {}),
+          stats: s.subscription.stats(),
+        })
+      } catch (error) {
+        return failure(error?.code ?? 'subscriptions-failed', { message: error?.message ?? String(error) })
       }
     },
   },
