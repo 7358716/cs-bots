@@ -616,3 +616,341 @@ test('2026-11-04 P2-2：board.stats() 存在且含 total', (t) => {
   assert.ok(st.byStatus)
   assert.equal(st.ready, 2)
 })
+
+// ── 2026-11-09：结构化收尾（借鉴 superagent Report 枚举）────────────────────
+// 背景：`src/stage.js`（改造07）读 `latestReport` / `delivery` / `attention`，
+// 但 `board.js` **从未写入过这些字段**（grep 计数为 0）⇒ 阶段表 8 个阶段中有 4 个
+// 永远派不出来（person/answer、person/blocked、person/failed、idle）。
+// 下面三条用例锁死「写入侧」与「读取侧」的一致性。
+
+test('2026-11-09：complete 把 latestReport.state 落成 ready（默认）', (t) => {
+  const { dir, board } = setup(t)
+  const a = seed(board, { subject: 'A' })
+  const done = board.update({ id: a.id, expectedRev: 1, action: 'complete', byId: 'bot', artifacts: ['out/x.md'] })
+  assert.equal(done.status, 'completed')
+  assert.equal(done.latestReport.state, 'ready')
+  assert.equal(done.latestReport.reporter, 'bot')
+  // 落盘也必须有（不是只在内存里）
+  const last = events(dir).at(-1)
+  assert.equal(last.after.latestReport.state, 'ready')
+})
+
+test('2026-11-09：complete 的 outcome=dropped 落成 dropped（无人在等）', (t) => {
+  const { board } = setup(t)
+  const a = seed(board, { subject: 'A' })
+  const done = board.update({
+    id: a.id, expectedRev: 1, action: 'complete', byId: 'bot',
+    artifacts: ['out/y.md'], outcome: 'dropped',
+  })
+  assert.equal(done.latestReport.state, 'dropped')
+})
+
+test('2026-11-09：complete 拒绝 outcome=blocked/failed（应走 block）', (t) => {
+  const { board } = setup(t)
+  const a = seed(board, { subject: 'A' })
+  for (const bad of ['blocked', 'failed']) {
+    assert.throws(
+      () => board.update({ id: a.id, expectedRev: 1, action: 'complete', byId: 'bot', artifacts: ['x'], outcome: bad }),
+      (err) => err.code === 'BOARD_BAD_FIELD' && /请改用 board\.update block/.test(err.message),
+      `outcome=${bad} 必须被拒并指路 block`,
+    )
+  }
+})
+
+test('2026-11-09：complete 拒绝 humanAction（完成≠提问，否则 stage 误判待验收）', (t) => {
+  const { board } = setup(t)
+  const a = seed(board, { subject: 'A' })
+  // 即使先 claim 成 in_progress 也一样要拒 —— 这不是状态问题，是语义问题
+  const claimed = board.update({ id: a.id, expectedRev: 1, action: 'claim', byId: 'bot' })
+  assert.throws(
+    () => board.update({
+      id: a.id, expectedRev: claimed.rev, action: 'complete', byId: 'bot',
+      artifacts: ['x'], humanAction: '帮我确认端口',
+    }),
+    (err) => err.code === 'BOARD_BAD_FIELD' && /complete 不接受 humanAction/.test(err.message),
+  )
+})
+
+test('2026-11-09：block 落 latestReport（state=blocked + attention.question）', (t) => {
+  const { dir, board } = setup(t)
+  const a = seed(board, { subject: 'A' })
+  const blocked = board.update({
+    id: a.id, expectedRev: 1, action: 'block', byId: 'bot',
+    reason: '端口 3080 被占用',
+    humanAction: '请你确认是否杀掉旧进程',
+  })
+  assert.equal(blocked.status, 'blocked')
+  assert.equal(blocked.blockedReason, '端口 3080 被占用')
+  assert.equal(blocked.latestReport.state, 'blocked')
+  assert.equal(blocked.latestReport.attention.question, '请你确认是否杀掉旧进程')
+  // 落盘校验
+  const last = events(dir).at(-1)
+  assert.equal(last.after.latestReport.state, 'blocked')
+})
+
+test('2026-11-09：block 的 outcome=failed 与 blocked 区分开', (t) => {
+  const { board } = setup(t)
+  const a = seed(board, { subject: 'A' })
+  const failed = board.update({ id: a.id, expectedRev: 1, action: 'block', byId: 'bot', outcome: 'failed' })
+  assert.equal(failed.latestReport.state, 'failed')
+})
+
+test('2026-11-09：block 不给 humanAction 时不伪造 attention（诊断≠指令）', (t) => {
+  const { board } = setup(t)
+  const a = seed(board, { subject: 'A' })
+  const blocked = board.update({ id: a.id, expectedRev: 1, action: 'block', byId: 'bot', reason: '等外部 API' })
+  assert.equal(blocked.latestReport.state, 'blocked')
+  assert.equal(blocked.latestReport.attention, undefined,
+    'blockedReason 不得冒充 attention.question —— 否则人在「等你回答」里看到一句诊断，不知道回什么')
+})
+
+test('2026-11-09：block 拒绝 outcome=ready/dropped（应走 complete）', (t) => {
+  const { board } = setup(t)
+  const a = seed(board, { subject: 'A' })
+  assert.throws(
+    () => board.update({ id: a.id, expectedRev: 1, action: 'block', byId: 'bot', outcome: 'ready' }),
+    (err) => err.code === 'BOARD_BAD_FIELD' && /blocked \| failed/.test(err.message),
+  )
+})
+
+test('2026-11-09：outcome=waiting/progress 不是收尾结论，必须被拒', (t) => {
+  const { board } = setup(t)
+  const a = seed(board, { subject: 'A' })
+  // superagent 的 Report 有 6 态，但 waiting/progress 是「进行中报告」，不是收尾
+  for (const bad of ['waiting', 'progress']) {
+    assert.throws(
+      () => board.update({ id: a.id, expectedRev: 1, action: 'block', byId: 'bot', outcome: bad }),
+      (err) => err.code === 'BOARD_BAD_FIELD',
+    )
+  }
+})
+
+test('2026-11-09：humanAction 超 1000 字符被拒（它是列表标题，不是报告）', (t) => {
+  const { board } = setup(t)
+  const a = seed(board, { subject: 'A' })
+  assert.throws(
+    () => board.update({
+      id: a.id, expectedRev: 1, action: 'block', byId: 'bot',
+      humanAction: 'x'.repeat(1001),
+    }),
+    (err) => err.code === 'BOARD_BAD_FIELD' && /超长/.test(err.message),
+  )
+  // 边界：正好 1000 字符可接受
+  const ok = board.update({
+    id: a.id, expectedRev: 1, action: 'block', byId: 'bot',
+    humanAction: 'y'.repeat(1000),
+  })
+  assert.equal(ok.latestReport.attention.question.length, 1000)
+})
+
+test('2026-11-09：edit 可补/清除 humanAction，落 latestReport 而非顶层字段', (t) => {
+  const { board } = setup(t)
+  const a = seed(board, { subject: 'A' })
+  const claimed = board.update({ id: a.id, expectedRev: 1, action: 'claim', byId: 'bot' })
+  // 执行中改口「我要你决定 X」
+  const asked = board.update({
+    id: a.id, expectedRev: claimed.rev, action: 'edit', byId: 'bot',
+    humanAction: '选 A 还是 B？',
+  })
+  assert.equal(asked.latestReport.attention.question, '选 A 还是 B？')
+  assert.equal(asked.humanAction, undefined, '不得新增顶层 humanAction 字段（stage.js 不读它）')
+  // 人回答了 → 清除
+  const cleared = board.update({
+    id: a.id, expectedRev: asked.rev, action: 'edit', byId: 'ui', humanAction: null,
+  })
+  assert.equal(cleared.latestReport?.attention, undefined)
+})
+
+test('2026-11-09：reopen 作废 latestReport（旧收尾结论不得残留）', (t) => {
+  const { board } = setup(t)
+  const a = seed(board, { subject: 'A' })
+  const blocked = board.update({ id: a.id, expectedRev: 1, action: 'block', byId: 'bot', humanAction: '请决定' })
+  const reopened = board.update({ id: a.id, expectedRev: blocked.rev, action: 'reopen', byId: 'ui' })
+  assert.equal(reopened.latestReport, undefined)
+  assert.equal(reopened.blockedReason, undefined)
+})
+
+test('2026-11-09：accept/reject 作废 latestReport（驳回后要重做）', (t) => {
+  const { board } = setup(t)
+  const a = seed(board, { subject: 'A' })
+  const done = board.update({ id: a.id, expectedRev: 1, action: 'complete', byId: 'bot', artifacts: ['x'] })
+  assert.equal(done.latestReport.state, 'ready')
+  const rejected = board.accept({ id: a.id, by: 'ui', result: 'reject', note: '不合格' })
+  assert.equal(rejected.status, 'pending')
+  assert.equal(rejected.latestReport, undefined)
+})
+
+test('2026-11-09：needsAttention 认 latestReport.attention（与 stage 同一依据）', (t) => {
+  const { board } = setup(t)
+  const a = seed(board, { subject: 'A' })
+  // 未 claim、未 block、优先级低、无 dueAt ⇒ 本来不该被 attention 选中
+  const before = board.list({ attention: true, byId: 'someone-else' })
+  assert.equal(before.some((x) => x.id === a.id), false)
+  board.update({ id: a.id, expectedRev: 1, action: 'edit', byId: 'bot', humanAction: '需要你拍板' })
+  const after = board.list({ attention: true, byId: 'someone-else' })
+  assert.equal(after.some((x) => x.id === a.id), true)
+})
+
+// ── 2026-11-09：Mandate 授权留痕（借鉴 superagent docs/001 §Mandate）──────────
+
+test('2026-11-09：create 未给 mandate 时记 sender=byId（事实，不是推断）', (t) => {
+  const { board } = setup(t)
+  const a = board.create({ subject: 'S', byId: 'lead' })
+  assert.deepEqual(a.mandate, { sender: 'lead' })
+})
+
+test('2026-11-09：create 带 mandateBasis/mandateSender 时完整留痕', (t) => {
+  const { dir, board } = setup(t)
+  const a = board.create({
+    subject: 'S', byId: 'lead',
+    mandate: { basis: 'explicit', sender: '张三', policyVersion: 'v3' },
+  })
+  assert.deepEqual(a.mandate, { basis: 'explicit', sender: '张三', policyVersion: 'v3' })
+  const last = events(dir).at(-1)
+  assert.equal(last.after.mandate.basis, 'explicit')
+})
+
+test('2026-11-09：mandate 含未知字段被拒（授权依据不接受含糊）', (t) => {
+  const { board } = setup(t)
+  assert.throws(
+    () => board.create({ subject: 'S', byId: 'lead', mandate: { basis: 'explicit', because: '我说了算' } }),
+    (err) => err.code === 'BOARD_BAD_FIELD' && /未知字段 because/.test(err.message),
+  )
+})
+
+test('2026-11-09：mandate.basis 非法值被拒', (t) => {
+  const { board } = setup(t)
+  assert.throws(
+    () => board.create({ subject: 'S', byId: 'lead', mandate: { basis: '我觉得可以' } }),
+    (err) => err.code === 'BOARD_BAD_FIELD' && /mandate\.basis/.test(err.message),
+  )
+})
+
+test('2026-11-09：mandate 空对象被拒（至少给一条依据）', (t) => {
+  const { board } = setup(t)
+  assert.throws(
+    () => board.create({ subject: 'S', byId: 'lead', mandate: {} }),
+    (err) => err.code === 'BOARD_BAD_FIELD' && /不能是空对象/.test(err.message),
+  )
+})
+
+test('2026-11-09：mandate.sender 空白被拒', (t) => {
+  const { board } = setup(t)
+  assert.throws(
+    () => board.create({ subject: 'S', byId: 'lead', mandate: { sender: '   ' } }),
+    (err) => err.code === 'BOARD_BAD_FIELD' && /sender/.test(err.message),
+  )
+})
+
+test('2026-11-09：set 可更新 mandate（改规则后追溯当时依据）', (t) => {
+  const { board } = setup(t)
+  const a = seed(board, { subject: 'A' })
+  const updated = board.update({
+    id: a.id, expectedRev: 1, action: 'set', byId: 'ui',
+    mandate: { basis: 'room', sender: 'memory-evolve' },
+  })
+  assert.equal(updated.mandate.basis, 'room')
+  assert.equal(updated.mandate.sender, 'memory-evolve')
+})
+
+// ── 2026-11-09：改造07 写入侧缺口修复 ──────────────────────────────────────
+// `src/stage.js`（改造07）的「已完成且已验收 → idle」读 `task.accepted`，
+// 但 `board.accept()` **从未写过这个字段**（只写 `acceptance`）⇒ 该分支永不触发，
+// 验收通过的任务永远显示「等你验收」。下面的用例用 **deriveStage 的真实输出**
+// 做证据，而不是只断言字段存在。
+
+test('2026-11-09：accept/pass 写 accepted=true，deriveStage 从 person/review 转 idle', async (t) => {
+  const { deriveStage } = await import('../src/stage.js')
+  const { board } = setup(t)
+  const a = seed(board, { subject: 'A' })
+  const done = board.update({ id: a.id, expectedRev: 1, action: 'complete', byId: 'bot', artifacts: ['x'] })
+  assert.equal(deriveStage(done).stage, 'person/review', '交付后应等人验收')
+
+  const passed = board.accept({ id: a.id, by: 'ui', result: 'pass' })
+  assert.equal(passed.accepted, true)
+  assert.equal(passed.acceptance.result, 'pass')
+  assert.equal(deriveStage(passed).stage, 'idle', '验收通过后阶段必须离开 person/review')
+  assert.equal(deriveStage(passed).needsPerson, false)
+})
+
+test('2026-11-09：accept/reject 清 accepted，deriveStage 回到 working/queued', async (t) => {
+  const { deriveStage } = await import('../src/stage.js')
+  const { board } = setup(t)
+  const a = seed(board, { subject: 'A' })
+  const done = board.update({ id: a.id, expectedRev: 1, action: 'complete', byId: 'bot', artifacts: ['x'] })
+  const passed = board.accept({ id: a.id, by: 'ui', result: 'pass' })
+  assert.equal(deriveStage(passed).stage, 'idle')
+
+  const rejected = board.accept({ id: a.id, by: 'ui', result: 'reject', note: '重做' })
+  assert.equal(rejected.accepted, undefined, '驳回后不得残留 accepted=true')
+  assert.equal(rejected.acceptance.result, 'reject')
+  assert.equal(deriveStage(rejected).stage, 'working/queued', '打回 pending 且无 owner ⇒ 排队等接活')
+})
+
+test('2026-11-09：complete 清 accepted（重开后重新验收不继承旧结论）', (t) => {
+  const { board } = setup(t)
+  const a = seed(board, { subject: 'A' })
+  board.update({ id: a.id, expectedRev: 1, action: 'complete', byId: 'bot', artifacts: ['x'] })
+  const passed = board.accept({ id: a.id, by: 'ui', result: 'pass' })
+  assert.equal(passed.accepted, true)
+  // reopen → 重做 → 再次 complete，此时 accepted 必须是 undefined（等新一轮验收）
+  const reopened = board.update({ id: a.id, expectedRev: passed.rev, action: 'reopen', byId: 'ui' })
+  const claimed = board.update({ id: a.id, expectedRev: reopened.rev, action: 'claim', byId: 'bot' })
+  const redone = board.update({ id: a.id, expectedRev: claimed.rev, action: 'complete', byId: 'bot', artifacts: ['y'] })
+  assert.equal(redone.accepted, undefined, '新一轮交付不得继承上一轮的 accepted=true')
+  assert.equal(redone.acceptance, undefined)
+})
+
+// ── 2026-11-09：并发槽位（⑤ · 借鉴 superagent WorkerSlots 的人优先原则）────────
+// superagent（src/executor/dsh.ts:171-199）的硬纪律：`by === 'person'` 时额外给一个槽位，
+// 官方注释「New work therefore cannot prevent a person from continuing an existing Ticket」。
+// 上限是给**自动化流量**设的闸，不是用来拒绝人的。
+
+test('2026-11-09：WIP 上限下，机器人不能再领，人多一个槽位', (t) => {
+  const { board } = setup(t, { wipLimitPerBot: 1 })
+  const a = seed(board, { subject: 'A' })
+  const b = seed(board, { subject: 'B' })
+  const c = seed(board, { subject: 'C' })
+  const d = seed(board, { subject: 'D' })
+
+  // 机器人领满 1 个
+  const claimed = board.update({ id: a.id, expectedRev: 1, action: 'claim', byId: 'bot' })
+  assert.equal(claimed.ownerId, 'bot')
+
+  // 机器人再领 → 拒（机器人上限 = 1）
+  assert.throws(
+    () => board.update({ id: b.id, expectedRev: 1, action: 'claim', byId: 'bot' }),
+    (err) => err.code === 'BOARD_WIP_EXCEEDED' && err.details?.botId === 'bot',
+  )
+
+  // 人领 → 人上限 = 基础 1 + 额外 1 = 2，当前 0 ⇒ 允许
+  const personClaim = board.update({ id: b.id, expectedRev: 1, action: 'claim', byId: 'person' })
+  assert.equal(personClaim.ownerId, 'person')
+  assert.equal(personClaim.lease.ownerId, 'person')
+
+  // 人领到第 2 个（人上限 2）⇒ 仍允许
+  const personClaim2 = board.update({ id: c.id, expectedRev: 1, action: 'claim', byId: 'person' })
+  assert.equal(personClaim2.ownerId, 'person')
+
+  // 人领第 3 个 → 超（人上限 2）⇒ 拒
+  assert.throws(
+    () => board.update({ id: d.id, expectedRev: 1, action: 'claim', byId: 'person' }),
+    (err) => err.code === 'BOARD_WIP_EXCEEDED' && err.details?.personBonus === true,
+  )
+})
+
+test('2026-11-09：WIP 报文里带人优先的依据（limit 与 baseLimit 区分）', (t) => {
+  const { board } = setup(t, { wipLimitPerBot: 1 })
+  const a = seed(board, { subject: 'A' })
+  const b = seed(board, { subject: 'B' })
+  board.update({ id: a.id, expectedRev: 1, action: 'claim', byId: 'bot' })
+  let err
+  try {
+    board.update({ id: b.id, expectedRev: 1, action: 'claim', byId: 'bot' })
+  } catch (e) { err = e }
+  assert.equal(err.code, 'BOARD_WIP_EXCEEDED')
+  assert.equal(err.details.limit, 1, '机器人上限 = 基础上限')
+  assert.equal(err.details.baseLimit, 1)
+  assert.equal(err.details.personBonus, false)
+  assert.equal(err.details.current, 1)
+})

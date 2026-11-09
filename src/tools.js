@@ -105,6 +105,17 @@ const DEFS = [
         cycle: { type: 'string', description: '周期名（PDCA 复盘周期标识）' },
         milestone: { type: 'string', description: '里程碑名' },
         estimate: { type: 'number', description: '预估工作量（≥0）' },
+        mandateBasis: {
+          type: 'string',
+          enum: ['explicit', 'inferred', 'task-board', 'room', 'cycle'],
+          description:
+            '授权依据（借鉴 superagent Mandate）：explicit=人明确点名要做 / inferred=按规则推断 / '
+            + 'task-board=任务板派发 / room=房间里的指令 / cycle=周期复盘产物。不传则不记 basis。',
+        },
+        mandateSender: {
+          type: 'string',
+          description: '谁下的令（人/会话/Bot 标识）。不传时记录调用者 byId —— 那是事实，不是推断。',
+        },
       },
       required: ['subject'],
       additionalProperties: false,
@@ -112,7 +123,19 @@ const DEFS = [
     run: (s, a, exec) => {
       if (!s.board) return failure('board-unavailable', { hint: '任务板未装配（状态目录不可写？）' })
       try {
-        return success({ task: s.board.create({ ...a, byId: callerOf(exec) }) })
+        // `mandateBasis`/`mandateSender` 是扁平参数（模型友好），落到 board 时
+        // 组装成 `mandate` 对象 —— 校验在 board 侧统一做（未知键会被拒）。
+        const { mandateBasis, mandateSender, ...rest } = a ?? {}
+        const mandate = {}
+        if (mandateBasis !== undefined && mandateBasis !== null) mandate.basis = mandateBasis
+        if (mandateSender !== undefined && mandateSender !== null) mandate.sender = mandateSender
+        return success({
+          task: s.board.create({
+            ...rest,
+            byId: callerOf(exec),
+            ...(Object.keys(mandate).length > 0 ? { mandate } : {}),
+          }),
+        })
       } catch (error) {
         return failure(error?.code ?? 'create-failed', { message: error?.message ?? String(error) })
       }
@@ -152,7 +175,9 @@ const DEFS = [
     description:
       '推进任务状态（CAS：必须带当前 expectedRev，不匹配会被拒，绝不静默覆盖）。' +
       'action: claim=取租约并置 in_progress / heartbeat=续租 / release=放租约回 pending / ' +
-      'complete=完成（**必须带非空 artifacts**）/ reopen=重开 / block / unblock / delete=tombstone / set=改字段。',
+      'complete=完成（**必须带非空 artifacts**）/ reopen=重开 / block / unblock / delete=tombstone / set=改字段。' +
+      '结构化收尾：complete 可带 outcome=ready|dropped 与 humanAction（一句话要人做什么）；' +
+      'block 可带 outcome=blocked|failed 与 humanAction。',
     parameters: {
       type: 'object',
       properties: {
@@ -164,6 +189,18 @@ const DEFS = [
         },
         artifacts: { type: 'array', items: { type: 'string' }, description: 'complete 必填：交付物路径' },
         reason: { type: 'string', description: 'block 的原因' },
+        outcome: {
+          type: 'string',
+          enum: ['ready', 'blocked', 'failed', 'dropped'],
+          description:
+            '收尾结论（借鉴 superagent Report 枚举）：complete 用 ready（默认，等人验收）或 dropped（无需人处理）；'
+            + 'block 用 blocked（默认）或 failed（这条路走不通）。传错组合会被拒并指路。',
+        },
+        humanAction: {
+          type: 'string',
+          description:
+            '一句话说清要人具体做什么（≤1000 字符）；block 时建议必填 —— 它显示在「待你决定」列表里。',
+        },
         subject: { type: 'string' },
         description: { type: 'string' },
         priority: { type: 'number' },

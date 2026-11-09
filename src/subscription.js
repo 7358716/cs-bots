@@ -43,6 +43,7 @@
  */
 
 import { appendJsonl, readJsonl, readJson, writeJsonAtomic, ensureDir, statePath } from './store.js'
+import { decideAdmission, ADMISSIONS, DEFAULT_ACCEPT_MODE, ACCEPT_MODES } from './admission.js'
 
 let kernel = null
 let kernelError = null
@@ -57,6 +58,9 @@ export const SUB_STATES = Object.freeze(['active', 'active_stopped', 'dropped'])
 
 /** 事件动作集合。 */
 const ACTIONS = ['subscribe', 'unsubscribe', 'fanout', 'drop']
+
+/** 订阅上可配置的准入字段（改造09）。 */
+const ADMISSION_FIELDS = ['acceptMode', 'rules', 'receivesEveryMessage']
 
 /** 缺省配置。 */
 const DEFAULTS = Object.freeze({
@@ -274,6 +278,27 @@ export function createSubscription(ctx, config = {}) {
   // ── 写 ────────────────────────────────────────────────────────────────────
 
   /**
+   * 归一化订阅上的准入配置（改造09）。
+   *
+   * 只认白名单字段 —— 未知字段一律不写，与 board 的「绝不发明字段」同口径。
+   * 非法模式值退回缺省 `observe`（**绝不退回 `auto`**：那等于偷偷放权）。
+   *
+   * @param {object} input
+   * @returns {{ acceptMode: string, rules?: object[], receivesEveryMessage?: boolean }}
+   */
+  function normalizeAdmission(input) {
+    const out = { acceptMode: DEFAULT_ACCEPT_MODE }
+    const mode = input && typeof input === 'object' ? input.acceptMode : undefined
+    if (ACCEPT_MODES.includes(mode)) out.acceptMode = mode
+    if (Array.isArray(input?.rules)) out.rules = input.rules
+    // ⚠️ 房间订阅缺省 `receivesEveryMessage: true` —— 房间是群聊，
+    //    成员本来就**看到所有消息**。这不是放权，而是对事实的承认：
+    //    在群聊里「没点名」不等于「与我无关」。`false` 用于「只收点名」的场景。
+    out.receivesEveryMessage = input?.receivesEveryMessage !== false
+    return out
+  }
+
+  /**
    * 订阅：让任务接收某个房间的后续消息。
    *
    * **幂等**：同一 (taskId, roomId) 已有活订阅时，直接返回既有记录
@@ -317,6 +342,11 @@ export function createSubscription(ctx, config = {}) {
       updatedBy: author,
     }
     if (n !== undefined) sub.note = n
+    // 改造09：订阅自带准入配置（缺省 observe —— 最保守的一档）
+    const adm = normalizeAdmission(input)
+    sub.acceptMode = adm.acceptMode
+    if (adm.rules !== undefined) sub.rules = adm.rules
+    if (adm.receivesEveryMessage !== undefined) sub.receivesEveryMessage = adm.receivesEveryMessage
     commit('subscribe', at, author, null, sub)
     info(`[cs-bots/subscription] ${id}：任务 ${tId} 订阅房间 ${rId}`)
     return clone(sub)
@@ -379,12 +409,34 @@ export function createSubscription(ctx, config = {}) {
     let failed = 0
 
     for (const s of targets) {
+      // ── 改造09：Gate 判定（确定性、可审计）────────────────────────────
+      // superagent 把准入拆成 Gate + Assessment：Gate 判「是不是候选 / 明确请求」，
+      // 只有放行的才进上下文并唤醒。忽略掉的连上下文都不记（省 token、省打扰）。
+      const gate = decideAdmission({
+        message,
+        recipientId: s.taskId,
+        subscribed: s.state === 'active',
+        subscriptionState: s.state,
+        acceptMode: s.acceptMode,
+        rules: s.rules,
+        receivesEveryMessage: s.receivesEveryMessage !== false,
+      })
+
+      if (gate.admission === ADMISSIONS.IGNORE) {
+        details.push({
+          subId: s.id, taskId: s.taskId, ok: true, woke: false, admitted: false,
+          admission: gate.admission, decidedBy: gate.decidedBy, reason: gate.reason,
+        })
+        continue // 不记上下文 —— 不相关的消息不该占用执行者的上下文窗口
+      }
+
       const entry = {
         from: message.from ?? '?',
         seq: message.seq ?? null,
         text: typeof message.text === 'string' ? message.text.slice(0, 2000) : '',
         at: message.at ?? at,
         messageId: message.id ?? null,
+        admission: gate.admission, // 记下它是 explicit 还是 inferred（审计 / 评估用）
       }
       const next = clone(s)
       next.rev = s.rev + 1
@@ -404,22 +456,23 @@ export function createSubscription(ctx, config = {}) {
         continue
       }
 
-      // 可选唤醒（默认关）：上下文到达不等于要打扰执行者
-      if (shouldWake) {
+      // 唤醒 = 「全局开关允许」(shouldWake) AND 「这条消息是明确要你」(explicit)。
+      // 二者是 AND 而非替代：一个说「这次允许唤醒」，一个说「这条值得唤醒」。
+      // 候选（inferred）只记上下文，不打扰 —— 是否动手交给执行者评估。
+      if (shouldWake && gate.admission === ADMISSIONS.EXPLICIT) {
         try {
-          // 通过 dispatcher 发（若可用），否则直接 kernel.followup
-          const text = `[任务上下文] 房间 ${rId} 新消息（${entry.from}）：${entry.text.slice(0, 500)}`
+          const text = `[任务上下文] 房间 ${rId} 新消息（${entry.from}，${gate.admission}）：${entry.text.slice(0, 500)}`
           const wakeResult = await wakeTask(s.taskId, text)
           if (wakeResult.ok) woke += 1
           else { failed += 1; diagnostics.wakeFailures += 1 }
-          details.push({ subId: s.id, taskId: s.taskId, ok: true, woke: wakeResult.ok, wakeReason: wakeResult.reason })
+          details.push({ subId: s.id, taskId: s.taskId, ok: true, woke: wakeResult.ok, admitted: true, admission: gate.admission, wakeReason: wakeResult.reason })
         } catch (error) {
           failed += 1
           diagnostics.wakeFailures += 1
-          details.push({ subId: s.id, taskId: s.taskId, ok: true, woke: false, reason: `wake-failed:${error?.message ?? error}` })
+          details.push({ subId: s.id, taskId: s.taskId, ok: true, woke: false, admitted: true, admission: gate.admission, reason: `wake-failed:${error?.message ?? error}` })
         }
       } else {
-        details.push({ subId: s.id, taskId: s.taskId, ok: true, woke: false })
+        details.push({ subId: s.id, taskId: s.taskId, ok: true, woke: false, admitted: true, admission: gate.admission, decidedBy: gate.decidedBy })
       }
     }
 

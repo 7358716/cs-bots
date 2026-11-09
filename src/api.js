@@ -301,6 +301,8 @@ function buildTaskAnchor(task) {
     progress: task?.progress ?? 0,
     artifacts: normalizeArtifactItems(task?.artifacts),
     createdAt: task?.createdAt,
+    // 授权留痕（改造08）：随锚定文本一起下发给执行者
+    mandate: task?.mandate ?? null,
   }
 }
 
@@ -511,6 +513,44 @@ function evolvePrefixFor(note) {
  * @param {{ phases?: string[] } | string[]} [longrun] 该任务的 longrun 记录（或阶段数组）
  * @returns {string}
  */
+/**
+ * 把 `task.mandate` 翻译成人话（改造08 · 借鉴 superagent Mandate）。
+ *
+ * 三条纪律：
+ *   1. **缺省不编造**：没有 mandate 就返回空数组，绝不说「用户已授权」；
+ *   2. **依据要写清楚**：`explicit`（人明确点名）和 `inferred`（按规则推断）
+ *      对人的意义完全不同，必须能分辨；
+ *   3. **不承诺越权**：明说「超出范围要重新要授权」——
+ *      mandate 是「此刻已被要求什么」，不是「随便干」。
+ *
+ * @param {object|undefined} mandate
+ * @returns {string[]}
+ */
+function describeMandate(mandate) {
+  if (!mandate || typeof mandate !== 'object') return []
+  const lines = []
+  const sender = typeof mandate.sender === 'string' && mandate.sender.trim() ? mandate.sender.trim() : ''
+  const BASIS_TEXT = {
+    explicit: '人明确点名要做（最强 —— 可以直接动手）',
+    inferred: '按规则推断（**推断，动手前先确认**）',
+    'task-board': '任务板派发（管理面正式派活）',
+    room: '房间里的指令',
+    cycle: '周期复盘产物',
+  }
+  const basis = typeof mandate.basis === 'string' ? mandate.basis : ''
+  if (basis && BASIS_TEXT[basis]) {
+    lines.push(`- 依据：${BASIS_TEXT[basis]}`)
+  }
+  if (sender) lines.push(`- 下达者：${sender}`)
+  if (typeof mandate.policyVersion === 'string' && mandate.policyVersion) {
+    lines.push(`- 规则版本：${mandate.policyVersion}`)
+  }
+  if (typeof mandate.scope === 'string' && mandate.scope) {
+    lines.push(`- 范围：${mandate.scope}`)
+  }
+  return lines
+}
+
 function buildTaskAnchorText(task, notes = [], longrun = null) {
   const anchor = buildTaskAnchor(task)
   const desc = typeof anchor.description === 'string' ? anchor.description : ''
@@ -528,6 +568,21 @@ function buildTaskAnchorText(task, notes = [], longrun = null) {
     lines.push('阶段（长任务，按序推进，不得跳步）：')
     phases.forEach((phase, index) => lines.push(`${index + 1}. ${phase}`))
   }
+  // ── 授权留痕（改造08 · 借鉴 superagent Mandate）────────────────────────
+  // 执行者被唤醒时必须知道：**这活是谁批的、凭什么**。
+  // 少了这一行，「我自己猜用户想要」和「用户明确要我干」看起来一模一样 ——
+  // 而那正是失控与越权的分界线。
+  //
+  // ⚠️ 但**没有 basis 就不渲染**：UI 随手建的任务记的是 `{ sender: 'ui' }`，
+  //    那是「谁建的」，不是「谁授权的」。把它渲染成「授权」等于编造授权 ——
+  //    正是这套纪律要防的。只有记录了明确依据（explicit/inferred/task-board…）
+  //    才说明这确实是一份授权。
+  const mandate = anchor.mandate
+  if (mandate && typeof mandate === 'object' && typeof mandate.basis === 'string' && mandate.basis) {
+    lines.push('授权（谁批准的、凭什么 —— 超出此授权范围的新需求要重新要授权）：')
+    lines.push(...describeMandate(mandate))
+  }
+
   lines.push('补充说明（按时间，全部有效，不得忽略）：')
   for (const note of notes) {
     lines.push(`- [${formatAnchorTime(note?.at)}] ${note?.text ?? ''}`)
@@ -1036,8 +1091,20 @@ export function installApi(ctx, { warn } = {}) {
 
       if (request.method === 'POST' && path === '/tasks') {
         const body = (await readBody(request)) ?? {}
+        // `mandateBasis`/`mandateSender` 是扁平参数（HTTP 与工具调用同形），
+        // 落到 board 时组装成 `mandate` 对象 —— 校验在 board 侧统一做。
+        // 与 `src/tools.js` 的 bot_task_create 保持**同一套参数名**，
+        // 否则同一个概念会出现两种形状，调用方必须记两套规则。
+        const { mandateBasis, mandateSender, ...rest } = body
+        const mandate = {}
+        if (mandateBasis !== undefined && mandateBasis !== null) mandate.basis = mandateBasis
+        if (mandateSender !== undefined && mandateSender !== null) mandate.sender = mandateSender
         const task = await withService(services, 'board', (b) =>
-          b.create({ ...body, byId: body.byId ?? 'ui' }),
+          b.create({
+            ...rest,
+            byId: rest.byId ?? 'ui',
+            ...(Object.keys(mandate).length > 0 ? { mandate } : {}),
+          }),
         )
         sendJson(response, 200, { ok: true, task })
         return

@@ -670,3 +670,162 @@ test('改造07 阶段：GET /tasks/summary 带 stageInfo', async () => {
     h.cleanup()
   }
 })
+
+// ── 改造08：HTTP 侧授权留痕（mandateBasis / mandateSender）────────────────────
+// 与工具侧 `bot_task_create` 用**同一套参数名**，否则同一概念两种形状。
+
+test('2026-11-09：POST /tasks 接受 mandateBasis/mandateSender 并落到 mandate', async (t) => {
+  const h = boot()
+  t.after(() => rmSync(h.stateDir, { recursive: true, force: true }))
+
+  const created = await h.req('POST', '/tasks', {
+    subject: '带授权的任务',
+    mandateBasis: 'explicit',
+    mandateSender: 'boss',
+  })
+  assert.equal(created.status, 200)
+  const task = created.json.task
+  assert.equal(task.mandate.basis, 'explicit')
+  assert.equal(task.mandate.sender, 'boss')
+  assert.equal(task.mandateBasis, undefined, '扁平参数不能被当成任务字段存下来')
+})
+
+test('2026-11-09：POST /tasks 不给授权参数时 mandate 只记 sender（不编造 basis）', async (t) => {
+  const h = boot()
+  t.after(() => rmSync(h.stateDir, { recursive: true, force: true }))
+
+  const created = await h.req('POST', '/tasks', { subject: '普通任务' })
+  const task = created.json.task
+  assert.equal(task.mandate.basis, undefined, '没有依据就不能编造依据')
+  assert.equal(typeof task.mandate.sender, 'string')
+  assert.equal(task.mandateSender, undefined)
+})
+
+test('2026-11-09：POST /tasks 传非法 mandateBasis → 400 且带可读原因', async (t) => {
+  const h = boot()
+  t.after(() => rmSync(h.stateDir, { recursive: true, force: true }))
+
+  const res = await h.req('POST', '/tasks', { subject: 'x', mandateBasis: '我猜的' })
+  assert.equal(res.status, 400)
+  assert.match(JSON.stringify(res.json), /mandate\.basis/, '报错要指出是哪个字段')
+})
+
+test('2026-11-09：锚定文案在**有依据**时带授权行（执行者必须知道谁批的）', async (t) => {
+  const h = boot()
+  t.after(() => rmSync(h.stateDir, { recursive: true, force: true }))
+
+  const created = await h.req('POST', '/tasks', {
+    subject: '任务', description: '目标原文',
+    mandateBasis: 'explicit', mandateSender: 'boss',
+  })
+  const id = created.json.task.id
+
+  const brief = await h.req('GET', `/tasks/brief?id=${id}`)
+  assert.equal(brief.status, 200)
+  assert.match(brief.json.text, /授权（谁批准的、凭什么/, '有依据才渲染授权块')
+  assert.match(brief.json.text, /人明确点名要做/, 'explicit 的含义要写清楚')
+  assert.match(brief.json.text, /下达者：boss/, '下达者要写明')
+  assert.match(brief.json.text, /超出此授权范围的新需求要重新要授权/, '不能让执行者以为可以随便干')
+})
+
+test('2026-11-09：🔴 没有依据就不渲染授权块（不编造授权）', async (t) => {
+  const h = boot()
+  t.after(() => rmSync(h.stateDir, { recursive: true, force: true }))
+
+  const created = await h.req('POST', '/tasks', { subject: 'UI 随手建的任务' })
+  const id = created.json.task.id
+  const brief = await h.req('GET', `/tasks/brief?id=${id}`)
+  assert.doesNotMatch(brief.json.text, /授权（谁批准的/, 'UI 建任务记的是「谁建的」，不是「谁授权的」')
+})
+
+test('2026-11-09：inferred 依据要标明「推断，动手前先确认」', async (t) => {
+  const h = boot()
+  t.after(() => rmSync(h.stateDir, { recursive: true, force: true }))
+
+  const created = await h.req('POST', '/tasks', {
+    subject: '推断任务', mandateBasis: 'inferred', mandateSender: 'rule-engine',
+  })
+  const id = created.json.task.id
+  const brief = await h.req('GET', `/tasks/brief?id=${id}`)
+  assert.match(brief.json.text, /按规则推断/)
+  assert.match(brief.json.text, /动手前先确认/)
+})
+
+// ── 改造09：房间发消息 → 订阅扇出，必须经过 Gate ─────────────────────────────
+// 生产路径上的关键纪律：**不相关消息不占执行者的上下文窗口**。
+
+test('2026-11-09：房间消息经 Gate 准入后扇出（未点名 → inferred，记上下文不唤醒）', async (t) => {
+  const h = boot()
+  t.after(() => rmSync(h.stateDir, { recursive: true, force: true }))
+
+  const room = await h.req('POST', '/rooms', { name: '闸门房' })
+  const roomId = room.json.room.id
+  const task = await h.req('POST', '/tasks', { subject: '订阅任务' })
+  const taskId = task.json.task.id
+
+  const sub = await h.req('POST', '/subscriptions', { taskId, roomId })
+  assert.equal(sub.status, 200, JSON.stringify(sub.json))
+  assert.equal(sub.json.sub.acceptMode, 'observe', '缺省最保守的一档')
+
+  // 发一条没点名（且不带 to）的消息 → 候选：记上下文、不唤醒
+  const posted = await h.req('POST', '/rooms/post', { roomId, text: '闲聊一句', from: 'ui' })
+  assert.equal(posted.status, 200, JSON.stringify(posted.json))
+  const detail = posted.json.fanout?.details?.[0]
+  assert.ok(detail, '应有扇出明细')
+  assert.equal(detail.admission, 'inferred')
+  assert.equal(detail.admitted, true)
+  assert.equal(detail.woke, false, '候选不打扰人')
+})
+
+test('2026-11-09：🔴 带 to 定向点名 → explicit（定向发言是最强的点名证据）', async (t) => {
+  const h = boot()
+  t.after(() => rmSync(h.stateDir, { recursive: true, force: true }))
+
+  const room = await h.req('POST', '/rooms', { name: '定向房' })
+  const roomId = room.json.room.id
+  const task = await h.req('POST', '/tasks', { subject: '被点名任务' })
+  const taskId = task.json.task.id
+  await h.req('POST', '/subscriptions', { taskId, roomId })
+
+  const posted = await h.req('POST', '/rooms/post', {
+    roomId, text: '这活归你', from: 'ui', to: taskId,
+  })
+  assert.equal(posted.status, 200, JSON.stringify(posted.json))
+  const detail = posted.json.fanout?.details?.[0]
+  assert.equal(detail.admission, 'explicit', 'gate 认 room.post 的 to 字段')
+  assert.equal(detail.admitted, true)
+})
+
+test('2026-11-09：🔴 acceptMode=off 时房间里未点名的消息连上下文都不记', async (t) => {
+  const h = boot()
+  t.after(() => rmSync(h.stateDir, { recursive: true, force: true }))
+
+  const room = await h.req('POST', '/rooms', { name: '关闸房' })
+  const roomId = room.json.room.id
+  const task = await h.req('POST', '/tasks', { subject: '静默任务' })
+  const taskId = task.json.task.id
+
+  await h.req('POST', '/subscriptions', { taskId, roomId, acceptMode: 'off' })
+  const posted = await h.req('POST', '/rooms/post', { roomId, text: '闲聊', from: 'ui' })
+  const detail = posted.json.fanout?.details?.[0]
+  assert.equal(detail.admission, 'ignore')
+  assert.equal(detail.admitted, false, 'off 下连上下文都不记')
+})
+
+test('2026-11-09：🔴 off 模式下点名仍然准入（三档模式都要放行 explicit）', async (t) => {
+  const h = boot()
+  t.after(() => rmSync(h.stateDir, { recursive: true, force: true }))
+
+  const room = await h.req('POST', '/rooms', { name: '关闸但不聋' })
+  const roomId = room.json.room.id
+  const task = await h.req('POST', '/tasks', { subject: '点名任务' })
+  const taskId = task.json.task.id
+
+  await h.req('POST', '/subscriptions', { taskId, roomId, acceptMode: 'off' })
+  const posted = await h.req('POST', '/rooms/post', {
+    roomId, text: '点名了', from: 'ui', to: taskId,
+  })
+  const detail = posted.json.fanout?.details?.[0]
+  assert.equal(detail.admission, 'explicit', '官方：三档模式下 explicit 都准入')
+  assert.equal(detail.admitted, true)
+})

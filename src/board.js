@@ -89,11 +89,38 @@ const ACCEPT_RESULTS = ['pass', 'reject']
 const DEFAULT_LEASE_MS = 300_000
 /** 复杂度档位（契约 §6 冻结；路由侧 `src/routing/complexity.js` 用同一套字面量）。 */
 const COMPLEXITY_TIERS = ['T0', 'T1', 'T2', 'T3']
+/**
+ * 收尾结论集合 —— 借鉴 `dsh-superagent-prototype` 的 Report 枚举
+ * （docs/001：`progress | waiting | ready | blocked | failed | dropped`）。
+ *
+ * 我们只保留**收尾时才有意义**的四档，且与自家 5 态机一一对应：
+ *   - `ready`   —— 干完了，等人验收 ⇒ `complete` 默认值（status=completed）
+ *   - `blocked` —— 卡住了，要人决策 ⇒ 必须走 `block`（status=blocked）
+ *   - `failed`  —— 干不成（不是卡住，是失败）⇒ 必须走 `block`（同上，
+ *                  用 `outcome:'failed'` 区分「不是等人解锁，是这条路走不通」）
+ *   - `dropped` —— 结论是「不需要人做任何事」⇒ `complete` 可用（status=completed），
+ *                  面板不把它计入「待你决定」
+ *
+ * **为什么不给 `complete` 开 `blocked`/`failed`**：我们的 `complete` 会置
+ * `status='completed'`，而「卡住/失败」的任务不该出现在「待验收」里 —— 那会让人
+ * 以为有东西可验收。宁可让它报错并指路 `block`，也不接受一个语义矛盾的收尾。
+ */
+const OUTCOMES = ['ready', 'blocked', 'failed', 'dropped']
+/** `complete` 允许直接使用的收尾结论（其余必须走 `block`）。 */
+const COMPLETE_OUTCOMES = ['ready', 'dropped']
+/** `humanAction` 上限 —— 对齐 superagent 的 `human_action` ≤1000 字符（docs/003）。 */
+const MAX_HUMAN_ACTION = 1000
 /** 字段补丁允许改的字段（**不含 status**，见文件头不变量 3）。 */
 const PATCH_FIELDS = [
   'subject', 'description', 'blockedBy', 'writeScopes', 'priority', 'dueAt',
   // 复杂度路由标注（2026-11-04 新增，契约 §6）—— 见文件头「路由标签」说明
   'expectedComplexity', 'requiresPaid',
+  // 结构化收尾（2026-11-09 新增，借鉴 superagent 的 Report 枚举）：
+  // `outcome`/`humanAction` 是**入参**（complete/block 时消费），落盘到
+  // `latestReport`（`src/stage.js` 读的字段）。它们也允许出现在 `edit`/`set`
+  // 的补丁里（比如执行中改口「我要你决定 X」），由 applyNewFields 统一落到
+  // latestReport —— **不产生第二个顶层字段**。
+  'outcome', 'humanAction',
   // P0-B 新增可选字段
   'labels', 'milestone', 'cycle', 'estimate', 'assignee', 'reviewer',
   'startedAt', 'completedAt', 'archivedAt', 'triaged', 'progress',
@@ -102,6 +129,14 @@ const PATCH_FIELDS = [
 const NEW_FIELD_NAMES = [
   'labels', 'milestone', 'cycle', 'estimate', 'assignee', 'reviewer',
   'startedAt', 'completedAt', 'archivedAt', 'triaged', 'progress',
+  // 结构化收尾（2026-11-09）：与 PATCH_FIELDS 同步，否则 `set` 会拒这两个字段。
+  // 落盘目标是 `latestReport`（stage.js 的唯一真相），不是顶层字段。
+  'outcome', 'humanAction',
+  // Mandate 授权留痕（2026-11-09，借鉴 superagent docs/001）：
+  // `mandate.basis` 记「这条活的授权依据」—— explicit（人明确点名）/ inferred（规则推断）
+  // / task-board（任务板派发）/ room（房间指令）；`mandate.sender` 记谁下的令；
+  // `mandate.policyVersion` 记规则版本，供「改规则后追溯当时依据」用。
+  'mandate',
 ]
 /** 事件动作集合。 */
 const ACTIONS = ['create', 'edit', 'claim', 'release', 'heartbeat', 'complete', 'reopen', 'block', 'unblock', 'set', 'delete', 'accept', 'lease_expired', 'triage']
@@ -385,6 +420,133 @@ function normalizeTriaged(value, where) {
     )
   }
   return value
+}
+
+/**
+ * 收尾结论归一：必须是 `OUTCOMES` 之一（借鉴 superagent Report 枚举）。
+ *
+ * 不在集合内 → 抛错，**不静默取默认**。理由：`outcome` 是 `stage.js` 派生
+ * 「待验收/待你决定」的唯一依据，猜一个默认值会把「失败」显示成「待验收」，
+ * 或反过来。宁可拒绝，也不接受语义错误的收尾。
+ */
+function normalizeOutcome(value, where) {
+  if (value === undefined || value === null) return undefined
+  if (typeof value !== 'string') {
+    throw new BoardError(
+      `board.${where}：字段 outcome 类型错误（要求字符串，收到 ${JSON.stringify(value)}）`,
+      'BOARD_BAD_FIELD', { field: 'outcome', where },
+    )
+  }
+  if (!OUTCOMES.includes(value)) {
+    throw new BoardError(
+      `board.${where}：outcome 必须是 ${OUTCOMES.join(' | ')}，收到 ${JSON.stringify(value)}`,
+      'BOARD_BAD_FIELD', { field: 'outcome', where },
+    )
+  }
+  return value
+}
+
+/**
+ * `humanAction` 归一：**一句话、必填于需要人决策时、≤ `MAX_HUMAN_ACTION` 字符**。
+ *
+ * 对齐 superagent 的 `human_action`（docs/003：≤1000 字符，「一句话说清要人做什么」）。
+ * 它是「待你决定」列表的标题来源，所以必须是**一句话**，不是一段报告。
+ *
+ * 只校验「传了就必须是干净字符串」；是否**该**传由调用方（complete/block 的语义）
+ * 决定，不在这里猜 —— 但空串会被 `complete`/`block` 拒绝（见对应 case）。
+ */
+function normalizeHumanAction(value, where) {
+  if (value === undefined || value === null) return undefined
+  if (typeof value !== 'string') {
+    throw new BoardError(
+      `board.${where}：字段 humanAction 类型错误（要求字符串，收到 ${JSON.stringify(value)}）`,
+      'BOARD_BAD_FIELD', { field: 'humanAction', where },
+    )
+  }
+  if (value.length > MAX_HUMAN_ACTION) {
+    throw new BoardError(
+      `board.${where}：字段 humanAction 超长（≤${MAX_HUMAN_ACTION} 字符，收到 ${value.length}）—— `
+      + '它要当「待你决定」列表的标题，请压缩成一句话',
+      'BOARD_BAD_FIELD', { field: 'humanAction', where },
+    )
+  }
+  return value
+}
+
+/**
+ * Mandate 授权留痕归一（借鉴 superagent docs/001 §Mandate）。
+ *
+ * 只接受 `{ basis, sender, policyVersion }` 三个字段，且 `basis` 必须在
+ * `MANDATE_BASES` 内；**多余的键直接拒绝**，不静默忽略 —— Mandate 是「这条活
+ * 凭什么能做」的唯一证据，多一个字段就意味着多一种「当时没记清」的可能。
+ *
+ * 其中 `sender`（谁下的令）必填且非空；`policyVersion` 可选（缺省 null）。
+ */
+const MANDATE_BASES = ['explicit', 'inferred', 'task-board', 'room', 'cycle']
+/**
+ * Mandate 的合法字段集合。
+ * 「谁下令」（sender）必填，其余可选；`basis` 的语义见 `MANDATE_BASES`。
+ */
+const MANDATE_FIELDS = ['basis', 'sender', 'policyVersion', 'scope']
+
+function normalizeMandate(value, where) {
+  if (value === undefined || value === null) return undefined
+  if (typeof value !== 'object' || Array.isArray(value)) {
+    throw new BoardError(
+      `board.${where}：字段 mandate 类型错误（要求对象，收到 ${JSON.stringify(value)}）`,
+      'BOARD_BAD_FIELD', { field: 'mandate', where },
+    )
+  }
+  const unknown = Object.keys(value).filter((k) => !MANDATE_FIELDS.includes(k))
+  if (unknown.length > 0) {
+    throw new BoardError(
+      `board.${where}：mandate 含未知字段 ${unknown.join(', ')}（合法：${MANDATE_FIELDS.join(' | ')}）—— `
+      + '拒绝静默忽略，Mandate 是授权依据，多一个字段就多一处说不清',
+      'BOARD_BAD_FIELD', { field: 'mandate', where, unknown },
+    )
+  }
+  const out = { ...value }
+  if (out.basis !== undefined && out.basis !== null) {
+    if (typeof out.basis !== 'string' || !MANDATE_BASES.includes(out.basis)) {
+      throw new BoardError(
+        `board.${where}：mandate.basis 必须是 ${MANDATE_BASES.join(' | ')}，收到 ${JSON.stringify(out.basis)}`,
+        'BOARD_BAD_FIELD', { field: 'mandate.basis', where },
+      )
+    }
+  }
+  if (out.sender !== undefined && out.sender !== null) {
+    if (typeof out.sender !== 'string' || out.sender.trim() === '') {
+      throw new BoardError(
+        `board.${where}：mandate.sender 必须是非空字符串（谁下的令）—— 收到 ${JSON.stringify(out.sender)}`,
+        'BOARD_BAD_FIELD', { field: 'mandate.sender', where },
+      )
+    }
+    out.sender = out.sender.trim()
+  }
+  if (out.policyVersion !== undefined && out.policyVersion !== null) {
+    if (typeof out.policyVersion !== 'string') {
+      throw new BoardError(
+        `board.${where}：mandate.policyVersion 类型错误（要求字符串，收到 ${JSON.stringify(out.policyVersion)}）`,
+        'BOARD_BAD_FIELD', { field: 'mandate.policyVersion', where },
+      )
+    }
+  }
+  if (out.scope !== undefined && out.scope !== null) {
+    if (typeof out.scope !== 'string') {
+      throw new BoardError(
+        `board.${where}：mandate.scope 类型错误（要求字符串，收到 ${JSON.stringify(out.scope)}）`,
+        'BOARD_BAD_FIELD', { field: 'mandate.scope', where },
+      )
+    }
+  }
+  // 至少要留下一条依据 —— 否则 Mandate 是空壳，等于没记
+  if (out.basis === undefined && out.sender === undefined && out.policyVersion === undefined && out.scope === undefined) {
+    throw new BoardError(
+      `board.${where}：mandate 不能是空对象（至少给 basis 或 sender）`,
+      'BOARD_BAD_FIELD', { field: 'mandate', where },
+    )
+  }
+  return out
 }
 
 
@@ -739,6 +901,9 @@ export function createBoard(ctx, config = {}) {
     if (task.priority !== undefined && task.priority >= 8) return true
     if (task.dueAt && task.status !== 'completed' && task.dueAt < Date.now()) return true
     if (task.status === 'completed' && task.accepted !== true) return true
+    // 结构化「待你回答」：latestReport.attention 存在 ⇒ 执行者明确在等人
+    // （2026-11-09：与 stage.js 的 person/answer 判定同一依据，不另起字段）
+    if (task.latestReport?.attention) return true
     if (mySession && task.createdBy === mySession && !['completed', 'deleted'].includes(task.status)) return true
     return false
   }
@@ -830,6 +995,7 @@ export function createBoard(ctx, config = {}) {
       subject, description, blockedBy, writeScopes, priority, dueAt, byId, sourceSeq, now,
       expectedComplexity, requiresPaid, source,
       labels, milestone, cycle, estimate, assignee, reviewer, progress, triaged,
+      mandate,
     } = input ?? {}
     const by = requireString(byId, 'byId', 'create')
     // 来源判定：显式传了 source 就采信；否则按 byId 推断
@@ -857,6 +1023,8 @@ export function createBoard(ctx, config = {}) {
     const reviewerNorm = normalizeOptionalString(reviewer, 'reviewer', 'create')
     const progressNorm = normalizeProgress(progress, 'create')
     const triagedNorm = normalizeTriaged(triaged, 'create')
+    // Mandate 授权留痕（可选；不给就是「未记录依据」，不伪造一个）
+    const mandateNorm = normalizeMandate(mandate, 'create')
 
     // ── 幂等（校验全部通过后再判定，避免校验失败污染幂等键）──
     if (seq !== undefined) {
@@ -910,6 +1078,8 @@ export function createBoard(ctx, config = {}) {
     if (reviewerNorm !== undefined) task.reviewer = reviewerNorm
     if (progressNorm !== undefined) task.progress = progressNorm
     if (triagedNorm !== undefined) task.triaged = triagedNorm
+    if (mandateNorm !== undefined) task.mandate = mandateNorm
+    else task.mandate = { sender: by } // 事实留痕：谁建的（`byId`），不是判断
 
     idCounter = nextCounter
     try {
@@ -1002,6 +1172,27 @@ export function createBoard(ctx, config = {}) {
       if (src.startedAt !== undefined) setOrDelete('startedAt', optionalNumber(src.startedAt, 'startedAt', where))
       if (src.completedAt !== undefined) setOrDelete('completedAt', optionalNumber(src.completedAt, 'completedAt', where))
       if (src.archivedAt !== undefined) setOrDelete('archivedAt', optionalNumber(src.archivedAt, 'archivedAt', where))
+      // 结构化收尾（2026-11-09）：`outcome`/`humanAction` 是**入参**，
+      // 落盘目标是 `latestReport`（stage.js 的唯一真相），**不新增顶层字段**。
+      // `null` 表示「清除报告」（等价于 `delete latestReport`）—— 与 `setOrDelete`
+      // 的既有约定一致；stage.js 读不到就用保守值，干净。
+      if (src.outcome !== undefined) {
+        if (src.outcome === null) {
+          if (nextTask.latestReport) delete nextTask.latestReport.state
+        } else {
+          if (nextTask.latestReport === undefined) nextTask.latestReport = {}
+          nextTask.latestReport.state = normalizeOutcome(src.outcome, where)
+        }
+      }
+      if (src.humanAction !== undefined) {
+        if (src.humanAction === null) {
+          if (nextTask.latestReport) delete nextTask.latestReport.attention
+        } else {
+          if (nextTask.latestReport === undefined) nextTask.latestReport = {}
+          nextTask.latestReport.attention = { question: normalizeHumanAction(src.humanAction, where) }
+        }
+      }
+      if (src.mandate !== undefined) setOrDelete('mandate', normalizeMandate(src.mandate, where))
     }
 
     /** 把（可选）路由标签落到 next 上；`null` = 清除该标注。@param {object} nextTask */
@@ -1106,15 +1297,26 @@ export function createBoard(ctx, config = {}) {
           }
         }
         // WIP 上限（P0-B §2）：同 bot 名下 in_progress 任务数 >= 上限 → 拒
+        //
+        // ⚠️ 借自 superagent 的一条硬纪律（src/executor/dsh.ts:171-199）：
+        //   `by === 'person'` 时**额外给一个槽位** —— 官方注释是
+        //   「New work therefore cannot prevent a person from continuing an existing Ticket」。
+        //   人手动接活不能被机器人的排队上限挡住：上限是给自动化流量设的闸，
+        //   不是用来拒绝人。所以人的有效上限 = wipLimitPerBot + 1。
         const wipActive = [...tasks.values()].filter(
           (t) => t.status === 'in_progress' && t.ownerId === by,
         )
-        if (wipActive.length >= wipLimitPerBot) {
+        const isPerson = by === 'person'
+        const effectiveWipLimit = wipLimitPerBot + (isPerson ? 1 : 0)
+        if (wipActive.length >= effectiveWipLimit) {
           throw new BoardError(
-            `board.claim：WIP 超限 —— bot ${by} 当前在 ${wipActive.length} 个 in_progress 任务上（上限 ${wipLimitPerBot}），`
+            `board.claim：WIP 超限 —— bot ${by} 当前在 ${wipActive.length} 个 in_progress 任务上（上限 ${effectiveWipLimit}），`
             + `拒绝再领 ${taskId}`,
             'BOARD_WIP_EXCEEDED',
-            { botId: by, limit: wipLimitPerBot, current: wipActive.length, taskId },
+            {
+              botId: by, limit: effectiveWipLimit, baseLimit: wipLimitPerBot,
+              personBonus: isPerson, current: wipActive.length, taskId,
+            },
           )
         }
         next.status = 'in_progress'
@@ -1198,12 +1400,49 @@ export function createBoard(ctx, config = {}) {
             { id: taskId, ownerId: current.lease.ownerId },
           )
         }
+        // ── 结构化收尾（2026-11-09，借鉴 superagent Report 枚举）──────────────
+        // 落到 `latestReport`（**单一真相**），而不是另开顶层 `outcome` 字段 ——
+        // `src/stage.js` 的 8 阶段分类器读的就是 `latestReport.state` / `latestReport.attention`，
+        // 若这里写另一个字段名，阶段表永远派不出「等你验收/等你回答」。
+        //
+        // 顺序纪律（与 stage.js 同构）：complete 时**不要**带 attention ——
+        // attention 的优先级高于 `ready`（stage 顺序：answer > review），
+        // 带 attention 会把「待验收」显示成「等你回答」，语义就错了。
+        const rawOutcome = fields.outcome
+        const outcomeNorm = normalizeOutcome(rawOutcome, 'complete')
+        if (outcomeNorm !== undefined && !COMPLETE_OUTCOMES.includes(outcomeNorm)) {
+          throw new BoardError(
+            `board.complete：outcome=${JSON.stringify(outcomeNorm)} 不能用 complete 交付 —— `
+            + `「卡住/失败」的任务不该出现在「待验收」里（那是 ready/dropped 的语义）。请改用 board.update block。`,
+            'BOARD_BAD_FIELD',
+            { id: taskId, outcome: outcomeNorm, allowed: COMPLETE_OUTCOMES },
+          )
+        }
+        const humanActionNorm = normalizeHumanAction(fields.humanAction, 'complete')
+        if (humanActionNorm !== undefined) {
+          throw new BoardError(
+            `board.complete：complete 不接受 humanAction（${JSON.stringify(humanActionNorm)}）—— `
+            + '完成就是「等人验收」，不是「等人回答」；要提问请用 block 或 edit。'
+            + '（否则 stage 会把「待验收」误判成「等你回答」）',
+            'BOARD_BAD_FIELD', { id: taskId, field: 'humanAction' },
+          )
+        }
+
         next.artifacts = normalizeArtifacts(artifacts, taskId)
         next.status = 'completed'
         next.completedAt = at
         next.ownerId = current.ownerId ?? by
+        // `ready` = 干完了等人验收（默认）；`dropped` = 结论是「不需要人做任何事」。
+        // 两者都合法，但面板含义完全不同：前者进「待验收」，后者直接归档不显示。
+        // 缺省取 `ready` —— 一个 completed 任务不该默默变成「无需验收」。
+        next.latestReport = {
+          state: outcomeNorm ?? 'ready',
+          at,
+          reporter: by,
+        }
         delete next.lease
         delete next.acceptance // 完成即待验收，旧的验收结论作废（历史在事件流里）
+        delete next.accepted // `accepted` 与 `acceptance` 同生同灭，必须一起清
         break
       }
 
@@ -1223,6 +1462,8 @@ export function createBoard(ctx, config = {}) {
         delete next.completedAt
         delete next.artifacts
         delete next.blockedReason
+        // 重开 = 一切收尾结论作废（旧结论在事件流的 before 里留档）
+        delete next.latestReport
         break
       }
 
@@ -1242,6 +1483,44 @@ export function createBoard(ctx, config = {}) {
         if (blockReason !== undefined && blockReason !== null && String(blockReason) !== '') {
           next.blockedReason = String(blockReason)
         }
+        // ── 结构化「要人做什么」（2026-11-09）──────────────────────────────
+        // 落到 `latestReport`（与 stage.js 共用同一真相）：
+        //   state = blocked | failed  ⇒ stage 派 `person/blocked` / `person/failed`
+        //   attention.question       ⇒ 若给了 humanAction，stage 会优先派 `person/answer`
+        //
+        // ⚠️ 顺序陷阱：stage.js 里 `answer` 的优先级**高于** `blocked`。
+        //   所以「blocked + 带 attention」会显示成「等你回答」而不是「受阻等你」。
+        //   这其实是对的语义 —— 如果执行者能说清「我要你做什么」，那就是在等你回答；
+        //   说不出（只 report blocked）才落到「受阻等你」。两者都指向「该人动手」。
+        const blockOutcome = normalizeOutcome(fields.outcome, 'block')
+        if (blockOutcome !== undefined && !['blocked', 'failed'].includes(blockOutcome)) {
+          throw new BoardError(
+            `board.block：outcome 只能是 blocked | failed，收到 ${JSON.stringify(blockOutcome)}`
+            + '（ready/dropped 请用 complete）',
+            'BOARD_BAD_FIELD', { id: taskId, outcome: blockOutcome },
+          )
+        }
+        const blockHumanAction = normalizeHumanAction(fields.humanAction, 'block')
+        if (blockHumanAction !== undefined && String(blockHumanAction).trim() === '') {
+          throw new BoardError(
+            `board.block：humanAction 不能是空白 —— 要么写清要人做什么，要么不传`,
+            'BOARD_BAD_FIELD', { id: taskId, field: 'humanAction' },
+          )
+        }
+        /** @type {Record<string, unknown>} */
+        const blockReport = {
+          state: blockOutcome ?? 'blocked',
+          at,
+          reporter: by,
+        }
+        // attention 只在**明确给了 humanAction** 时才写 —— 绝不用 blockedReason
+        // 冒充「问题」。理由：blockedReason 是「为什么卡住」（给人看的诊断），
+        // attention 是「要你做什么」（给人的行动指令）。把诊断当指令，会让人
+        // 在「等你回答」里看到一句「端口被占用」，然后不知道该回什么。
+        if (blockHumanAction !== undefined) {
+          blockReport.attention = { question: blockHumanAction }
+        }
+        next.latestReport = blockReport
         break
       }
 
@@ -1508,11 +1787,20 @@ export function createBoard(ctx, config = {}) {
     if (result === 'pass') {
       next.status = 'completed'
       next.completedAt = current.completedAt ?? at
+      // ⚠️ 修复（2026-11-09）：原来只写 `acceptance` 却从不写 `accepted`，
+      //   而 `src/stage.js` 的「已完成且已验收 → idle」分支读的是 `accepted`。
+      //   结果是：验收通过的任务永远显示「等你验收」，`person/review` 永不消失，
+      //   `needsAttention` 也永远认为它还需要关注 —— 阶段表被一个写侧缺口卡住。
+      //   现在 `accepted` 必须由 acceptance 记录推出（**不接受手动 patch**）：
+      //   有 acceptance.result==='pass' 才有 accepted=true，两者同生同灭。
+      next.accepted = true
     } else {
       next.status = 'pending'
       delete next.ownerId
       delete next.completedAt
       delete next.artifacts // 验收驳回 → 产出物作废（在事件流的 before 里留档）
+      delete next.latestReport // 旧的收尾结论一并作废（重做后会重新产生）
+      delete next.accepted // 驳回即取消「已验收」，与 acceptance.result='reject' 一致
     }
     return commit(taskId, 'accept', actor, at, before, next)
   }

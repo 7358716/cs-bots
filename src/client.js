@@ -997,6 +997,17 @@ window.__ModuleLoader__.load({
                 ]
               : null,
             h('span', { className: 'csb-k' }, '任务编号'), h('span', { className: 'csb-v csb-mono' }, task.id),
+            // 改造07 + 2026-11-09：执行者在等你做什么（结构化 Attention）。
+            // 只显示**执行者明确提出的问题**（latestReport.attention.question），
+            // 绝不把 blockedReason（诊断）冒充成问题 —— 两者混在一起，
+            // 人会在「等你回答」里看到一句「端口被占用」而不知道该回什么。
+            data?.stageInfo?.stage === 'person/answer' && task.latestReport?.attention?.question
+              ? [
+                  h('span', { key: 'ae', className: 'csb-k' }, '要你回答'),
+                  h('span', { key: 'av', className: 'csb-v', style: { color: 'var(--dsw-alias-text-warn, #b45309)', fontWeight: 600 } },
+                    h(CollapsibleText, { text: String(task.latestReport.attention.question), limit: 300 })),
+                ]
+              : null,
             h('span', { className: 'csb-k' }, '谁在做'), h('span', { className: 'csb-v' }, task.ownerId ? botName(bots, task.ownerId) : '还没人领'),
             h('span', { className: 'csb-k' }, '进度'), h('span', { className: 'csb-v csb-kv-progress' },
               h('div', { className: 'csb-progress', style: { flex: 1, minWidth: 80 } },
@@ -1758,9 +1769,26 @@ window.__ModuleLoader__.load({
             const sum = summaryQ.data
             // 没有有效摘要就不渲染区块：空区块比没有区块更烦人（且 `{ok:true}` 无数据时
             // 会渲染出一个只有标题、三条全「—」的壳子，属于误导）。
-            if (!sum || (!sum.currentProgress && !sum.nextStep && !(Array.isArray(sum.stepConclusions) && sum.stepConclusions.length))) return null
+            // `stageInfo` 也算「有数据」：它是**从任务状态实时推导**的，永远真实存在；
+            // 只按 currentProgress/nextStep 判断会让「刚派下来还没写进度」的任务
+            // 连阶段都看不到 —— 而那正是人最想知道的时刻。
+            if (!sum || (!sum.stageInfo && !sum.currentProgress && !sum.nextStep && !(Array.isArray(sum.stepConclusions) && sum.stepConclusions.length))) return null
             const { currentProgress, stepConclusions, nextStep } = sum
             const progressItems = []
+            // ── 当前阶段（改造07 + 2026-11-09）────────────────────────────
+            // 结论区是人打开任务详情时**最先扫的那一屏**：
+            // 阶段徽标 + 理由，让「现在做到哪一步、该谁动」不用读正文就能判断。
+            // 「需要你处理」刻意放在阶段后面 —— 人先看是哪类事，再决定要不要动手。
+            if (sum.stageInfo) {
+              const si = sum.stageInfo
+              progressItems.push(h('div', { key: 'stage', className: 'csb-kv', style: { marginTop: 10 } },
+                h('span', { className: 'csb-k' }, '当前阶段'),
+                h('span', { className: 'csb-v' },
+                  h('span', { className: stageBadgeCls(si.group), title: si.reason }, si.label),
+                  si.needsPerson
+                    ? h('span', { className: 'csb-b csb-b-run', style: { marginLeft: 8 } }, '需要你处理')
+                    : null)))
+            }
             if (currentProgress) {
               progressItems.push(h('div', { key: 'p', className: 'csb-kv', style: { marginTop: 10 } },
                 h('span', { className: 'csb-k' }, '当前进度'),

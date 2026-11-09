@@ -224,3 +224,94 @@ function dir(t) {
   // 辅助：返回 setup 的 dir（用于断言落盘事件数）
   return t._dir
 }
+
+// ── 改造09：Gate 接入 fanout（真实路径）───────────────────────────────────────
+// 关键纪律：**忽略掉的消息连上下文都不记**（省 token、省打扰）；
+// 候选（inferred）记上下文但不唤醒；明确（explicit）才唤醒。
+
+test('2026-11-09：订阅缺省 acceptMode=observe、receivesEveryMessage=true（房间是群聊）', (t) => {
+  const { svc } = setup(t)
+  const sub = svc.subscribe({ taskId: 't-1', roomId: 'room-a', by: 'ui' })
+  assert.equal(sub.acceptMode, 'observe')
+  assert.equal(sub.receivesEveryMessage, true, '房间群聊缺省看到所有消息')
+})
+
+test('2026-11-09：subscribe 可显式配置 acceptMode 与规则', (t) => {
+  const { svc } = setup(t)
+  const sub = svc.subscribe({
+    taskId: 't-1', roomId: 'room-a', by: 'ui',
+    acceptMode: 'auto', rules: [{ contains: '部署' }],
+  })
+  assert.equal(sub.acceptMode, 'auto')
+  assert.deepEqual(sub.rules, [{ contains: '部署' }])
+})
+
+test('2026-11-09：非法 acceptMode 退回 observe（绝不退回 auto）', (t) => {
+  const { svc } = setup(t)
+  const sub = svc.subscribe({ taskId: 't-1', roomId: 'room-a', by: 'ui', acceptMode: '全开' })
+  assert.equal(sub.acceptMode, 'observe')
+})
+
+test('2026-11-09：未点名的消息成为候选 → 记上下文但不唤醒', async (t) => {
+  const { svc } = setup(t)
+  svc.subscribe({ taskId: 't-1', roomId: 'room-a', by: 'ui' })
+  const out = await svc.fanout({
+    roomId: 'room-a',
+    message: { id: 'm-1', seq: 1, from: 'bot-b', text: '随便聊聊', at: 1 },
+  })
+  assert.equal(out.fanned, 1)
+  assert.equal(out.woke, 0, '候选不唤醒人')
+  const d = out.details[0]
+  assert.equal(d.admitted, true)
+  assert.equal(d.admission, 'inferred')
+  const ctx = svc.list().find((x) => x.taskId === 't-1')
+  assert.equal(ctx.context.length, 1, '候选仍要记上下文')
+})
+
+test('2026-11-09：点名的消息 → explicit，可唤醒', async (t) => {
+  const { svc } = setup(t)
+  svc.subscribe({ taskId: 't-1', roomId: 'room-a', by: 'ui' })
+  const out = await svc.fanout({
+    roomId: 'room-a', wake: true,
+    message: { id: 'm-1', seq: 1, from: 'bot-b', text: '@t-1 帮我看下', at: 1 },
+  })
+  const d = out.details[0]
+  assert.equal(d.admission, 'explicit')
+  assert.equal(d.admitted, true)
+})
+
+test('2026-11-09：🔴 不在名单上的房间 → 连上下文都不记（省 token）', async (t) => {
+  const { svc } = setup(t)
+  svc.subscribe({ taskId: 't-1', roomId: 'room-a', by: 'ui' })
+  const out = await svc.fanout({
+    roomId: 'room-none',
+    message: { id: 'm-1', seq: 1, from: 'bot-b', text: '无关房间的消息', at: 1 },
+  })
+  assert.equal(out.fanned, 0, '没有订阅者就没人扇出')
+})
+
+test('2026-11-09：🔴 acceptMode=off → 候选不成立，上下文不增长', async (t) => {
+  const { svc } = setup(t)
+  svc.subscribe({ taskId: 't-1', roomId: 'room-a', by: 'ui', acceptMode: 'off' })
+  const out = await svc.fanout({
+    roomId: 'room-a',
+    message: { id: 'm-1', seq: 1, from: 'bot-b', text: '随便聊聊', at: 1 },
+  })
+  const d = out.details[0]
+  assert.equal(d.admitted, false)
+  assert.equal(d.admission, 'ignore')
+  const ctx = svc.list().find((x) => x.taskId === 't-1')
+  assert.equal(ctx.context.length, 0, 'off 下连上下文都不记')
+})
+
+test('2026-11-09：off 下点名仍然被记录（不静默吞掉，只是不唤醒）', async (t) => {
+  const { svc } = setup(t)
+  svc.subscribe({ taskId: 't-1', roomId: 'room-a', by: 'ui', acceptMode: 'off' })
+  const out = await svc.fanout({
+    roomId: 'room-a',
+    message: { id: 'm-1', seq: 1, from: 'bot-b', text: '@t-1 帮我看下', at: 1 },
+  })
+  const d = out.details[0]
+  assert.equal(d.admission, 'explicit', 'off 不影响 explicit 的准入（官方：三档都准入）')
+  assert.equal(d.admitted, true)
+})

@@ -13,6 +13,90 @@
 
 ---
 
+## [0.7.3] - 2026-11-09
+
+「照 superagent 补齐自己缺的那一层」版。
+对照官方 `deepseek-ai/dsh-superagent-prototype` 的架构逐层比对后，
+cs-bots 的上层（任务板/团队/房间/PDCA/纪律/记忆）与它的执行层本就是两套东西，
+真正缺的是**它那里的三件纪律**：阶段分类、授权留痕、准入闸。本版补齐。
+
+### Fixed
+
+- **执行阶段分类器原本是「结构性死件」（改造07 的 4/8 行从未可达）**
+  `src/stage.js`（245 行）此前已在 `5809e7a` 落地，本轮**没有重写它** ——
+  真正坏的是写侧：`board.js` 从不写 `latestReport`/`attention`，
+  于是 `person/answer`、`person/blocked`、`person/failed`、`idle` 四行永远判不出来；
+  `accept()` 只写 `acceptance` 不写 `accepted`，而分类器与 `needsAttention` 读的都是
+  `accepted` ⇒ 「已验收 → idle」这条分支**在代码上不可达**（人永远看到「等你验收」）。
+
+  修法不是再加字段，而是**让写侧去补分类器已经读的东西**：
+  - `complete` / `block` 把 `outcome` 落成 `latestReport.state`（input 名，不新增顶层字段 ——
+    否则 `latestReport` 就成了第二处真相源，与 `stage.js` 抢）；
+  - `applyNewFields` 里 `outcome` 与 `humanAction` **各自独立**处理，
+    且只删自己的子字段（原来会整份删掉 `latestReport`）；
+  - `accepted` 与 `acceptance` **同生同灭** —— 这条必须守死，
+    否则 `accepted` 又被写歪，死分支会第三次复活。
+
+  另有两处「顺手做对更贵」的坑：
+  - `complete` 拒绝携带 `humanAction`：`person/answer` 优先级高于 `person/review`，
+    一个已完成还带着 attention 的任务会显示「等你回答」而不是「等你验收」；
+  - `block` 拒绝把 `blockedReason`（诊断）冒充成 `attention.question`（问题）：
+    两者混在一起，人会在「等我回答」里看到一句「端口被占用」而不知道该回什么。
+
+### Added
+
+- **任务授权留痕（借鉴 superagent Mandate）**
+  `POST /tasks` 与 `bot_task_create` 统一接受扁平参数 `mandateBasis`
+  （`explicit|inferred|task-board|room|cycle`）+ `mandateSender`，落到 `task.mandate`。
+  参数名两边**同形**：同一概念出现两种形状，调用方就得记两套规则。
+  写进 `board.js` 的 `MANDATE_BASES` 白名单，非法值 400。
+  锚定文案在**有依据**时才渲染授权块，且必须写清「这是推断还是明确」、
+  以及「超出此授权范围的新需求要重新要授权」 ——
+  没有 `basis` 就不渲染（UI 随手建的任务记的是「谁建的」，渲染成「授权」等于编造授权）。
+
+- **房间消息准入闸（借鉴 superagent 两段式准入 Gate + Assessment）**
+  新增 `src/admission.js`（纯函数、零依赖）：判一条消息是
+  `explicit`（明确要你，直接做）/ `inferred`（候选，要评估）/ `ignore`（不相关）。
+  只有前两者进订阅上下文；`ignore` 的**连上下文都不记** —— 省 token、省打扰。
+  逐格对齐官方准入表，四点反直觉但有出处的纪律：
+
+  | | 点名 | 没点名 |
+  |---|---|---|
+  | 在名单上 | `explicit`（**不在表里**） | `inferred` |
+  | 不在名单上 | **`ignore`**（缺省） | `ignore` |
+
+  1. 不在名单上的人点名你 ⇒ 缺省 `ignore`。「明确」的前提是**在名单上**；
+     放行等于绕过订阅权限。正确做法是让他订阅。
+  2. `inferred` 是「候选」不是「放行」；`off` 下候选不成立（连候选都没有）。
+  3. 未点名那两格**只对「收全部消息」的来源开放**；房间群聊缺省 `receivesEveryMessage=true`。
+  4. **机器人永远不能造出 `explicit`**（即使表格该格设为 explicit）。
+
+  实装时踩到一个自己的坑：`observe` 与 `auto` 的差别**不在 Gate**（两者都产出候选），
+  而在评估之后。初版把 `observe` 做成「不评估」，那样「would accept」永远没有依据。
+  另一个坑：Gate 阶段 `wouldAccept` 恒 `false` —— 它是评估阶段的记录，不能提前伪造。
+  `fanout()` 已接入 Gate，唤醒条件改为 `shouldWake AND admission===explicit`。
+
+- **并发槽位（借鉴 superagent WorkerSlots）**
+  `board.claim` 新增 WIP 上限闸门：bot 在 `in_progress` 任务数达上限时拒绝再领。
+  **人是 `+1` 的**（`effectiveWipLimit = wipLimitPerBot + (by==='person'?1:0)`），
+  理由是官方那句 `New work therefore cannot prevent a person from continuing an existing Ticket` ——
+  上限是对**自动化流量**的闸门，不是拒绝人的借口。
+  错误报文带 `limit/baseLimit/personBonus/current`，便于排障。
+
+### Changed
+
+- **任务结论区补「当前阶段」行**：`GET /tasks/summary` 已返回 `stageInfo`，
+  但结论区（人打开任务详情最先扫的那一屏）没渲染它。
+  同时把渲染守卫的条件加入 `stageInfo`：阶段是**从任务状态实时推导**的、永远真实存在，
+  只按 `currentProgress/nextStep` 判断会让「刚派下来还没写进度」的任务连阶段都看不到 ——
+  而那正是人最想知道的时刻。
+
+### 测试
+
+`1108` 项全绿（`bash test/run-all.sh`，exit 0）。本轮新增 41 项：
+`admission.test.mjs`（28，逐格锁死准入表）、`board.test.mjs`（5，含写入侧缺口与 WIP）、
+`subscription.test.mjs`（8，Gate 真实路径）、`api.test.mjs`（10，含 HTTP 侧授权与房间扇出）。
+
 ## [0.7.0] - 2026-11-06
 
 「任务可以改」版。一句话：**已完成不是终点**——可以纠错、优化、变更、换负责人，
