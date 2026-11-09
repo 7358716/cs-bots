@@ -3624,6 +3624,9 @@ window.__ModuleLoader__.load({
       const [renameTo, setRenameTo] = useState('')
       const [retiring, setRetiring] = useState(null)
       const [sessionPicker, setSessionPicker] = useState(null)
+      // 把 Bot 会话挂进工作区（2026-11-09）：存量 Bot 从没挂过，永远躺在「未分组」。
+      const [attaching, setAttaching] = useState(false)
+      const [attachMsg, setAttachMsg] = useState(null)
       // 改造04：Bot 卡片上的「派任务」「发消息」
       const [assignFor, setAssignFor] = useState(null)
       const [msgFor, setMsgFor] = useState(null)
@@ -3729,6 +3732,31 @@ window.__ModuleLoader__.load({
         }
       }
 
+      /**
+       * 把全部 Bot 会话挂进各自工作目录对应的工作区（2026-11-09）。
+       *
+       * 为什么需要手动点：新建的 Bot 会话现在会自动挂（kernel.attachToWorkspace），
+       * 但**存量 Bot**（这个修复之前建的）从来没挂过 —— 于是永远躺在左侧栏「未分组」。
+       * 补挂会写宿主的工作区注册表，属于跨插件写操作，不适合在插件装配期偷偷做，
+       * 所以做成一个显式按钮：你点，它做，结果如实报。
+       */
+      const attachWorkspaces = async () => {
+        setErr(null)
+        setAttachMsg(null)
+        setAttaching(true)
+        try {
+          const d = await call('/roster/attach-workspaces', { method: 'POST', body: {} })
+          setAttachMsg({
+            kind: d?.failed ? 'err' : 'ok',
+            text: d?.note ?? `已挂 ${d?.attached ?? 0} / ${d?.total ?? 0}`,
+          })
+        } catch (e) {
+          setAttachMsg({ kind: 'err', text: `补挂失败：${e.message}` })
+        } finally {
+          setAttaching(false)
+        }
+      }
+
       return h('div', { className: 'csb-wrap' },
         sessionPicker
           ? h(Modal, {
@@ -3760,10 +3788,16 @@ window.__ModuleLoader__.load({
         // 改造05 §3.3：重启 dsh-web 后一键把所有 Bot 会话拉起来（否则派活必报 agent-not-live）
         h('div', { className: 'csb-bar', style: { marginTop: 8 } },
           h('button', { className: 'csb-btn', disabled: busy, onClick: reviveAll }, busy ? '启动中…' : '全部启动'),
+          h('button', { className: 'csb-btn csb-btn-p', disabled: attaching, onClick: attachWorkspaces },
+            attaching ? '补挂中…' : '把会话挂进工作区'),
           h('span', { className: 'csb-set-d' },
-            '重启 dsh-web 后点这里，一次性把全部 Bot 会话拉起来（否则派活/唤醒会报「会话当时没在运行」）')),
+            '「全部启动」把 Bot 会话拉起来；「挂进工作区」把它们放进左侧栏各自的工作目录分组'
+            + '（存量 Bot 从没挂过，会一直待在「未分组」里）')),
         reviveMsg
           ? h(Notice, { kind: reviveMsg.kind, onClose: () => setReviveMsg(null) }, reviveMsg.text)
+          : null,
+        attachMsg
+          ? h(Notice, { kind: attachMsg.kind, onClose: () => setAttachMsg(null) }, attachMsg.text)
           : null,
 
         h(Section, { title: '新建 Bot' }),

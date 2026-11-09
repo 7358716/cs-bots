@@ -345,7 +345,10 @@ test('R9 Bot 页首渲染不抛，页头有「全部启动」按钮', () => {
   assert.ok(tree && typeof tree === 'object')
   const text = allText(tree)
   assert.match(text, /全部启动/)
-  assert.match(text, /重启 dsh-web 后点这里/, '按钮旁要有用途说明')
+  // 说明文案 2026-11-09 改为同时讲清两个按钮（全部启动 / 挂进工作区），
+  // 断言跟着改成「两个按钮都有说明」，不是放宽。
+  assert.match(text, /把 Bot 会话拉起来/, '按钮旁要有用途说明')
+  assert.match(text, /挂进工作区/, '新增的「挂进工作区」按钮也必须在页头')
 })
 
 test('R10 点 Bot 页「全部启动」→ POST /bots/revive {all:true}，并显示三清单', async () => {
