@@ -4692,6 +4692,16 @@ window.__ModuleLoader__.load({
     }
 
     // ── 大/小团队（Teams）────────────────────────────────────────────────────
+    /** 管理策略的中文名（与后端 TEAM_ADMIN_POLICIES 逐字对应，避免两边写死不一致）。 */
+    const ADMIN_POLICY_LABEL = {
+      'lead-only': '仅负责人可管理',
+      'any-member': '成员可管理',
+      'open': '不限制',
+    }
+    /** 下拉里的合法取值（顺序即页面顺序：安全 → 宽松 → 逃生阀）。 */
+    const ADMIN_POLICY_KEYS = ['lead-only', 'any-member', 'open']
+    /** 团队默认策略：人建的团队一律默认「仅负责人可管理」。 */
+    const DEFAULT_ADMIN_POLICY = 'lead-only'
     /**
      * 团队页（需求3，2026-11-08 重做）。
      *
@@ -4713,6 +4723,15 @@ window.__ModuleLoader__.load({
      * 3. **负责人（队长）必须有显式标识**。用「队长」徽章 + 名字前缀把负责人
      *    从成员列表里区分出来——用户要求「团队负责人要有标识」。
      *
+     * ## 管理权限边界（需求：「管理员权限边界从页面控制」）
+     *   团队以前没有「谁能管理团队」这个概念——任何人知道 id 就能调
+     *   `/teams/remove` 把成员踢掉。现在策略是团队级设置 `adminPolicy`，由页面控制：
+     *     - `lead-only`（默认）= 仅负责人可管理
+     *     - `any-member`        = 成员可管理
+     *     - `open`              = 不限制（逃生阀）
+     *   卡片上显示当前策略的中文名 + 一个下拉直接切换（`POST /teams/policy`，带 CAS）。
+     *   服务端还会独立执行一条不变量：**负责人（leadId）任何策略下都不能被移出**。
+     *
      * ## 跳转房间（用户补充说明）
      *   「跳房间实质是可以穿透房间，看到团队成员的子团队工作内容，或者定向搜索查看，
      *     用户就是超级管理员」
@@ -4731,9 +4750,28 @@ window.__ModuleLoader__.load({
       const [busy, setBusy] = useState(false)
       // 每个团队的行内「加成员」待选集合（teamId → 要加的 id 列表）
       const [pendingMembers, setPendingMembers] = useState({})
+      // 管理策略：行内草稿（teamId → 下拉当前值）。策略切换是服务端 CAS 写操作，
+      // onChange 直接发请求，草稿只用于「请求进行中先显示用户选的值」。
+      const [pendingPolicy, setPendingPolicy] = useState({})
+      // 策略切换的 toast（本页无 toast 组件，沿用行内 csb-notice + 定时消失）
+      const [policyMsg, setPolicyMsg] = useState(null)
+      // 定时器必须放 ref：组件每次渲染都会重建函数体，`let` 会被重置成 null，
+      // 旧定时器就再也清不掉了（多次快速切换会留下幽灵定时器）。
+      const policyTimerRef = useRef(null)
+      useEffect(() => () => { if (policyTimerRef.current) clearTimeout(policyTimerRef.current) }, [])
+      const flashPolicy = (text) => {
+        setPolicyMsg(text)
+        if (policyTimerRef.current) clearTimeout(policyTimerRef.current)
+        policyTimerRef.current = setTimeout(() => setPolicyMsg(null), 3000)
+      }
       const act = (p, body) => call(p, { method: 'POST', body })
 
       const teams = listQ.data?.items ?? []
+      // 后端下发的合法策略（/teams 返回 policies）；万一旧后端没这个字段，就用本地常量兜底
+      const policyKeys = listQ.data?.policies?.length ? listQ.data.policies : ADMIN_POLICY_KEYS
+      const policyLabel = (key) => ADMIN_POLICY_LABEL[key] ?? `${key}（未知策略）`
+      /** 下拉当前应该显示的值：优先行内草稿（用户正在切的），否则服务端的真实策略。 */
+      const currentPolicy = (t) => pendingPolicy[t.id] ?? (t.adminPolicy ?? DEFAULT_ADMIN_POLICY)
       // 可用的 Bot（不含已退役）——成员与队长都从这里选
       const bots = (rosterQ.data?.bots ?? []).filter((b) => b.state !== 'retired')
       const botBySession = new Map(bots.map((b) => [b.sessionId, b]))
@@ -4751,6 +4789,9 @@ window.__ModuleLoader__.load({
             leadId,
             purpose: purpose.trim() || undefined,
             memberIds: selected,
+            // 人建的团队默认「仅负责人可管理」（服务端缺省是 open，为了不破坏既有调用面；
+            // 页面是新入口，没有历史包袱，所以在这里给安全默认值）
+            adminPolicy: DEFAULT_ADMIN_POLICY,
             by: 'ui',
           })
           setMsg(`团队「${r.team.name}」已创建（负责人：${botBySession.get(leadId)?.name ?? leadId}）`)
@@ -4791,6 +4832,39 @@ window.__ModuleLoader__.load({
           setMsg(`团队「${t.name}」已关闭`)
           listQ.reload()
         } catch (e) { setMsg(String(e.message ?? e)) } finally { setBusy(false) }
+      }
+
+      /**
+       * 切换「谁能管理这个团队」（需求：管理员权限边界从页面控制）。
+       *
+       * 用 CAS：带 expectedRev，别人刚改过就 409 打回，不静默覆盖。
+       * 失败时把下拉复原成服务端的真实值（`pendingPolicy` 清掉），
+       * 否则用户会以为已经改成功了 —— 那是最坏的静默失败。
+       */
+      const setAdminPolicy = async (t, policy) => {
+        if (policy === currentPolicy(t)) return
+        setPendingPolicy((s) => ({ ...s, [t.id]: policy }))
+        setBusy(true); setMsg(null)
+        try {
+          const r = await act('/teams/policy', {
+            id: t.id, expectedRev: t.rev, adminPolicy: policy, by: 'ui',
+          })
+          setPendingPolicy((s) => {
+            const next = { ...s }
+            delete next[t.id]
+            return next
+          })
+          flashPolicy(`「${t.name}」的权限已改为：${policyLabel(r.adminPolicy ?? policy)}`)
+          listQ.reload()
+        } catch (e) {
+          // 复原下拉：显示失败时绝不能让人以为改成功了
+          setPendingPolicy((s) => {
+            const next = { ...s }
+            delete next[t.id]
+            return next
+          })
+          setMsg(String(e.message ?? e))
+        } finally { setBusy(false) }
       }
 
       /** Bot 多选器（成员/队长共用同一个数据源，交互不同）。 */
@@ -4847,6 +4921,9 @@ window.__ModuleLoader__.load({
             onClick: createTeam,
           }, busy ? '创建中…' : '创建团队')),
 
+        // 策略切换的 toast：成功才出现，3 秒后自动消失（不挡住下面的团队卡片）
+        policyMsg ? h('div', { className: 'csb-notice csb-notice-ok', style: { marginTop: 8 } },
+          h('span', { className: 'csb-notice-t' }, policyMsg)) : null,
         msg ? h('div', { className: 'csb-notice csb-notice-ok', style: { marginTop: 8 } }, h('span', { className: 'csb-notice-t' }, msg)) : null,
         listQ.error ? h('div', { className: 'csb-err' }, listQ.error) : null,
         listQ.loading ? h(Skeleton, { n: 3 }) : null,
@@ -4868,6 +4945,13 @@ window.__ModuleLoader__.load({
                   t.name,
                   t.status === 'closed' ? h('span', { className: 'csb-b csb-b-idle', style: { marginLeft: 8 } }, '已关闭') : null,
                   t.purpose ? h('span', { className: 'csb-set-d' }, ` · ${t.purpose.slice(0, 40)}`) : null),
+
+                // 管理员权限边界（需求：管理员权限边界从页面控制）
+                // 徽章：人要能一眼看出「谁能动这个团队」，所以常驻显示当前策略的中文名。
+                h('div', { className: 'csb-card-m' },
+                  h('span', { className: 'csb-b csb-b-idle', title: '谁能管理这个团队' },
+                    '🔐 权限：',
+                    policyLabel(currentPolicy(t)))),
 
                 // 负责人标识（需求3：团队负责人要有标识）
                 h('div', { className: 'csb-card-m' },
@@ -4893,6 +4977,16 @@ window.__ModuleLoader__.load({
               // 操作区
               t.status === 'open'
                 ? h('div', { style: { marginTop: 10 } },
+                    // 管理策略切换（需求：管理员权限边界从页面控制）
+                    h('div', { className: 'csb-bar', style: { marginBottom: 8 } },
+                      h('span', { className: 'csb-set-d', style: { lineHeight: 2 } }, '谁能管理这个团队：'),
+                      h('select', {
+                        className: 'csb-sel',
+                        style: { width: 160 },
+                        value: currentPolicy(t),
+                        onChange: (e) => setAdminPolicy(t, e.target.value),
+                      }, policyKeys.map((key) =>
+                        h('option', { key, value: key }, policyLabel(key))))),
                     // 加成员：Bot 多选
                     addable.length > 0
                       ? h('div', null,
@@ -4952,6 +5046,127 @@ window.__ModuleLoader__.load({
                         }, '关闭团队')))
                 : null)
           })))
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // 团队工作区（需求4：每个团队在左侧栏有工作区的对应）
+    // ══════════════════════════════════════════════════════════════════════════
+    /**
+     * ## 为什么是「页签」而不是原生左侧栏工作区
+     *
+     * 用户的诉求「每个团队在 DSH 主页面左侧栏有工作区的对应，或者对话」。
+     * 实测官方宿主契约后，A 路（低成本、不动宿主）：
+     *   - `sidebar.workspaces` 的 kind 是 **single**（单条目）——不能为每个团队注册一条，
+     *     强行注册只会把官方会话树挤掉。B 路（每团队一条真实会话）需宿主配合，风险高，
+     *     已列待验证，不在本次落地。
+     *   - `sidebar.panellist` 的 kind 是 **list**（可多条），但它是左侧**图标按钮条**，
+     *     不是工作区列表。
+     *   ⇒ 落地方式：左栏点「◈ 协作平台」进面板 → 团队页签下的「工作区」，逐个团队展开
+     *     成员 Bot + 各自工作目录 + 房间入口 + 最近任务。这是「能在左侧栏到达」的最小实现。
+     *
+     * ## 这一页解决什么（对照用户原话）
+     *   「团队的管理员其实就是 router 进行分派管理」「可以穿透房间，看到团队成员的子团队工作内容」
+     *   ⇒ 每个团队卡片展开后能看到：负责人标识、成员各自 cwd（点一下复制）、
+     *     成员的最近任务与产出物线索、直达该团队房间的入口。
+     */
+    function TeamSpacesTab({ onGoto }) {
+      const listQ = useApi('/teams?type=big', [])
+      const rosterQ = useApi('/roster')
+      const [expanded, setExpanded] = useState({})
+      const [copied, setCopied] = useState(null)
+      const copyTimerRef = useRef(null)
+      useEffect(() => () => { if (copyTimerRef.current) clearTimeout(copyTimerRef.current) }, [])
+
+      const teams = listQ.data?.items ?? []
+      const bots = (rosterQ.data?.bots ?? []).filter((b) => b.state !== 'retired')
+      const botBySession = new Map(bots.map((b) => [b.sessionId, b]))
+
+      const copyPath = (p) => {
+        try {
+          navigator.clipboard?.writeText(p)
+          setCopied(p)
+          if (copyTimerRef.current) clearTimeout(copyTimerRef.current)
+          copyTimerRef.current = setTimeout(() => setCopied(null), 2000)
+        } catch { /* 剪贴板不可用就算了，路径本身已经显示在页面上 */ }
+      }
+
+      /** 团队卡片：收起时一行摘要，展开时是完整工作区视图。 */
+      const teamCard = (t) => {
+        const open = expanded[t.id] === true
+        const lead = botBySession.get(t.leadId)
+        const memberBots = (t.members ?? []).map((m) => botBySession.get(m)).filter(Boolean)
+        return h('div', { key: t.id, className: 'csb-set-c' },
+          h('div', { className: 'csb-row', style: { alignItems: 'center' } },
+            h('div', { style: { flex: 1, minWidth: 0 } },
+              h('div', { style: { fontWeight: 600 } },
+                t.name,
+                t.status === 'closed' ? h('span', { className: 'csb-set-d' }, ' （已关闭）') : null),
+              h('div', { className: 'csb-set-d' },
+                `负责人：${lead?.name ?? t.leadId ?? '（无）'}`,
+                `　成员 ${memberBots.length} 个`)),
+            h('button', {
+              type: 'button',
+              className: 'csb-btn csb-btn-s',
+              onClick: () => setExpanded((s) => ({ ...s, [t.id]: !open })),
+            }, open ? '收起' : '展开工作区')))
+
+        if (!open) return null
+
+        // 展开：负责人 + 每个成员的工作目录
+        const rows = []
+        if (lead) {
+          rows.push(h('div', { key: `lead-${t.leadId}`, className: 'csb-row', style: { alignItems: 'center', paddingTop: 6 } },
+            h('span', { className: 'csb-badge', style: { background: 'var(--csb-accent, #2d7ff9)', color: '#fff' } }, '负责人'),
+            h('span', { style: { fontWeight: 600, marginLeft: 6 } }, lead.name),
+            h('code', {
+              className: 'csb-set-d',
+              style: { marginLeft: 8, cursor: 'pointer', flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+              title: '点击复制工作目录',
+              onClick: () => copyPath(lead.cwd ?? ''),
+            }, copied === lead.cwd ? '✓ 已复制' : (lead.cwd ?? '（无工作目录）'))))
+        }
+        for (const b of memberBots) {
+          rows.push(h('div', { key: `m-${b.sessionId}`, className: 'csb-row', style: { alignItems: 'center', paddingTop: 4 } },
+            h('span', { className: 'csb-set-d', style: { width: 42 } }, '成员'),
+            h('span', { style: { marginLeft: 6 } }, b.name),
+            h('code', {
+              className: 'csb-set-d',
+              style: { marginLeft: 8, cursor: 'pointer', flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+              title: '点击复制工作目录',
+              onClick: () => copyPath(b.cwd ?? ''),
+            }, copied === b.cwd ? '✓ 已复制' : (b.cwd ?? '（无工作目录）'))))
+        }
+        if (rows.length === 0) {
+          rows.push(h('div', { key: 'empty', className: 'csb-set-d', style: { paddingTop: 6 } },
+            '这个团队还没有成员。去「团队」页加人，或到「Bot 档案」新建一个 Bot。'))
+        }
+
+        return h('div', { style: { paddingTop: 8 } },
+          rows,
+          h('div', { className: 'csb-row', style: { paddingTop: 10, gap: 8 } },
+            h('button', {
+              type: 'button', className: 'csb-btn csb-btn-s',
+              onClick: () => onGoto?.('team', { sub: 'rooms', teamName: t.name }),
+            }, '→ 看团队房间'),
+            h('button', {
+              type: 'button', className: 'csb-btn csb-btn-s',
+              onClick: () => onGoto?.('team', { sub: 'teams' }),
+            }, '→ 管理团队')))
+      }
+
+      return h('div', { className: 'csb-wrap' },
+        h(Section, {
+          title: '团队工作区',
+          desc: '每个团队在这里有一个工作区：负责人、成员、各自的工作目录，以及直达房间的入口。'
+            + '「点左侧 ◈ 协作平台 → 团队 → 工作区」即可到达。',
+        },
+          listQ.error
+            ? h('div', { className: 'csb-notice csb-notice-err' }, `读取团队失败：${listQ.error.message ?? listQ.error}`)
+            : null,
+          teams.length === 0
+            ? h('div', { className: 'csb-set-d', style: { padding: '12px 0' } },
+                '还没有团队。去「团队」页建一个，这里就会出现它的工作区。')
+            : teams.map(teamCard)))
     }
 
     // ── PDCA 测量（Metrics）───────────────────────────────────────────────────
@@ -6637,6 +6852,8 @@ window.__ModuleLoader__.load({
         subs: [
           { id: 'bots', label: 'Bot 档案', Comp: BotsTab },
           { id: 'teams', label: '团队', Comp: TeamsTab },
+          // 需求4：每个团队在左侧栏有工作区的对应（A 路：面板内工作区页签）
+          { id: 'teamspaces', label: '工作区', Comp: TeamSpacesTab },
           { id: 'rooms', label: '房间', Comp: RoomsTab },
         ],
       },
@@ -6826,6 +7043,13 @@ window.__ModuleLoader__.load({
         setLocate(
           opts && typeof opts === 'object' && (opts.roomId || opts.filter) ? opts : null,
         )
+        // 需求4：工作区页签里「看团队房间 / 管理团队」要精确落到子页签
+        // （opts.sub = 'rooms' | 'teams'）。只在目标页签确实有这个子视图时才设。
+        if (opts && typeof opts === 'object' && typeof opts.sub === 'string') {
+          const next = TABS.find((t) => t.id === id)
+          const sub = next?.subs?.find((v) => v.id === opts.sub)
+          if (sub) setView(sub.id)
+        }
       }
 
       // 兼容旧 goTab 调用：'tasks' → 'workspace', 'bots' → 'team'
