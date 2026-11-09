@@ -1317,6 +1317,9 @@ export function installApi(ctx, { warn } = {}) {
           'roster', 'board', 'dispatcher', 'room', 'memory',
           'library', 'discipline', 'todo', 'scratch', 'prompts', 'suggest', 'reviewer',
           'metrics', 'verify', 'cycle', 'teams', 'subscription',
+          // 投递回执看护（2026-11-09）：不上报的话，它装配失败时
+          // 「系统体检」会显示一切正常，而实际没有任何回执追踪 —— 静默失败。
+          'deliveryWatch',
         ]
         for (const key of SERVICE_KEYS) {
           const svc = services[key]
@@ -1325,6 +1328,10 @@ export function installApi(ctx, { warn } = {}) {
                 available: true,
                 stats: typeof svc.stats === 'function' ? svc.stats() : undefined,
                 stateDir: svc.paths?.stateDir,
+                // 看护没有状态目录（期望表只在内存），补一句人话说明
+                ...(key === 'deliveryWatch'
+                  ? { note: '投递回执看护（只在内存；重启后旧期望失效是设计如此）' }
+                  : {}),
               }
             : { available: false }
         }
