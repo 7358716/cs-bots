@@ -50,6 +50,20 @@ const CYCLE_KINDS = ['human', 'agent']
 /** 团队类型与角色（前端展示用；与 teams.js 的 TEAM_TYPES/TEAM_ROLES 逐字一致）。 */
 const TEAM_TYPES = ['big', 'small']
 const TEAM_ROLES = ['lead', 'member']
+/** 团队管理策略（与 teams.js 的 TEAM_ADMIN_POLICIES 逐字一致；页面下拉直接用）。 */
+const TEAM_ADMIN_POLICIES = ['lead-only', 'any-member', 'open']
+
+/**
+ * 团队域错误 → HTTP 状态码。
+ * 只有「无权管理团队」升级成 403（语义正确，且与 /teams/memory 的 403 口径一致）；
+ * 其余 TEAM_* 保持历史口径 400；非团队错误原样抛出（503/500 不受影响）。
+ */
+function markTeamError(error) {
+  if (error && typeof error.code === 'string' && error.code.startsWith('TEAM_')) {
+    error.status = error.code === 'TEAM_FORBIDDEN' ? 403 : 400
+  }
+  throw error
+}
 
 /** 读请求体（JSON）。 */
 async function readBody(request) {
@@ -3511,49 +3525,77 @@ export function installApi(ctx, { warn } = {}) {
         const items = await withService(services, 'teams', (t) => t.list({
           type: qp(url, 'type'), status: qp(url, 'status'),
         }))
-        sendJson(response, 200, { ok: true, items, types: TEAM_TYPES, roles: TEAM_ROLES })
+        sendJson(response, 200, {
+          ok: true, items,
+          types: TEAM_TYPES, roles: TEAM_ROLES, policies: TEAM_ADMIN_POLICIES,
+        })
         return
       }
       if (request.method === 'POST' && path === '/teams') {
         const body = (await readBody(request)) ?? {}
         const out = await withService(services, 'teams', (t) =>
-          t.create({ ...body, by: body.by ?? OWNER }))
+          t.create({ ...body, by: body.by ?? OWNER })).catch(markTeamError)
         sendJson(response, 200, { ok: true, team: out })
         return
       }
       if (request.method === 'POST' && path === '/teams/add') {
         const body = (await readBody(request)) ?? {}
         const out = await withService(services, 'teams', (t) =>
-          t.addMember({ ...body, by: body.by ?? OWNER }))
+          t.addMember({ ...body, by: body.by ?? OWNER })).catch(markTeamError)
         sendJson(response, 200, { ok: true, team: out })
         return
       }
       if (request.method === 'POST' && path === '/teams/remove') {
         const body = (await readBody(request)) ?? {}
         const out = await withService(services, 'teams', (t) =>
-          t.removeMember({ ...body, by: body.by ?? OWNER }))
+          t.removeMember({ ...body, by: body.by ?? OWNER })).catch(markTeamError)
         sendJson(response, 200, { ok: true, team: out })
         return
       }
       if (request.method === 'POST' && path === '/teams/role') {
         const body = (await readBody(request)) ?? {}
         const out = await withService(services, 'teams', (t) =>
-          t.setRole({ ...body, by: body.by ?? OWNER }))
+          t.setRole({ ...body, by: body.by ?? OWNER })).catch(markTeamError)
         sendJson(response, 200, { ok: true, team: out })
         return
       }
       if (request.method === 'POST' && path === '/teams/note') {
         const body = (await readBody(request)) ?? {}
         const out = await withService(services, 'teams', (t) =>
-          t.note({ ...body, by: body.by ?? OWNER }))
+          t.note({ ...body, by: body.by ?? OWNER })).catch(markTeamError)
         sendJson(response, 200, { ok: true, team: out })
         return
       }
       if (request.method === 'POST' && path === '/teams/close') {
         const body = (await readBody(request)) ?? {}
         const out = await withService(services, 'teams', (t) =>
-          t.close({ ...body, by: body.by ?? OWNER }))
+          t.close({ ...body, by: body.by ?? OWNER })).catch(markTeamError)
         sendJson(response, 200, { ok: true, team: out })
+        return
+      }
+      // 管理策略（2026-11-09「管理员权限边界从页面控制」）：CAS 改团队的 adminPolicy。
+      if (request.method === 'POST' && path === '/teams/policy') {
+        const body = (await readBody(request)) ?? {}
+        if (!body.id) {
+          sendJson(response, 400, { ok: false, reason: 'id 必填' })
+          return
+        }
+        if (!TEAM_ADMIN_POLICIES.includes(body.adminPolicy)) {
+          sendJson(response, 400, {
+            ok: false,
+            code: 'TEAM_BAD_POLICY',
+            reason: `adminPolicy 非法（合法：${TEAM_ADMIN_POLICIES.join(' | ')}）`,
+          })
+          return
+        }
+        const out = await withService(services, 'teams', (t) =>
+          t.setPolicy({
+            id: body.id,
+            expectedRev: body.expectedRev,
+            adminPolicy: body.adminPolicy,
+            by: body.by ?? OWNER,
+          })).catch(markTeamError)
+        sendJson(response, 200, { ok: true, team: out, adminPolicy: out.adminPolicy })
         return
       }
 

@@ -30,8 +30,41 @@ export const TEAM_TYPES = Object.freeze(['big', 'small'])
 /** 团队成员角色。 */
 export const TEAM_ROLES = Object.freeze(['lead', 'member'])
 
-/** 合法动作。 */
-const ACTIONS = Object.freeze(['create', 'addMember', 'removeMember', 'setRole', 'close', 'note'])
+/**
+ * 团队管理权限边界（2026-11-09 需求：「管理员权限边界从页面控制」）。
+ *
+ * 团队只有 lead / member 两种角色，**lead 即管理员**；在此之前「谁能管理团队」这个概念
+ * 根本不存在 —— 任何人只要知道 id 就能调 `removeMember` 把人踢掉。本字段把这条边界
+ * 变成团队级、可审计、可从页面切换的设置：
+ *
+ *   - `'lead-only'`  ：只有负责人（leadId）或「人」能改团队（addMember/removeMember/setRole/close/note）
+ *   - `'any-member'` ：任何成员都能改，但**踢负责人永远禁止**（不变量，与策略无关）
+ *   - `'open'`       ：不做校验（= 历史行为，留作逃生阀）
+ */
+export const TEAM_ADMIN_POLICIES = Object.freeze(['lead-only', 'any-member', 'open'])
+
+/**
+ * 缺省策略 = `'open'`。
+ *
+ * 为什么不是 `'lead-only'`：这个字段是**新加**的，而 teams.jsonl 里已经躺着历史团队、
+ * `src/tools.js` 的 `bot_teams_add` 也在用（by = 执行者会话 id）。把缺省改成 lead-only
+ * 等于给所有既有调用面**静默降权**，且既有测试会被迫改写以迁就新默认 —— 那说明改的是
+ * 契约而不是加能力。缺省 `'open'` 保证「升级不改变任何既有行为」，再由**页面**把新建
+ * 团队显式设成 `'lead-only'`（TeamsTab 的创建表单默认值），安全的默认值落在真正需要
+ * 它的地方（人建的团队），不需要它的地方保持原样。这么做的代价是：服务层直调（工具/
+ * 脚本）默认不设防 —— 所以 `close`/`removeMember` 的关键不变量（负责人不可移除）做在
+ * 策略之外，任何策略下都生效。
+ */
+export const DEFAULT_TEAM_ADMIN_POLICY = 'open'
+
+/**
+ * 视为「人」的身份：人永远是超级管理员，不受任何策略限制。
+ * 与 `src/api.js` 的 OWNER（`'user'`）和页面层发来的 `'ui'` 对齐，另收 `'person'`。
+ */
+const HUMAN_IDS = Object.freeze(['ui', 'user', 'person'])
+
+/** 合法动作（含 setPolicy：策略变更本身也是要留痕的事件）。 */
+const ACTIONS = Object.freeze(['create', 'addMember', 'removeMember', 'setRole', 'close', 'note', 'setPolicy'])
 
 /** 结构化错误。 */
 export class TeamError extends Error {
@@ -69,6 +102,23 @@ function stringList(value, field, where) {
     throw new TeamError(`teams.${where}：${field} 必须是数组，收到 ${JSON.stringify(value)}`, 'TEAM_BAD_FIELD', { where, field })
   }
   return value.map((v) => requireString(v, `${field}[]`, where))
+}
+
+/** 校验并归一化管理策略（undefined/null → 缺省策略；非法值直接拒绝，绝不静默降级）。 */
+function normalizePolicy(value, where) {
+  if (value === undefined || value === null) return DEFAULT_TEAM_ADMIN_POLICY
+  if (typeof value !== 'string' || !TEAM_ADMIN_POLICIES.includes(value)) {
+    throw new TeamError(
+      `teams.${where}：adminPolicy=${JSON.stringify(value)} 非法（合法：${TEAM_ADMIN_POLICIES.join(' | ')}）`,
+      'TEAM_BAD_POLICY', { where, field: 'adminPolicy', adminPolicy: value },
+    )
+  }
+  return value
+}
+
+/** 该身份是否是「人」（人 = 超级管理员，不受任何策略约束）。 */
+function isHuman(by) {
+  return HUMAN_IDS.includes(by)
 }
 
 function resolveStateDir(config) {
@@ -172,16 +222,67 @@ export function createTeams(ctx, config = {}) {
     return t
   }
 
+  /** 读团队的实际生效策略（历史团队没有该字段 → 缺省策略；绝不用 undefined 参与判断）。 */
+  function policyOf(team) {
+    return team?.adminPolicy ?? DEFAULT_TEAM_ADMIN_POLICY
+  }
+
+  /**
+   * 管理动作的权限闸（2026-11-09「管理员权限边界」）。
+   *
+   * 判定顺序（**人永远第一**）：人 → 放行；`open` → 放行；负责人 → 放行；
+   * `any-member` 且调用者是成员 → 放行；其余一律 `TEAM_FORBIDDEN`。
+   *
+   * 为什么 `open` 要放行而不是「人 + 负责人」：它是给既有调用面留的逃生阀，
+   * 语义必须是「和加这个字段之前一模一样」，否则升级即破坏（含 tools.js 的
+   * `bot_teams_add`，它的 by 是执行者会话 id）。
+   *
+   * @param {object} team 团队记录
+   * @param {string} by 调用者身份（'ui'|'user'|'person' = 人）
+   * @param {string} where 动作名（用于错误信息）
+   */
+  function assertAdmin(team, by, where) {
+    const adminPolicy = policyOf(team)
+    if (adminPolicy === 'open') return adminPolicy
+    if (isHuman(by)) return adminPolicy
+    if (team.leadId && by === team.leadId) return adminPolicy
+    if (adminPolicy === 'any-member' && (team.members ?? []).includes(by)) return adminPolicy
+    throw new TeamError(
+      `teams.${where}：${by} 无权管理团队 ${team.id}（当前策略 ${adminPolicy}：`
+        + `${adminPolicy === 'lead-only' ? '仅负责人可管理' : '仅团队成员可管理'}；人不受限）`,
+      'TEAM_FORBIDDEN',
+      { where, id: team.id, by, adminPolicy, leadId: team.leadId },
+    )
+  }
+
+  /**
+   * 不变量：负责人（leadId）永不可被移出团队。
+   *
+   * **与 adminPolicy 无关**——哪怕策略是 `open`、哪怕调用者是人。
+   * 依据：leadId 是团队的锚，移掉就得到一个没有负责人的团队（既无法定义管理边界，
+   * 也无法回答「谁能管」）。要换负责人请走 `setRole(..., role:'lead')`，
+   * 那条路径会把原负责人降级为成员，不会制造空洞。
+   */
+  function assertNotLead(team, memberId, where) {
+    if (team.leadId && team.leadId === memberId) {
+      throw new TeamError(
+        `teams.${where}：${memberId} 是团队 ${team.id} 的负责人，不能被移出（换负责人请用 setRole）`,
+        'TEAM_LEAD_IMMUTABLE', { where, id: team.id, leadId: team.leadId, memberId },
+      )
+    }
+  }
+
   // ── API：写 ────────────────────────────────────────────────────────────────
 
   /**
    * 创建一个团队。
    * @param {{ name: string, type?: 'big'|'small', purpose?: string,
-   *           memberIds?: string[], leadId?: string, by: string, now?: number }} input
+   *           memberIds?: string[], leadId?: string, adminPolicy?: 'lead-only'|'any-member'|'open',
+   *           by: string, now?: number }} input
    */
   function create(input = {}) {
     assertAlive('create')
-    const { name, type, purpose, memberIds, leadId, by, now } = input ?? {}
+    const { name, type, purpose, memberIds, leadId, adminPolicy, by, now } = input ?? {}
     const nameNorm = requireString(name, 'name', 'create')
     if (nameNorm.length > 120) throw new TeamError(`teams.create：name ≤120 字符（收到 ${nameNorm.length}）`, 'TEAM_BAD_FIELD', { field: 'name' })
     const teamType = type ?? 'big'
@@ -190,6 +291,8 @@ export function createTeams(ctx, config = {}) {
     }
     const author = requireString(by, 'by', 'create')
     const at = normalizeNow(now, 'create')
+    // 缺省 'open'：升级不改变既有行为（见 DEFAULT_TEAM_ADMIN_POLICY 注释）
+    const policy = normalizePolicy(adminPolicy, 'create')
 
     // big 团队必须有人管（leadId）；small 团队是自建的，leadId 可选
     const lead = teamType === 'big' ? requireString(leadId, 'leadId', 'create') : (leadId ?? null)
@@ -204,6 +307,7 @@ export function createTeams(ctx, config = {}) {
     const rec = {
       id, rev: 1, name: nameNorm, type: teamType, purpose: purpose ?? '',
       leadId: lead, members,
+      adminPolicy: policy,
       status: 'open',
       createdAt: at, createdBy: author, updatedAt: at, updatedBy: author,
     }
@@ -213,7 +317,7 @@ export function createTeams(ctx, config = {}) {
   }
 
   /**
-   * 加入成员。big 团队的成员变化需要 lead 权限（by === leadId 或 by === 'user'）。
+   * 加入成员。管理权限由团队的 `adminPolicy` 决定（缺省 = open，行为与历史一致）。
    * @param {{ id: string, expectedRev?: number, memberId: string, by: string, now?: number }} input
    */
   function addMember(input = {}) {
@@ -223,6 +327,7 @@ export function createTeams(ctx, config = {}) {
     const at = normalizeNow(now, 'addMember')
     const member = requireString(memberId, 'memberId', 'addMember')
     const current = cas(id, expectedRev, 'addMember')
+    assertAdmin(current, author, 'addMember')
     if (current.status === 'closed') throw new TeamError(`teams.addMember：团队 ${id} 已关闭`, 'TEAM_CLOSED', { id })
     if (current.members.includes(member)) {
       throw new TeamError(`teams.addMember：成员 ${member} 已在团队 ${id} 中`, 'TEAM_DUPLICATE_MEMBER', { id, member })
@@ -238,6 +343,7 @@ export function createTeams(ctx, config = {}) {
 
   /**
    * 移除成员。
+   * 两条独立的闸：权限闸（adminPolicy）+ 不变量闸（负责人永不可移除）。
    * @param {{ id: string, expectedRev?: number, memberId: string, by: string, now?: number }} input
    */
   function removeMember(input = {}) {
@@ -247,6 +353,8 @@ export function createTeams(ctx, config = {}) {
     const at = normalizeNow(now, 'removeMember')
     const member = requireString(memberId, 'memberId', 'removeMember')
     const current = cas(id, expectedRev, 'removeMember')
+    assertAdmin(current, author, 'removeMember')
+    assertNotLead(current, member, 'removeMember')
     const next = clone(current)
     next.rev = current.rev + 1
     next.members = current.members.filter((m) => m !== member)
@@ -270,6 +378,7 @@ export function createTeams(ctx, config = {}) {
     }
     const member = requireString(memberId, 'memberId', 'setRole')
     const current = cas(id, expectedRev, 'setRole')
+    assertAdmin(current, author, 'setRole')
     const next = clone(current)
     next.rev = current.rev + 1
     if (role === 'lead') {
@@ -300,6 +409,7 @@ export function createTeams(ctx, config = {}) {
     const text = requireString(note, 'note', 'note')
     if (text.length > 4000) throw new TeamError(`teams.note：note ≤4000 字符（收到 ${text.length}）`, 'TEAM_BAD_FIELD', { field: 'note' })
     const current = cas(id, expectedRev, 'note')
+    assertAdmin(current, author, 'note')
     const next = clone(current)
     next.rev = current.rev + 1
     next.notes = [...(current.notes ?? []), { text, by: author, at }]
@@ -319,6 +429,7 @@ export function createTeams(ctx, config = {}) {
     const author = requireString(by, 'by', 'close')
     const at = normalizeNow(now, 'close')
     const current = cas(id, expectedRev, 'close')
+    assertAdmin(current, author, 'close')
     const next = clone(current)
     next.rev = current.rev + 1
     next.status = 'closed'
@@ -329,6 +440,38 @@ export function createTeams(ctx, config = {}) {
     return clone(next)
   }
 
+  /**
+   * 改团队的「管理员权限边界」（CAS）。这是本次需求「从页面控制」的服务端落点。
+   *
+   * 权限：只有人或负责人能改策略（`assertAdmin`）。`open` 策略下任何人都能改 ——
+   * 那正是逃生阀该有的样子；`lead-only`/`any-member` 下非负责人会被 `TEAM_FORBIDDEN`。
+   * 注意：把策略从受限改成 `open` 用的也是这套判定（人/负责人可放行），不存在
+   * 「用策略把自己解锁」的路径 —— 想放宽必须先有管理权。
+   *
+   * @param {{ id: string, expectedRev?: number, adminPolicy: string, by: string, now?: number }} input
+   */
+  function setPolicy(input = {}) {
+    assertAlive('setPolicy')
+    const { id, expectedRev, adminPolicy, by, now } = input ?? {}
+    const author = requireString(by, 'by', 'setPolicy')
+    const at = normalizeNow(now, 'setPolicy')
+    const policy = normalizePolicy(adminPolicy, 'setPolicy')
+    const current = cas(id, expectedRev, 'setPolicy')
+    assertAdmin(current, author, 'setPolicy')
+    if (policyOf(current) === policy) {
+      // 幂等：同样的策略不产生新事件（避免事件流被无意义写入灌满）
+      return clone(current)
+    }
+    const next = clone(current)
+    next.rev = current.rev + 1
+    next.adminPolicy = policy
+    next.updatedAt = at
+    next.updatedBy = author
+    commit('setPolicy', at, author, clone(current), next)
+    info(`[cs-bots/teams] 团队 ${id} 管理策略 ${policyOf(current)} → ${policy}（by ${author}）`)
+    return clone(next)
+  }
+
   // ── API：读 ────────────────────────────────────────────────────────────────
 
   function list(query = {}) {
@@ -336,13 +479,15 @@ export function createTeams(ctx, config = {}) {
     let rows = [...entries.values()]
     if (query?.type !== undefined && query?.type !== null) rows = rows.filter((r) => r.type === query.type)
     if (query?.status !== undefined && query?.status !== null) rows = rows.filter((r) => r.status === query.status)
-    return clone(rows)
+    // 老团队没有 adminPolicy 字段：补成缺省值，保证读侧永远拿得到（页面才不用写「可能是 undefined」）
+    return clone(rows.map((r) => (r.adminPolicy ? r : { ...r, adminPolicy: DEFAULT_TEAM_ADMIN_POLICY })))
   }
 
   function get(id) {
     assertAlive('get')
     const t = entries.get(id)
-    return t ? clone(t) : null
+    if (!t) return null
+    return clone(t.adminPolicy ? t : { ...t, adminPolicy: DEFAULT_TEAM_ADMIN_POLICY })
   }
 
   function stats() {
@@ -369,6 +514,7 @@ export function createTeams(ctx, config = {}) {
     setRole,
     note,
     close,
+    setPolicy,
     list,
     get,
     stats,
