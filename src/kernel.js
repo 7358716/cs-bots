@@ -661,58 +661,90 @@ export async function readSessionMessages(ctx, sessionId, options = {}) {
  * @param {object[]} events
  * @returns {object[]}
  */
-function eventsToMessages(events) {
+export function eventsToMessages(events) {
   const out = []
   for (const ev of events) {
     if (!ev || typeof ev !== 'object') continue
+    // 官方 SessionEvent 的形状是 `{ type, seq, time, data }` —— 内容在 `data` 里。
+    // 早期实现只读 `ev.content`，结果对**任何真实会话**都产出空数组（需求2「看不到对话内容」
+    // 的真因）。这里同时兼容两种形状，避免新旧数据各有盲区。
     const type = ev.type
     const at = typeof ev.time === 'number' ? ev.time : undefined
+    const data = (ev.data && typeof ev.data === 'object') ? ev.data : {}
 
-    // 用户消息
-    if (type === 'user/message' || type === 'user-message') {
-      const text = blocksToText(ev.content ?? ev.message?.content)
-      if (text) out.push({ role: 'user', kind: 'text', text, at })
-      continue
-    }
-
-    // 助手消息：拆成文本 + 工具调用
-    if (type === 'assistant/message' || type === 'assistant-message') {
-      const blocks = Array.isArray(ev.content) ? ev.content : []
+    const pushBlocks = (role, blocks) => {
+      if (!Array.isArray(blocks)) return
       for (const b of blocks) {
         if (!b || typeof b !== 'object') continue
         if (b.type === 'text' && typeof b.text === 'string' && b.text.trim()) {
-          out.push({ role: 'assistant', kind: 'text', text: b.text, at })
+          out.push({ role, kind: 'text', text: b.text, at })
         } else if (b.type === 'reasoning' && typeof b.text === 'string' && b.text.trim()) {
           out.push({ role: 'assistant', kind: 'reasoning', text: b.text.slice(0, 2000), at })
         } else if (b.type === 'tool-call' || b.type === 'toolCall') {
-          const name = b.name ?? b.toolName ?? '?'
-          const input = b.input ?? b.arguments
-          let summary = ''
-          try {
-            summary = typeof input === 'string' ? input : JSON.stringify(input ?? {})
-          } catch {
-            summary = ''
-          }
-          out.push({
-            role: 'assistant',
-            kind: 'tool-call',
-            toolName: String(name),
-            text: summary.length > 500 ? `${summary.slice(0, 500)}…` : summary,
-            at,
-          })
+          out.push({ role: 'assistant', kind: 'tool-call', toolName: String(b.name ?? b.toolName ?? '?'), text: summarizeInput(b.input ?? b.arguments), at })
         }
       }
+    }
+
+    // 用户消息（含 system/developer 注入的「用户侧」文本，人看任务上下文需要）
+    if (type === 'user/message' || type === 'user-message') {
+      pushBlocks('user', data.content ?? ev.content ?? data.message?.content ?? ev.message?.content)
       continue
     }
 
-    // 工具结果
-    if (type === 'tool/result' || type === 'tool-result') {
-      const text = blocksToText(ev.content ?? ev.result)
-      if (text) out.push({ role: 'tool', kind: 'tool-result', text: text.slice(0, 1500), at })
+    // 助手消息：内容在 data.message.content
+    if (type === 'assistant/message' || type === 'assistant-message') {
+      const msg = data.message ?? ev.message ?? {}
+      pushBlocks('assistant', msg.content ?? data.content ?? ev.content)
+      continue
+    }
+
+    // 工具调用：data.name + data.arguments（顶层事件，不嵌在 assistant 消息里）
+    if (type === 'tool/call' || type === 'tool-call' || type === 'toolCall') {
+      const name = data.name ?? data.toolName ?? ev.name
+      const summary = summarizeInput(data.arguments ?? data.input ?? ev.arguments)
+      // 既没名字也没入参 ⇒ 对「看 Bot 干了什么」毫无信息量，跳过而不是画一个空壳
+      if (!name && !summary) continue
+      out.push({
+        role: 'assistant',
+        kind: 'tool-call',
+        toolName: String(name ?? '?'),
+        text: summary,
+        at,
+      })
+      continue
+    }
+
+    // 工具结果：data.message.content
+    if (type === 'tool/result' || type === 'tool-result' || type === 'toolResult') {
+      const msg = data.message ?? ev.message ?? {}
+      const text = blocksToText(msg.content ?? data.content ?? ev.content ?? ev.result)
+      const name = msg.toolName ?? data.name ?? ev.toolName
+      if (text) {
+        out.push({
+          role: 'tool',
+          kind: 'tool-result',
+          ...(typeof name === 'string' && name ? { toolName: name } : {}),
+          text: text.length > 1500 ? `${text.slice(0, 1500)}\u2026` : text,
+          at,
+        })
+      }
       continue
     }
   }
   return out
+}
+
+/** 工具入参压成一行摘要（对象转 JSON，超长截断）。 */
+function summarizeInput(input) {
+  if (input === undefined || input === null) return ''
+  let summary = ''
+  try {
+    summary = typeof input === 'string' ? input : JSON.stringify(input)
+  } catch {
+    summary = ''
+  }
+  return summary && summary.length > 500 ? `${summary.slice(0, 500)}\u2026` : summary
 }
 
 /** 把 content blocks 拍平成一段文本（只取 text 类型块）。 */
