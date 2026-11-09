@@ -605,3 +605,101 @@ test('E15 anchor 文案：无 longrun 时与既有格式逐字一致；有 longr
   assert.equal(calls.length, 1)
   assert.match(calls[0].text, /阶段（长任务，按序推进，不得跳步）：\n1\. 定标准\n2\. 实现\n补充说明/)
 })
+
+// ══════════════════════════════════════════════════════════════════════════
+// 需求3（2026-11-09）：建任务时选「长任务」= 一次到位
+//
+// 用户原话：「建任务的时候选择长任务就是长表单一次到位」。
+// 以前只能建普通任务再 `/tasks/evolve mode=longrun` 转，两步操作、两次留痕，
+// 而且第一步派活时唤醒文案里没有阶段清单 —— 执行者第一轮就看不到路线。
+// ══════════════════════════════════════════════════════════════════════════
+
+test('长任务创建：longrun:true + phases 一次到位，阶段清单落 task-meta.jsonl', async () => {
+  const h = boot()
+  const phases = ['摸清现状', '改写入边界', '跑全量测试']
+  const r = await h.req('POST', '/tasks', {
+    subject: '一次到位长任务', description: '目标原文', longrun: true, phases,
+  })
+  assert.equal(r.status, 200)
+  assert.equal(r.json.longrun, true)
+  assert.deepEqual(r.json.phases, phases, '响应要回显实际生效的阶段清单')
+  const rows = h.readMeta().filter((row) => row.taskId === r.json.task.id && row.kind === 'longrun')
+  assert.equal(rows.length, 1, '阶段清单必须真的落盘（不是只回显）')
+  assert.deepEqual(rows[0].phases, phases)
+})
+
+test('长任务创建：只给 longrun:true 不给 phases ⇒ 默认三阶段（与 evolve 同一份口径）', async () => {
+  const h = boot()
+  const r = await h.req('POST', '/tasks', { subject: '默认阶段长任务', longrun: true })
+  assert.equal(r.status, 200)
+  assert.deepEqual(r.json.phases, DEFAULT_PHASES)
+})
+
+test('长任务创建：给非空 phases 但没显式 longrun:true，也按长任务建（语义等价）', async () => {
+  const h = boot()
+  const r = await h.req('POST', '/tasks', { subject: '只给阶段', phases: ['A', 'B'] })
+  assert.equal(r.status, 200)
+  assert.deepEqual(r.json.phases, ['A', 'B'])
+  assert.ok(h.readMeta().some((row) => row.kind === 'longrun' && row.taskId === r.json.task.id))
+})
+
+test('长任务创建：phases 非法时**先拒绝、不落半成品任务**（校验在建任务之前）', async () => {
+  const h = boot()
+  const before = h.services.board.list({}).length
+  const r = await h.req('POST', '/tasks', {
+    subject: '非法阶段', longrun: true, phases: Array.from({ length: 13 }, (_, i) => `阶段${i}`),
+  })
+  assert.equal(r.status, 400)
+  assert.equal(r.json.code, 'TASK_BAD_PHASES')
+  assert.equal(h.services.board.list({}).length, before, '非法阶段不该留下一条任务')
+})
+
+test('长任务创建：普通任务（不带 longrun/phases）行为逐字不变，不写 task-meta', async () => {
+  const h = boot()
+  const r = await h.req('POST', '/tasks', { subject: '普通任务' })
+  assert.equal(r.status, 200)
+  assert.equal(r.json.longrun, undefined, '普通任务不该冒出 longrun 字段')
+  assert.equal(h.readMeta().filter((row) => row.taskId === r.json.task.id).length, 0)
+})
+
+test('长任务创建：第一次唤醒的锚定文案就带阶段清单（不用等「转长任务」）', async () => {
+  const h = boot()
+  const bot = await h.makeBot('longrun-anchor')
+  const r = await h.req('POST', '/tasks', { subject: '锚定带阶段', longrun: true, phases: ['第一步', '第二步'] })
+  const wake = h.stubDispatcher({ ok: true, result: 'sent' })
+  await h.req('POST', '/tasks/assign', {
+    id: r.json.task.id, ownerId: bot.sessionId, expectedRev: h.services.board.get(r.json.task.id).rev,
+  })
+  assert.equal(wake.length, 1, '应当发出一次唤醒')
+  const text = String(wake[0].text)
+  assert.match(text, /第一步/, '第一次唤醒就必须看到阶段清单')
+  assert.match(text, /第二步/)
+})
+
+test('长任务创建 + 授权依据：mandate 随创建落库，第一次唤醒文案带「授权」段', async () => {
+  const h = boot()
+  const bot = await h.makeBot('longrun-mandate')
+  const r = await h.req('POST', '/tasks', {
+    subject: '授权长任务', longrun: true, phases: ['A'], mandateBasis: 'explicit', mandateSender: 'ui',
+  })
+  assert.ok(r.json.task.mandate, '创建时就要记下授权依据')
+  assert.equal(r.json.task.mandate.basis, 'explicit')
+  const wake = h.stubDispatcher({ ok: true, result: 'sent' })
+  await h.req('POST', '/tasks/assign', {
+    id: r.json.task.id, ownerId: bot.sessionId, expectedRev: h.services.board.get(r.json.task.id).rev,
+  })
+  const text = String(wake[0].text)
+  assert.match(text, /授权/, '有依据就必须渲染授权段')
+  assert.match(text, /人明确点名/, '依据要写清楚是哪一档')
+})
+
+test('没有授权依据时不渲染授权段（宁可没有，不编造授权）', async () => {
+  const h = boot()
+  const bot = await h.makeBot('longrun-nomandate')
+  const r = await h.req('POST', '/tasks', { subject: '无授权任务' })
+  const wake = h.stubDispatcher({ ok: true, result: 'sent' })
+  await h.req('POST', '/tasks/assign', {
+    id: r.json.task.id, ownerId: bot.sessionId, expectedRev: h.services.board.get(r.json.task.id).rev,
+  })
+  assert.doesNotMatch(String(wake[0].text), /授权（谁批准/, 'UI 建的普通任务不是授权')
+})

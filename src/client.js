@@ -221,6 +221,12 @@ window.__ModuleLoader__.load({
 .csb-sec p{margin:4px 0 0;font-size:12px;line-height:1.6;color:var(--dsw-alias-label-secondary)}
 
 .csb-fld{margin-bottom:14px}
+/* 长任务完整表单：两列网格，窄屏（<720px）自动单列 —— 手机上也能填 */
+.csb-ltform{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px 16px;
+  margin-top:10px;padding:14px;border:1px solid var(--dsw-alias-border-l2);border-radius:10px;
+  background:var(--dsw-alias-bg-l1)}
+.csb-ltform .csb-fld{margin-bottom:0}
+@media (max-width:720px){.csb-ltform{grid-template-columns:1fr;padding:10px}}
 .csb-fld > label{display:block;font-size:12px;font-weight:500;margin-bottom:5px}
 .csb-fld-h{font-size:11.5px;line-height:1.6;color:var(--dsw-alias-label-secondary);margin-top:5px}
 
@@ -2532,6 +2538,25 @@ window.__ModuleLoader__.load({
       const [priority, setPriority] = useState('')
       const [assignee, setAssignee] = useState('')
       const [showAdv, setShowAdv] = useState(false)
+      // ── 长任务一次到位（2026-11-09 需求3）─────────────────────────────────
+      // 用户原话：「建任务的时候选择长任务就是长表单一次到位」。
+      // 以前只能「先建普通任务 → 再转长任务」，第一步派活时唤醒文案里没有阶段清单，
+      // 执行者第一轮就看不到路线。现在勾上就一次性把全部字段填完。
+      const [isLong, setIsLong] = useState(false)
+      const [phases, setPhases] = useState('')          // 每行一个阶段
+      const [reviewer, setReviewer] = useState('')
+      const [due, setDue] = useState('')
+      const [scopes, setScopes] = useState('')          // 每行一个路径前缀
+      const [complexity, setComplexity] = useState('')
+      const [requiresPaid, setRequiresPaid] = useState(false)
+      const [deps, setDeps] = useState('')
+      const [labels, setLabels] = useState('')
+      const [milestone, setMilestone] = useState('')
+      const [cycleName, setCycleName] = useState('')
+      const [estimate, setEstimate] = useState('')
+      // 授权依据（mandate.basis）：这是任务级的「权限」——执行者被唤醒时必须知道
+      // 「这活是谁批的、凭什么」。不填就不渲染授权段（宁可没有，不编造授权）。
+      const [mandateBasis, setMandateBasis] = useState('')
       const [openId, setOpenId] = useState(null)
       const [busy, setBusy] = useState(false)
       const [err, setErr] = useState(null)
@@ -2591,6 +2616,34 @@ window.__ModuleLoader__.load({
           if (desc.trim()) body.description = desc.trim()
           if (priority !== '') body.priority = Number(priority)
           if (assignee) body.assignee = assignee
+          // ── 长任务一次到位（需求3）：全部字段随创建一起提交 ──────────────
+          // 后端 POST /tasks 认 `longrun:true` 或非空 `phases` ⇒ 建完即长任务，
+          // 阶段清单落 task-meta.jsonl，第一次唤醒就带在锚定原文里。
+          if (isLong) {
+            body.longrun = true
+            const phaseList = phases.split('\n').map((x) => x.trim()).filter(Boolean)
+            if (phaseList.length) body.phases = phaseList
+            if (reviewer) body.reviewer = reviewer
+            if (due) {
+              const ts = Date.parse(due)
+              if (Number.isFinite(ts)) body.dueAt = ts
+            }
+            const scopeList = scopes.split('\n').map((x) => x.trim()).filter(Boolean)
+            if (scopeList.length) body.writeScopes = scopeList
+            if (complexity) body.expectedComplexity = complexity
+            if (requiresPaid) body.requiresPaid = true
+            const depList = deps.split(/[,\s]+/).map((x) => x.trim()).filter(Boolean)
+            if (depList.length) body.blockedBy = depList
+            const labelList = labels.split(/[,\s]+/).map((x) => x.trim()).filter(Boolean)
+            if (labelList.length) body.labels = labelList
+            if (milestone) body.milestone = milestone
+            if (cycleName) body.cycle = cycleName
+            if (estimate !== '') body.estimate = Number(estimate)
+            if (mandateBasis) {
+              body.mandateBasis = mandateBasis
+              body.mandateSender = 'ui'
+            }
+          }
           const created = await call('/tasks', { method: 'POST', body })
           const task = created?.task ?? null
           setSubject('')
@@ -2598,6 +2651,9 @@ window.__ModuleLoader__.load({
           setPriority('')
           setAssignee('')
           setShowAdv(false)
+          setPhases(''); setReviewer(''); setDue(''); setScopes('')
+          setComplexity(''); setRequiresPaid(false); setDeps('')
+          setLabels(''); setMilestone(''); setCycleName(''); setEstimate(''); setMandateBasis('')
           reload()
           // 改造04 §3.3：选了负责人 = 一步派活；失败不静默，wake 结果如实显示。
           if (assignee && task?.id) {
@@ -2656,11 +2712,25 @@ window.__ModuleLoader__.load({
             : h('button', { className: 'csb-btn csb-btn-s', onClick: () => setAttentionOnly(true) }, '只看需要我管的')),
         h('div', { className: 'csb-bar', style: { marginTop: 12 } },
           h('input', {
-            className: 'csb-in csb-grow', placeholder: '要做什么？（例如：实现登录接口。回车创建）',
+            className: 'csb-in csb-grow', placeholder: isLong
+              ? '长任务名称（回车创建）'
+              : '要做什么？（例如：实现登录接口。回车创建）',
             value: subject, onChange: (e) => setSubject(e.target.value),
             onKeyDown: (e) => e.key === 'Enter' && create(),
             ref: subjectRef,
           }),
+          // 长任务开关：勾上就展开完整表单（一次到位，不再「建完再转」）
+          h('label', {
+            className: 'csb-bar',
+            style: { gap: 4, cursor: 'pointer', margin: 0, whiteSpace: 'nowrap' },
+            title: '长任务 = 分阶段推进，每次唤醒都带阶段清单，防止几十轮后目标漂移',
+          },
+            h('input', {
+              type: 'checkbox', checked: isLong,
+              onChange: (e) => { setIsLong(e.target.checked); if (e.target.checked) setShowAdv(true) },
+            }),
+            h('span', { className: 'csb-set-d' }, '长任务'),
+          ),
           h('button', { className: 'csb-btn csb-btn-s', onClick: () => setShowAdv((v) => !v) }, showAdv ? '收起' : '更多字段'),
           h('button', { className: 'csb-btn csb-btn-p', disabled: busy || !subject.trim(), onClick: create }, '创建任务'),
           h('select', { className: 'csb-sel', style: { width: 116 }, value: filter, onChange: (e) => setFilter(e.target.value) },
@@ -2682,6 +2752,106 @@ window.__ModuleLoader__.load({
               h('select', { className: 'csb-sel', style: { width: 160 }, value: assignee, onChange: (e) => setAssignee(e.target.value) },
                 h('option', { value: '' }, '负责人（自动）'),
                 bots.map((b) => h('option', { key: b.id, value: b.sessionId }, b.name))))
+          : null,
+        // ── 长任务完整表单（需求3：一次到位）────────────────────────────────
+        // 覆盖「边界 / 权限 / 路由」三类选项，全部是后端**已支持**的字段：
+        //   写入边界 writeScopes · 验收人 reviewer · 依赖 blockedBy
+        //   复杂度 expectedComplexity · 是否付费 requiresPaid
+        //   截止 dueAt · 标签 labels · 里程碑 milestone · 周期 cycle · 预估 estimate
+        isLong
+          ? h('div', { className: 'csb-ltform' },
+              h('div', { className: 'csb-fld', style: { gridColumn: '1 / -1' } },
+                h('label', null, '阶段清单（每行一个阶段，按序推进，不许跳步）'),
+                h('textarea', {
+                  className: 'csb-ta', style: { minHeight: 92 },
+                  placeholder: '范围与验收标准确认\n执行与自测\n交付与复盘',
+                  value: phases, onChange: (e) => setPhases(e.target.value),
+                }),
+                h('div', { className: 'csb-fld-h' },
+                  '留空就是默认三阶段；最多 12 个，每个不超过 200 字。阶段清单会写进每次唤醒的「目标锚原文」。')),
+              h('div', { className: 'csb-fld' },
+                h('label', null, '验收人'),
+                h('input', {
+                  className: 'csb-in', placeholder: '谁验收（可留空）',
+                  value: reviewer, onChange: (e) => setReviewer(e.target.value),
+                })),
+              h('div', { className: 'csb-fld' },
+                h('label', null, '截止时间'),
+                h('input', {
+                  className: 'csb-in', type: 'datetime-local',
+                  value: due, onChange: (e) => setDue(e.target.value),
+                })),
+              h('div', { className: 'csb-fld' },
+                h('label', null, '写入边界（每行一个路径前缀）'),
+                h('textarea', {
+                  className: 'csb-ta', style: { minHeight: 70 },
+                  placeholder: 'src/api/\ndocs/',
+                  value: scopes, onChange: (e) => setScopes(e.target.value),
+                }),
+                h('div', { className: 'csb-fld-h' }, '超出这个范围的写入算越界，是可审计的边界。')),
+              h('div', { className: 'csb-fld' },
+                h('label', null, '复杂度档位'),
+                h('select', {
+                  className: 'csb-sel', value: complexity,
+                  onChange: (e) => setComplexity(e.target.value),
+                },
+                  h('option', { value: '' }, '不标（默认按常规处理）'),
+                  h('option', { value: 'T0' }, 'T0 一句话问答'),
+                  h('option', { value: 'T1' }, 'T1 常规改动'),
+                  h('option', { value: 'T2' }, 'T2 跨文件 / 多步'),
+                  h('option', { value: 'T3' }, 'T3 架构级')),
+                h('div', { className: 'csb-fld-h' }, '档位决定路由：拿不准就往低标，误标付费是浪费钱。')),
+              h('div', { className: 'csb-fld' },
+                h('label', null, '依赖任务（逗号分隔的任务 id）'),
+                h('input', {
+                  className: 'csb-in', placeholder: 't-12, t-15',
+                  value: deps, onChange: (e) => setDeps(e.target.value),
+                }),
+                h('div', { className: 'csb-fld-h' }, '依赖没完成，这条不会进「可领」列表。')),
+              h('div', { className: 'csb-fld' },
+                h('label', null, '标签（逗号分隔）'),
+                h('input', {
+                  className: 'csb-in', placeholder: 'backend, urgent',
+                  value: labels, onChange: (e) => setLabels(e.target.value),
+                })),
+              h('div', { className: 'csb-fld' },
+                h('label', null, '里程碑 / 周期'),
+                h('div', { className: 'csb-bar', style: { gap: 6 } },
+                  h('input', {
+                    className: 'csb-in', placeholder: '里程碑',
+                    value: milestone, onChange: (e) => setMilestone(e.target.value),
+                  }),
+                  h('input', {
+                    className: 'csb-in', placeholder: '周期',
+                    value: cycleName, onChange: (e) => setCycleName(e.target.value),
+                  }))),
+              h('div', { className: 'csb-fld' },
+                h('label', null, '预估工作量'),
+                h('input', {
+                  className: 'csb-in', type: 'number', min: 0, placeholder: '数字，可留空',
+                  value: estimate, onChange: (e) => setEstimate(e.target.value),
+                })),
+              h('div', { className: 'csb-fld' },
+                h('label', null, '授权依据（执行者据此判断能不能直接动手）'),
+                h('select', {
+                  className: 'csb-sel', value: mandateBasis,
+                  onChange: (e) => setMandateBasis(e.target.value),
+                },
+                  h('option', { value: '' }, '不记录（UI 建的，不算授权）'),
+                  h('option', { value: 'explicit' }, '人明确点名要做（可以直接动手）'),
+                  h('option', { value: 'inferred' }, '按规则推断（动手前先确认）'),
+                  h('option', { value: 'task-board' }, '任务板派发（管理面正式派活）')),
+                h('div', { className: 'csb-fld-h' },
+                  '只有明确记录依据时，唤醒文案里才会出现「授权」一段 —— 宁可没有，不编造授权。')),
+              h('div', { className: 'csb-fld' },
+                h('label', null, '是否值得用付费渠道'),
+                h('label', { className: 'csb-bar', style: { gap: 6, cursor: 'pointer' } },
+                  h('input', {
+                    type: 'checkbox', checked: requiresPaid,
+                    onChange: (e) => setRequiresPaid(e.target.checked),
+                  }),
+                  h('span', null, '允许付费（默认只走免费渠道）')),
+                h('div', { className: 'csb-fld-h' }, '只有确实需要强模型时才勾；勾了就是花你的钱。')))
           : null,
         h('div', { className: 'csb-bar', style: { marginTop: 8, flexWrap: 'wrap' } },
           h('button', {

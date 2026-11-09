@@ -429,6 +429,42 @@ function longrunPhaseList(longrun) {
     .map((phase) => phase.trim())
 }
 
+/**
+ * 归一化长任务阶段清单（**创建与 evolve 共用的单一真相**）。
+ *
+ * 为什么抽出来：创建时长任务和「事后转长任务」是同一份数据结构，
+ * 校验规则（上限 12 项 / 单项 200 字 / 不许空白）必须只有一处 ——
+ * 两处各写一遍，早晚会漂移成「创建的能过、转的不能过」这种鬼故事。
+ *
+ * @param {unknown} raw phases 数组（undefined/null/[] ⇒ 默认三阶段）
+ * @param {string} code 报错时用的错误码（区分调用方）
+ * @returns {string[]}
+ */
+function normalizePhases(raw, code = 'EVOLVE_BAD_PHASES') {
+  const failPhases = (message) => {
+    const error = new Error(message)
+    error.status = 400
+    error.code = code
+    return error
+  }
+  if (raw === undefined || raw === null || (Array.isArray(raw) && raw.length === 0)) {
+    return [...LONGRUN_DEFAULT_PHASES]
+  }
+  if (!Array.isArray(raw)) throw failPhases('phases 必须是字符串数组')
+  if (raw.length > LONGRUN_PHASES_MAX) {
+    throw failPhases(`phases 最多 ${LONGRUN_PHASES_MAX} 项（收到 ${raw.length} 项）`)
+  }
+  return raw.map((phase, index) => {
+    if (typeof phase !== 'string') throw failPhases(`phases[${index}] 必须是字符串（收到 ${JSON.stringify(phase)}）`)
+    const text = phase.trim()
+    if (!text) throw failPhases(`phases[${index}] 不能为空`)
+    if (text.length > LONGRUN_PHASE_MAX) {
+      throw failPhases(`phases[${index}] 过长（最多 ${LONGRUN_PHASE_MAX} 字，收到 ${text.length} 字）`)
+    }
+    return text
+  })
+}
+
 /** 变更**前**的任务快照（契约 §2.2 reopen 步骤 1）。 */
 function buildTaskSnapshot(task) {
   return {
@@ -1182,10 +1218,22 @@ export function installApi(ctx, { warn } = {}) {
         // 落到 board 时组装成 `mandate` 对象 —— 校验在 board 侧统一做。
         // 与 `src/tools.js` 的 bot_task_create 保持**同一套参数名**，
         // 否则同一个概念会出现两种形状，调用方必须记两套规则。
-        const { mandateBasis, mandateSender, ...rest } = body
+        const { mandateBasis, mandateSender, longrun, phases, ...rest } = body
         const mandate = {}
         if (mandateBasis !== undefined && mandateBasis !== null) mandate.basis = mandateBasis
         if (mandateSender !== undefined && mandateSender !== null) mandate.sender = mandateSender
+
+        // ── 长任务「一次到位」（2026-11-09 需求3）───────────────────────────
+        // 用户原话：「建任务的时候选择长任务就是长表单一次到位」。
+        // 此前 longrun 只能建完再转（`/tasks/evolve mode=longrun`），于是想直接
+        // 建长任务的人必须先建一条普通任务、再转一次 —— 两步操作、两次留痕，
+        // 而且第一步派活时唤醒文案里**没有阶段清单**，执行者第一轮就看不到。
+        //
+        // 判定：显式 `longrun:true` 或给了 `phases` 数组 ⇒ 按长任务建。
+        // 校验放在**建任务之前**（非法 phases 不该留下一条半成品任务）。
+        const wantsLongrun = longrun === true || (Array.isArray(phases) && phases.length > 0)
+        const normalizedPhases = wantsLongrun ? normalizePhases(phases, 'TASK_BAD_PHASES') : undefined
+
         const task = await withService(services, 'board', (b) =>
           b.create({
             ...rest,
@@ -1193,6 +1241,25 @@ export function installApi(ctx, { warn } = {}) {
             ...(Object.keys(mandate).length > 0 ? { mandate } : {}),
           }),
         )
+
+        // 阶段清单落在 task-meta.jsonl（与 evolve 同一份存储、同一形状）⇒
+        // `buildTaskAnchorText` 自动带上，第一次唤醒就可见，不需要再转。
+        if (wantsLongrun) {
+          appendTaskMeta(services, {
+            kind: 'longrun',
+            taskId: task.id,
+            phases: normalizedPhases,
+            note: '创建时长任务',
+            by: rest.byId ?? 'ui',
+            at: Date.now(),
+          })
+          sendJson(response, 200, {
+            ok: true, task, phases: normalizedPhases, longrun: true,
+            note: '已按长任务创建；此后每次唤醒都会带上阶段清单',
+          })
+          return
+        }
+
         sendJson(response, 200, { ok: true, task })
         return
       }
@@ -1948,7 +2015,12 @@ export function installApi(ctx, { warn } = {}) {
             target: body.ownerId,
             reason: 'task-assigned',
             dedupKey: `task-assigned:${task.id}:${task.rev}`,
-            text: `新任务 ${task.id}：${task.subject}\n${task.description ?? ''}`.trim(),
+            // 2026-11-09：改成**锚定文案**（与 /tasks/wake、补充说明同一套）。
+            // 原来的 `新任务 t-x：标题\n描述` 有三处不如它：
+            //   ① 长任务的阶段清单不在里面 —— 第一次派活执行者看不到路线（需求3 的核心）
+            //   ② 没有写入边界 / 依赖 / 授权依据（mandate）—— 越界风险
+            //   ③ 与后面每次唤醒的文案不同源，容易出现「第一轮和后面几轮看到的活不一样」
+            text: buildTaskAnchorText(task, readTaskNotes(services, task.id), readLongrunMeta(services, task.id)),
           })
           // wake 层就失败了（agent-not-live / dispatcher 拒收）→ 同样落到任务上。
           if (wake && wake.result === 'failed') {
@@ -2493,46 +2565,7 @@ export function installApi(ctx, { warn } = {}) {
         }
 
         // mode=longrun（转成长任务）：阶段清单进 task-meta，唤醒文案自动带上。
-        let phases
-        if (body.phases === undefined || body.phases === null
-          || (Array.isArray(body.phases) && body.phases.length === 0)) {
-          phases = [...LONGRUN_DEFAULT_PHASES]
-        } else {
-          if (!Array.isArray(body.phases)) {
-            const error = new Error('phases 必须是字符串数组')
-            error.status = 400
-            error.code = 'EVOLVE_BAD_PHASES'
-            throw error
-          }
-          if (body.phases.length > LONGRUN_PHASES_MAX) {
-            const error = new Error(`phases 最多 ${LONGRUN_PHASES_MAX} 项（收到 ${body.phases.length} 项）`)
-            error.status = 400
-            error.code = 'EVOLVE_BAD_PHASES'
-            throw error
-          }
-          phases = body.phases.map((phase, index) => {
-            if (typeof phase !== 'string') {
-              const error = new Error(`phases[${index}] 必须是字符串（收到 ${JSON.stringify(phase)}）`)
-              error.status = 400
-              error.code = 'EVOLVE_BAD_PHASES'
-              throw error
-            }
-            const text = phase.trim()
-            if (!text) {
-              const error = new Error(`phases[${index}] 不能为空`)
-              error.status = 400
-              error.code = 'EVOLVE_BAD_PHASES'
-              throw error
-            }
-            if (text.length > LONGRUN_PHASE_MAX) {
-              const error = new Error(`phases[${index}] 过长（最多 ${LONGRUN_PHASE_MAX} 字，收到 ${text.length} 字）`)
-              error.status = 400
-              error.code = 'EVOLVE_BAD_PHASES'
-              throw error
-            }
-            return text
-          })
-        }
+        const phases = normalizePhases(body.phases, 'EVOLVE_BAD_PHASES')
         // ① reopen:true 时按 reopen 流程重开（快照必须在内核清空 artifacts 之前落盘）。
         let current = task
         if (body.reopen === true) {
