@@ -460,17 +460,37 @@ test('2026-11-04 P0：API handler 对无会话的代理请求返回 403（端到
 
 // ── 改造07：穿透面板（下层 AI 基础设施）─────────────────────────────────────
 
-test('改造07 穿透：GET /deepdive/blocks 返回 6 个下层区块', async () => {
+test('改造07 穿透：GET /deepdive/blocks 返回 7 个下层区块（含订阅）', async () => {
   const h = boot()
   try {
     const { status, json } = await h.req('GET', '/deepdive/blocks')
     assert.equal(status, 200)
     assert.equal(json.ok, true)
     assert.ok(Array.isArray(json.blocks), 'blocks 应是数组')
+    assert.equal(json.blocks.length, 7, `应返回 7 个区块，实际 ${json.blocks.length}`)
     const ids = json.blocks.map((b) => b.id)
-    for (const want of ['registry', 'wake', 'store', 'routing', 'verify', 'suggest']) {
+    for (const want of ['registry', 'wake', 'store', 'routing', 'verify', 'suggest', 'subscription']) {
       assert.ok(ids.includes(want), `应含区块 ${want}，实际 ${ids.join(',')}`)
     }
+    // 订阅区块的 stats 必须是可序列化数字（不能是 undefined 污染 UI）
+    const sub = json.blocks.find((b) => b.id === 'subscription')
+    for (const k of ['total', 'active', 'dropped', 'fanouts']) {
+      assert.equal(typeof sub.stats[k], 'number', `订阅区块 stats.${k} 应是数字`)
+    }
+  } finally {
+    h.cleanup()
+  }
+})
+
+test('改造07 穿透：GET /deepdive/block/subscription 返回订阅关系', async () => {
+  const h = boot()
+  try {
+    const { status, json } = await h.req('GET', '/deepdive/block/subscription')
+    assert.equal(status, 200)
+    assert.equal(json.ok, true)
+    assert.equal(json.block, 'subscription')
+    assert.ok(Array.isArray(json.data.subscriptions), 'data.subscriptions 应是数组')
+    assert.ok(json.data.stats && typeof json.data.stats.total === 'number')
   } finally {
     h.cleanup()
   }

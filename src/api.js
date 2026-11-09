@@ -3730,7 +3730,7 @@ export function installApi(ctx, { warn } = {}) {
       }
 
       // ── 改造07：穿透面板（下层 AI 基础设施查看）─────────────────────────────
-      // GET /deepdive/blocks —— 列出 6 个下层区块 + 概览统计
+      // GET /deepdive/blocks —— 列出 7 个下层区块 + 概览统计
       if (request.method === 'GET' && path === '/deepdive/blocks') {
         const blocks = []
         // 注册表：Bot 数量 + 各状态计数
@@ -3784,6 +3784,17 @@ export function installApi(ctx, { warn } = {}) {
           id: 'suggest', label: '建议', description: '建议确认队列 / 纪律提议',
           stats: sugStats ?? { note: 'suggest 服务未装配' },
         })
+        // 订阅：任务 ↔ 房间订阅关系（服务不可用时计数为 0，绝不抛）
+        const subStats = services.subscription?.stats?.()
+        blocks.push({
+          id: 'subscription', label: '订阅', description: '任务订阅、房间扇出',
+          stats: {
+            total: subStats?.total ?? 0,
+            active: subStats?.active ?? 0,
+            dropped: subStats?.dropped ?? 0,
+            fanouts: subStats?.fanouts ?? 0,
+          },
+        })
         sendJson(response, 200, { ok: true, blocks })
         return
       }
@@ -3825,6 +3836,19 @@ export function installApi(ctx, { warn } = {}) {
           } else if (id === 'suggest') {
             data.stats = services.suggest?.stats?.()
             data.pending = services.suggest?.list?.({ status: 'pending', limit: 20 }) ?? []
+          } else if (id === 'subscription') {
+            // 订阅：任务 ↔ 房间订阅关系。
+            // ⚠️ 服务未装配时**不能抛** —— 穿透面板是「管理/查看」，不是硬依赖。
+            if (!services.subscription) {
+              sendJson(response, 200, {
+                ok: true, block: id,
+                available: false, reason: '订阅服务未装配', data: {}, operations: [],
+              })
+              return
+            }
+            data.stats = services.subscription.stats()
+            data.subscriptions = services.subscription.list({}).slice(0, 100)
+            operations.push({ id: 'unsubscribe', label: '取消某订阅', body: { id: '' } })
           } else {
             sendJson(response, 404, { ok: false, reason: `未知区块: ${id}` })
             return
@@ -3852,6 +3876,13 @@ export function installApi(ctx, { warn } = {}) {
             sendJson(response, 200, { ok: true, text: 'Bot 会话重启需要内核支持，请通过页面操作' })
           } else if (block === 'verify' && op === 'recheck') {
             sendJson(response, 200, { ok: true, text: '验收重跑需要在任务详情中操作' })
+          } else if (block === 'subscription' && op === 'unsubscribe') {
+            const result = services.subscription?.unsubscribe(body.id)
+            if (!result?.ok) {
+              sendJson(response, 400, { ok: false, reason: result?.reason ?? '取消订阅失败' })
+              return
+            }
+            sendJson(response, 200, { ok: true, text: `已取消订阅 ${body.id}`, result })
           } else {
             sendJson(response, 400, { ok: false, reason: `不支持的操作：${block}/${op}` })
           }
