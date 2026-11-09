@@ -20,7 +20,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 
-import { attachToWorkspace, createSession } from '../src/kernel.js'
+import { attachToWorkspace, createSession, resumeSession } from '../src/kernel.js'
 
 /** 假 ctx：只提供本测试需要的两个服务，其余缺失（验证降级路径）。 */
 function fakeCtx({ defaultSelection, registry } = {}) {
@@ -107,4 +107,34 @@ test('K8 attachToWorkspace：attach 抛错由调用方吞掉（工作区只是�
   assert.equal(handle.agent.id, 'bot-e')
   // 直接调则如实抛（调用方自己决定要不要吞）
   await assert.rejects(() => attachToWorkspace(ctx, '/tmp/e', 'bot-e2'), /cwd 不匹配/)
+})
+
+test('K9 复活会话：存量会话没有模型选择时，带上默认模型（否则下次唤醒照样炸）', async () => {
+  const calls = []
+  const ctx = {
+    reflect: {
+      get: (key) => {
+        if (key === 'agents') return { resume: async (o) => { calls.push(o); return { agent: { id: o.resumeSessionId } } } }
+        if (key === 'agentDefaultModel') return { currentSelection: () => ({ provider: 'huoshan', model: 'm' }) }
+        return undefined
+      },
+    },
+  }
+  await resumeSession(ctx, { resumeSessionId: 'bot-old' })
+  assert.deepEqual(calls[0].agentOptions, { provider: 'huoshan', model: 'm' })
+})
+
+test('K10 复活会话：调用方显式给模型时优先', async () => {
+  const calls = []
+  const ctx = {
+    reflect: {
+      get: (key) => {
+        if (key === 'agents') return { resume: async (o) => { calls.push(o); return { agent: { id: 'x' } } } }
+        if (key === 'agentDefaultModel') return { currentSelection: () => ({ provider: 'p2', model: 'm2' }) }
+        return undefined
+      },
+    },
+  }
+  await resumeSession(ctx, { resumeSessionId: 'bot-x', agentOptions: { provider: 'p1', model: 'm1' } })
+  assert.deepEqual(calls[0].agentOptions, { provider: 'p1', model: 'm1' })
 })

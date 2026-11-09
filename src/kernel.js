@@ -426,9 +426,19 @@ export async function resumeSession(ctx, options) {
   if (!agents || typeof agents.resume !== 'function') {
     throw new Error('cs-bots kernel: agents.resume 不可用')
   }
-  const { resumeSessionId, signal } = options ?? {}
+  const { resumeSessionId, signal, agentOptions } = options ?? {}
   if (!resumeSessionId) throw new Error('cs-bots kernel: resumeSession 需要 resumeSessionId')
-  return agents.resume({ resumeSessionId, ...(signal ? { signal } : {}) })
+  // 2026-11-09 同源修复：**存量会话**从来没有记录过模型选择（当时走的是不带
+  // agentOptions 的创建路径），复活后依然 `model.current() === undefined`，
+  // 下一次唤醒照样炸 `has no provider/model`。所以复活也要给兜底路由：
+  // 调用方显式给 > 会话自己已记录的 > 宿主全局默认（由宿主负责，我们只在
+  // 前两者都没有时才传，避免把用户后来改过的会话级选择覆盖回默认值）。
+  const route = agentOptions ?? defaultModelSelection(ctx)
+  return agents.resume({
+    resumeSessionId,
+    ...(route ? { agentOptions: route } : {}),
+    ...(signal ? { signal } : {}),
+  })
 }
 
 // ── HTTP 路由注册 ───────────────────────────────────────────────────────────
