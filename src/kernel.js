@@ -572,3 +572,157 @@ export function defaultPreset(ctx) {
     return undefined
   }
 }
+
+// ── 会话内容读取（需求2：任务详情里直接看对话，不必跳走）──────────────────────
+
+/**
+ * 读一个会话的历史事件，转成「人类可读的对话片段」。
+ *
+ * 为什么需要它（2026-11-08 用户反馈）：
+ *   「任务栏页面指派 bot 后，无法追踪任务进度，无法看到产出物，
+ *     没有跳转对话也没有对话内容查看」
+ *   ⇒ 跳转会话（openSession）只能把人带到会话界面，**看不到这个任务相关的对话**；
+ *     人想看「Bot 到底干了什么」，必须能在任务详情里直接读。
+ *
+ * 数据来源：官方 `ctx.sessionPersistence`（durable 事件日志，**真相源**）。
+ * 为什么不用 live Agent 的内存：进程重启后 live 注册表是空的，但磁盘上的会话仍在——
+ * 用持久化层读才能保证「重启后照样能看历史」。
+ *
+ * @param {object} ctx
+ * @param {string} sessionId
+ * @param {{ limit?: number, offset?: number }} [options]
+ *   - `limit`：最多返回多少条**消息片段**（默认 40；取**末尾**的，因为人关心最近发生了什么）
+ * @returns {Promise<{
+ *   ok: boolean, sessionId?: string, messages?: object[], total?: number,
+ *   reason?: string, available?: boolean,
+ * }>}
+ */
+export async function readSessionMessages(ctx, sessionId, options = {}) {
+  if (typeof sessionId !== 'string' || sessionId === '') {
+    return { ok: false, reason: 'missing-session-id', available: true }
+  }
+  const persistence = service(ctx, 'sessionPersistence')
+  if (!persistence || typeof persistence.open !== 'function') {
+    return {
+      ok: false,
+      available: false,
+      reason: 'sessionPersistence 不可用（宿主未装配持久化层）——无法读取会话历史',
+    }
+  }
+
+  let handle
+  try {
+    // access: 'read' —— 只读打开，绝不抢所有权（会话可能正在被 live agent 使用）
+    handle = await persistence.open(sessionId, 'read')
+  } catch (error) {
+    return {
+      ok: false,
+      available: true,
+      reason: `打开会话失败：${error?.message ?? error}`,
+    }
+  }
+
+  try {
+    const result = await handle.read(0)
+    const events = Array.isArray(result?.events) ? result.events : []
+    const messages = eventsToMessages(events)
+    const limit = Number.isFinite(options.limit) && options.limit > 0 ? Math.floor(options.limit) : 40
+    // 取末尾 limit 条：人关心的是「最近在干什么」，不是开场白
+    const tail = messages.length > limit ? messages.slice(-limit) : messages
+    return {
+      ok: true,
+      sessionId,
+      messages: tail,
+      total: messages.length,
+      truncated: messages.length > limit,
+    }
+  } catch (error) {
+    return { ok: false, available: true, reason: `读取会话事件失败：${error?.message ?? error}` }
+  } finally {
+    try {
+      await handle.close?.()
+    } catch {
+      /* 关闭失败不影响已读到的数据 */
+    }
+  }
+}
+
+/**
+ * 把官方 SessionEvent 转成人类可读的消息片段。
+ *
+ * 只保留**有对话价值**的事件类型：用户消息、助手文本、工具调用（摘要）、工具结果（摘要）。
+ * 其余事件（会话元数据、内存写入等）一律跳过——它们对「看 Bot 干了什么」没有帮助，
+ * 塞进来只会让人淹没在噪声里。
+ *
+ * 每条输出统一形状：`{ role, kind, text, at?, toolName? }`
+ *   - role: 'user' | 'assistant' | 'tool'
+ *   - kind: 'text' | 'tool-call' | 'tool-result' | 'reasoning'
+ *
+ * @param {object[]} events
+ * @returns {object[]}
+ */
+function eventsToMessages(events) {
+  const out = []
+  for (const ev of events) {
+    if (!ev || typeof ev !== 'object') continue
+    const type = ev.type
+    const at = typeof ev.time === 'number' ? ev.time : undefined
+
+    // 用户消息
+    if (type === 'user/message' || type === 'user-message') {
+      const text = blocksToText(ev.content ?? ev.message?.content)
+      if (text) out.push({ role: 'user', kind: 'text', text, at })
+      continue
+    }
+
+    // 助手消息：拆成文本 + 工具调用
+    if (type === 'assistant/message' || type === 'assistant-message') {
+      const blocks = Array.isArray(ev.content) ? ev.content : []
+      for (const b of blocks) {
+        if (!b || typeof b !== 'object') continue
+        if (b.type === 'text' && typeof b.text === 'string' && b.text.trim()) {
+          out.push({ role: 'assistant', kind: 'text', text: b.text, at })
+        } else if (b.type === 'reasoning' && typeof b.text === 'string' && b.text.trim()) {
+          out.push({ role: 'assistant', kind: 'reasoning', text: b.text.slice(0, 2000), at })
+        } else if (b.type === 'tool-call' || b.type === 'toolCall') {
+          const name = b.name ?? b.toolName ?? '?'
+          const input = b.input ?? b.arguments
+          let summary = ''
+          try {
+            summary = typeof input === 'string' ? input : JSON.stringify(input ?? {})
+          } catch {
+            summary = ''
+          }
+          out.push({
+            role: 'assistant',
+            kind: 'tool-call',
+            toolName: String(name),
+            text: summary.length > 500 ? `${summary.slice(0, 500)}…` : summary,
+            at,
+          })
+        }
+      }
+      continue
+    }
+
+    // 工具结果
+    if (type === 'tool/result' || type === 'tool-result') {
+      const text = blocksToText(ev.content ?? ev.result)
+      if (text) out.push({ role: 'tool', kind: 'tool-result', text: text.slice(0, 1500), at })
+      continue
+    }
+  }
+  return out
+}
+
+/** 把 content blocks 拍平成一段文本（只取 text 类型块）。 */
+function blocksToText(content) {
+  if (typeof content === 'string') return content.trim()
+  if (!Array.isArray(content)) return ''
+  const parts = []
+  for (const b of content) {
+    if (typeof b === 'string') parts.push(b)
+    else if (b && typeof b === 'object' && typeof b.text === 'string') parts.push(b.text)
+  }
+  return parts.join('\n').trim()
+}

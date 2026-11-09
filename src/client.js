@@ -979,8 +979,11 @@ window.__ModuleLoader__.load({
         task ? h('div', null,
           h('div', { className: 'csb-kv' },
             // ── 5W：谁建的 / 是什么 / 何时 / 在哪做 / 为什么 ──
-            h('span', { className: 'csb-k' }, '谁建的'), h('span', { className: 'csb-v' }, task.createdBy ? botName(bots, task.createdBy) : task.createdBy),
-            h('span', { className: 'csb-k' }, '来源'), h('span', { className: 'csb-v' }, task.source === 'ai' ? '智能体自动派发' : '人建的'),
+            // 需求5：表述以「人」为主体——人建的任务就说「用户」，不暴露 Bot 会话 id
+            h('span', { className: 'csb-k' }, '谁建的'),
+            h('span', { className: 'csb-v' }, task.source === 'human' ? '用户' : (task.createdBy ? botName(bots, task.createdBy) : '智能体')),
+            h('span', { className: 'csb-k' }, '来源'),
+            h('span', { className: 'csb-v' }, task.source === 'human' ? '用户自建' : '智能体分发'),
             h('span', { className: 'csb-k' }, '优先级'), h('span', { className: 'csb-v' }, task.priority !== undefined ? `${task.priority}（${task.priority >= 8 ? '紧急' : '一般'}）` : '未设'),
             h('span', { className: 'csb-k' }, '截止'), h('span', { className: 'csb-v' }, task.dueAt ? fmt(task.dueAt) : '未设'),
             h('span', { className: 'csb-k' }, '状态'), h('span', { className: 'csb-v' }, h(Badge, { status: task.status })),
@@ -1057,10 +1060,19 @@ window.__ModuleLoader__.load({
             ? h(DepGraph, { graph, currentId: task.id })
             : null,
 
+          // 需求2：任务对话（进度 + 对话内容 + 去对话跳转），直接放在产出物之前
+          h(TaskConversationPanel, { taskId: task.id, task, bots, onGotoSource }),
+
           // 成果展示
           h(Section, { title: '产出物证据', desc: '任务完成时要带上「做了什么」的凭据（文件路径 / 链接）。' }),
           (task.artifacts ?? []).length === 0
-            ? h(Empty, { icon: '◈', title: '还没有产出物证据', hint: '任务完成并带上产出物证据后会出现在这里' })
+            ? h(Empty, {
+                icon: '◈',
+                title: '还没有产出物证据',
+                hint: task.status === 'completed'
+                  ? '这个任务完成了但没带产出物证据 —— 可以点上面「重开」让它补交，或在「变更」区派下去补。'
+                  : 'Bot 完成任务时会带上交付物路径/链接，届时会出现在这里（完成前看不到是正常的）。',
+              })
             : h('div', { className: 'csb-list', style: { marginTop: 10 } },
                 (task.artifacts ?? []).map((a, i) =>
                   h('div', { key: i, className: 'csb-card', style: { padding: '9px 12px' } },
@@ -1782,6 +1794,132 @@ window.__ModuleLoader__.load({
           })())
     }
 
+    /**
+     * 任务对话（需求2，2026-11-09）。
+     *
+     * ## 用户的原话（需求2）
+     *   「任务栏页面指派bot后，无法追踪任务进度，无法看到产出物，
+     *    没有跳转对话也没有对话内容查看」
+     *
+     * ⇒ 一个面板补齐三件事：**看进度**（来自 /tasks/summary 的 stepConclusions 与 stageInfo）、
+     *   **看产出物**（artifacts 直达预览/打开）、**看对话内容**（/tasks/conversation 读执行者会话）。
+     *
+     * ## 铁律
+     *   · **不装成功**：会话读不到（没有执行者 / 宿主没开 sessionPersistence）时，
+     *     把 `code` 对应的真话写出来，并给下一步 —— 不是只弹一句「失败」。
+     *   · **只读**：这里只渲染，不往执行者会话里写任何东西。
+     *   · **消息分层**：user / assistant / tool 三类各自样式，工具调用折叠，
+     *     reasoning 只在展开时看 —— 手机上默认不该被思维链淹没。
+     */
+    function TaskConversationPanel({ taskId, task, bots, onGotoSource }) {
+      const convQ = useApi(`/tasks/conversation?id=${encodeURIComponent(taskId)}&limit=40`, [taskId])
+      const [open, setOpen] = useState(false)
+      const [err, setErr] = useState(null)
+      const [expanded, setExpanded] = useState(false)
+      const [copied, setCopied] = useState(null)
+
+      const data = convQ.data
+      const messages = data?.messages ?? []
+      const bot = data?.bot ?? null
+      const sessionId = data?.sessionId ?? task?.assignee ?? task?.ownerId ?? null
+      // 后端在「没有执行者」时返回 ok:false + code NO_EXECUTOR，call() 会抛错 ——
+      // 那不是故障，是正常空态，要按空态呈现。
+      const noExecutor = /NO_EXECUTOR/.test(convQ.error ?? '') || /没有执行者/.test(convQ.error ?? '')
+
+      /** 跳到执行者的会话（宿主支持就直接开，不支持则复制 ID 兜底）。 */
+      const gotoSession = async () => {
+        setErr(null)
+        if (!sessionId) {
+          setErr('这个任务还没有执行者，先派活再跳转对话')
+          return
+        }
+        try {
+          if (hostUiWorkspace?.openSession) {
+            hostUiWorkspace.openSession({ sessionId })
+            return
+          }
+          const ok = await copyText(sessionId)
+          setCopied(ok ? `宿主不支持自动跳转，已复制会话 ID：${sessionId}` : `请手动复制会话 ID：${sessionId}`)
+        } catch (e) {
+          setErr(`无法打开会话：${e.message}`)
+        }
+      }
+
+      const roleLabel = (m) => {
+        if (m.role === 'user') return '你/派活方'
+        if (m.role === 'assistant') return bot?.name ?? '执行者'
+        if (m.role === 'tool') return m.toolName ? `工具 · ${m.toolName}` : '工具'
+        return m.role ?? '?'
+      }
+      // 复用房间消息那套样式（只读渲染，不新造 class）
+      const isMe = (m) => m.role === 'user'
+
+      const visible = expanded ? messages : messages.filter((m) => m.kind === 'text' || m.role === 'user')
+
+      return h('div', null,
+        h(Section, {
+          title: '任务对话',
+          desc: bot
+            ? `执行者「${bot.name}」的会话记录（最近 ${messages.length} 条${data?.truncated ? '，已截断' : ''}）。`
+              + '这里是只读的：要看全部或继续聊，点「去对话」。'
+            : '任务派给 Bot 之后，它的执行过程会出现在这里。',
+        }, null),
+
+        convQ.loading ? h(Skeleton, { n: 2 }) : null,
+
+        noExecutor
+          ? h(Empty, {
+              icon: '◌',
+              title: '还没有执行者',
+              hint: '任务派给 Bot 之后才会有对话记录。先在「可以做什么」里派活，或者用 Bot 页的「派发」把任务交给它。',
+            })
+          : convQ.error
+            ? h('div', { className: 'csb-err' }, `读不到对话：${convQ.error}`)
+            : null,
+
+        data && !noExecutor
+          ? h('div', null,
+              // 进度线索：后端给的阶段与摘要
+              h('div', { className: 'csb-anchor-meta', style: { marginTop: 6 } },
+                bot ? h('span', null, `执行者：${bot.name}${bot.label ? `（${bot.label}）` : ''}`) : null,
+                sessionId ? h('span', { className: 'csb-mono' }, `会话 ${short(sessionId, 18)}`) : null,
+                data?.available === false
+                  ? h('span', null, `会话不可读：${data.reason ?? '宿主未提供 sessionPersistence'}`)
+                  : h('span', null, `${messages.length} 条消息${data?.total ? ` / 共 ${data.total}` : ''}`)),
+              h('div', { className: 'csb-bar', style: { marginTop: 8 } },
+                h('button', { className: 'csb-btn csb-btn-p csb-btn-s', onClick: gotoSession }, '去对话（打开会话）'),
+                h('button', { className: 'csb-btn csb-btn-s', onClick: convQ.reload }, '刷新对话'),
+                messages.length > 0
+                  ? h('button', {
+                      className: `csb-btn csb-btn-s${expanded ? ' csb-btn-p' : ''}`,
+                      onClick: () => setExpanded((v) => !v),
+                    }, expanded ? '只看对话（隐藏工具/思维链）' : '看全部（含工具调用）')
+                  : null),
+              copied ? h(Notice, { kind: 'ok', onClose: () => setCopied(null) }, copied) : null,
+              err ? h('div', { className: 'csb-err' }, err) : null,
+
+              data?.available === false
+                ? h('div', { className: 'csb-note', style: { marginTop: 8 } },
+                    '宿主没有开放会话读取能力，所以看不到历史对话。'
+                    + '不影响看进度和产出物 —— 或者直接点「去对话」进它的会话里看。')
+                : null,
+
+              messages.length === 0 && data?.available !== false
+                ? h('div', { className: 'csb-set-d', style: { marginTop: 8 } }, '会话里还没有消息。')
+                : h('div', { className: 'csb-list', style: { marginTop: 10 } },
+                    visible.map((m, i) =>
+                      h('div', { key: i, className: `csb-msg-row${isMe(m) ? ' csb-msg-row-me' : ''}` },
+                        h('div', { className: `csb-msg${isMe(m) ? ' csb-msg-me' : ''}` },
+                          h('div', { className: 'csb-msg-h' },
+                            h('span', { className: 'csb-msg-sender' }, roleLabel(m)),
+                            m.kind && m.kind !== 'text' ? h('span', { className: 'csb-b csb-b-idle' }, m.kind) : null),
+                          h('div', { className: 'csb-msg-b' }, m.text ?? '')),
+                        h('div', { className: 'csb-msg-time' }, m.at ? fmt(m.at) : '')),
+                    )))
+          : null)
+    }
+
+
     // ══════════════════════════════════════════════════════════════════════
     // 改造06：任务变更中心（契约 CONTRACT-bots06 §3）
     //
@@ -2338,7 +2476,28 @@ window.__ModuleLoader__.load({
           : null)
     }
 
-    function TasksTab({ onGoto }) {
+    /** 需求1：智能体任务子页签——复用 TasksTab，只看 source='ai'。 */
+    function AiTasksTab(props) {
+      return h(TasksTab, { ...(props ?? {}), sourceFilter: 'ai', key: 'ai' })
+    }
+
+    /** 需求1：用户任务子页签——TasksTab 默认就是 human，显式包装保证语义清晰。 */
+    function UserTasksTab(props) {
+      return h(TasksTab, { ...(props ?? {}), sourceFilter: 'human', key: 'user' })
+    }
+
+    /**
+     * 任务看板。
+     *
+     * 需求1（2026-11-08）：任务页**默认只展示人建任务**；智能体自建/分发的任务
+     * 走独立子页签（`sourceFilter='ai'`），按状态分类展示。
+     *
+     * 为什么这样分：人关心的是「我要盯的活」，智能体之间互相派的活是执行细节——
+     * 混在一起会让人在看板上看到一堆自己没建过的卡片，反而找不到自己的任务。
+     *
+     * @param {{ onGoto?: Function, sourceFilter?: 'human'|'ai' }} props
+     */
+    function TasksTab({ onGoto, sourceFilter = 'human' }) {
       const [filter, setFilter] = useState('')
       const [subject, setSubject] = useState('')
       const [desc, setDesc] = useState('')
@@ -2360,9 +2519,11 @@ window.__ModuleLoader__.load({
       const subjectRef = useRef(null)
       const q = new URLSearchParams()
       if (filter) q.set('status', filter)
-      if (attentionOnly) q.set('attention', '1')
+      if (attentionOnly && sourceFilter === 'human') q.set('attention', '1')
+      // 需求1：按来源分离——human=用户自建，ai=智能体自建/分发
+      q.set('source', sourceFilter)
       const qs = q.toString()
-      const { data, loading, error, reload } = useApi(`/tasks${qs ? `?${qs}` : ''}`, [filter, attentionOnly])
+      const { data, loading, error, reload } = useApi(`/tasks${qs ? `?${qs}` : ''}`, [filter, attentionOnly, sourceFilter])
       const { data: rosterData } = useApi('/roster')
       const { data: wfData } = useApi('/library/workflows')
       const bots = rosterData?.bots ?? []
@@ -2450,16 +2611,20 @@ window.__ModuleLoader__.load({
         }
       }
 
+      const isAi = sourceFilter === 'ai'
       return h('div', { className: 'csb-wrap' },
         h(Section, {
-          title: '任务板',
-          desc: attentionOnly
-            ? '只看需要你管的（卡住 / 高优先 / 逾期 / 待验收 / 你建的）。AI 自己派发的任务不在这里，点下方「看全部」穿透查看。'
-            : '全部任务（含 AI 自己派发的）。点下方回到「只看需要我管的」。',
+          // 需求1：按来源给不同标题与说明——人只看自己建的，AI 的任务走独立子页签
+          title: isAi ? '智能体任务' : '我的任务',
+          desc: isAi
+            ? 'Bot 自行创建或分发的任务，按状态分类。这些是执行细节，平时不用盯；出问题（受阻/失败）时会出现在「我的任务」的待处理里。'
+            : (attentionOnly
+              ? '只看需要你管的（卡住 / 高优先 / 逾期 / 待验收）。智能体自己派发的任务在「智能体任务」子页签。'
+              : '全部你建的任务。点下方回到「只看需要我管的」。'),
         }),
-        h('div', { className: 'csb-bar', style: { marginTop: 8 } },
+        isAi ? null : h('div', { className: 'csb-bar', style: { marginTop: 8 } },
           attentionOnly
-            ? h('button', { className: 'csb-btn csb-btn-s', onClick: () => setAttentionOnly(false) }, '看全部任务')
+            ? h('button', { className: 'csb-btn csb-btn-s', onClick: () => setAttentionOnly(false) }, '看全部我的任务')
             : h('button', { className: 'csb-btn csb-btn-s', onClick: () => setAttentionOnly(true) }, '只看需要我管的')),
         h('div', { className: 'csb-bar', style: { marginTop: 12 } },
           h('input', {
@@ -3790,6 +3955,13 @@ window.__ModuleLoader__.load({
         setFocusSeq(Number.isInteger(seq) && seq > 0 ? seq : null)
       }, [locate])
 
+      // 需求3（用户补充）：从团队卡片「看房间」会带 `{ filter: 团队名 }` ——
+      // 用户是超级管理员，房间里可能很多，这里做前端定向过滤，让人一眼看到自己团队的房间。
+      const roomFilter = (locate?.filter ?? '').toString().trim()
+      const visibleRooms = roomFilter
+        ? rooms.filter((r) => (r.name ?? '').toLowerCase().includes(roomFilter.toLowerCase()))
+        : rooms
+
       // 定位到的消息加载出来后：滚过去 + 高亮（§3.2：`scrollIntoView`）
       useEffect(() => {
         if (focusSeq === null) return
@@ -3873,6 +4045,10 @@ window.__ModuleLoader__.load({
             className: `csb-btn csb-btn-s${showArchived ? ' csb-btn-p' : ''}`,
             onClick: () => setShowArchived((v) => !v),
           }, showArchived ? '隐藏归档' : '看归档'),
+          // 需求3：从团队卡片跳转过来时带筛选，这里给一个明确的清掉入口
+          roomFilter
+            ? h('button', { className: 'csb-btn csb-btn-s csb-btn-err', onClick: () => setLocate(null) }, '✕ 清筛选')
+            : null,
           h('button', { className: 'csb-btn csb-btn-p', disabled: !roomName.trim(), onClick: create }, '创建房间')),
 
         h(Notice, { kind: 'ok', onClose: () => setOk(null) }, ok),
@@ -3887,7 +4063,14 @@ window.__ModuleLoader__.load({
             })
           : null,
 
-        h('div', { className: 'csb-list' }, rooms.map((r) =>
+        roomFilter
+          ? h('div', { className: 'csb-notice csb-notice-ok', style: { marginTop: 8 } },
+            h('span', { className: 'csb-notice-t' }, `筛选房间：包含「${roomFilter}」→ ${visibleRooms.length} 个房间`))
+          : null,
+        visibleRooms.length === 0 && roomFilter
+          ? h(Empty, { icon: '◌', title: '没有匹配的房间', hint: `没有房间名包含「${roomFilter}」。点右上「×」清掉筛选。` })
+          : null,
+        h('div', { className: 'csb-list' }, visibleRooms.map((r) =>
           h('div', {
             key: r.id, className: `csb-card csb-card-c${active === r.id ? ' csb-card-on' : ''}`,
             onClick: () => { setActive(r.id); setFocusSeq(null) },
@@ -4245,48 +4428,119 @@ window.__ModuleLoader__.load({
     const PHASES = ['planned', 'doing', 'checking', 'acting', 'done']
     const PHASE_LABEL = { planned: '计划', doing: '执行', checking: '检查', acting: '改进', done: '完成' }
 
+    /**
+     * PDCA 复盘页（需求4，2026-11-08 重做）。
+     *
+     * ## 用户的要求（原话）
+     *   「我要求 pdca 是对用户长任务进行复盘跟进的，人类主导；智能体的 pdca 流程你优化一下，
+     *     看看有没有必要或优化，我关心的是用户能否对长任务进行管理，智能体的 pdca 需要定期归纳提升」
+     *
+     * ## 由此得到的分层
+     *
+     * | kind | 谁主导 | UI 呈现 | 阶段纪律 |
+     * |---|---|---|---|
+     * | `human` | **人** | 「我的长任务」分区——默认视图，人跟长任务用 | 五步不可跳 |
+     * | `agent` | 智能体 | 「智能体归纳」分区——周期性批量总结用 | 复盘时可一次性提交，自动闭环 |
+     *
+     * 为什么分两个分区而不是一个列表加筛选：
+     * 用户只关心「我对长任务的管理有没有到位」，智能体归纳是后台保鲜机制，
+     * 混在一起会让人在 50 条里翻。上层 UI 默认只给 human，agent 折叠在下方。
+     *
+     * 为什么 agent 可以一次性提交：智能体复盘是批量归纳，让它走 planned→doing 是对事实的虚构；
+     * 人需要的是「结论 + 可采纳的标准」。但**归纳本身要定期发生**——由 reviewer 回合计数驱动。
+     */
     function CyclesTab() {
-      const listQ = useApi('/cycles', [])
+      // 需求4：human 与 agent 分开取，默认视图只显示 human（人跟长任务）
+      const humanQ = useApi('/cycles?kind=human', [])
+      const agentQ = useApi('/cycles?kind=agent', [])
+      // 需求4：谁到了该归纳的时候（reviewer 只做被动计数，这里把它变成可点的动作）
+      const reviewQ = useApi('/review/status', [])
+      const rosterQ = useApi('/roster', [])
       const [taskId, setTaskId] = useState('')
       const [objective, setObjective] = useState('')
+      const [agentTaskId, setAgentTaskId] = useState('')
+      const [agentObjective, setAgentObjective] = useState('')
       const [expanded, setExpanded] = useState(null)
       const [reviewSummary, setReviewSummary] = useState('')
       const [reviewLessons, setReviewLessons] = useState('')
       const [reviewStandards, setReviewStandards] = useState('')
       const [msg, setMsg] = useState(null)
+      const [agentMsg, setAgentMsg] = useState(null)
+      const [urgeMsg, setUrgeMsg] = useState(null)
       const act = (p, body) => call(p, { method: 'POST', body })
 
-      const cycles = listQ.data?.items ?? []
+      const humanCycles = humanQ.data?.items ?? []
+      const agentCycles = agentQ.data?.items ?? []
+      const dueSessions = reviewQ.data?.status?.dueSessions ?? []
+      const reviewInterval = reviewQ.data?.status?.interval ?? null
+      const bots = rosterQ.data?.bots ?? []
 
+      /** 人类周期：创建（必须走五步，不许跳）。 */
       const createCycle = async () => {
         if (!taskId.trim() || !objective.trim()) { setMsg('任务 id 与目标都要填'); return }
         try {
-          const r = await act('/cycles', { taskId: taskId.trim(), objective: objective.trim(), by: 'ui' })
-          setMsg(`周期 ${r.cycle.id} 已开启（${PHASE_LABEL[r.cycle.phase]}）`)
+          const r = await act('/cycles', { taskId: taskId.trim(), objective: objective.trim(), kind: 'human', by: 'ui' })
+          setMsg(`长任务周期 ${r.cycle.id} 已开启（${PHASE_LABEL[r.cycle.phase]}）`)
           setTaskId(''); setObjective('')
-          listQ.reload()
+          humanQ.reload()
         } catch (e) { setMsg(String(e)) }
       }
 
+      /** 智能体周期：定期归纳用（一次性提交，自动闭环）。 */
+      const createAgentCycle = async () => {
+        if (!agentTaskId.trim() || !agentObjective.trim()) { setAgentMsg('任务 id 与归纳目标都要填'); return }
+        try {
+          const r = await act('/cycles', {
+            taskId: agentTaskId.trim(),
+            objective: agentObjective.trim(),
+            kind: 'agent',
+            by: 'ui',
+          })
+          setAgentMsg(`归纳周期 ${r.cycle.id} 已开启（kind=agent，可一次性提交）`)
+          setAgentTaskId(''); setAgentObjective('')
+          agentQ.reload()
+        } catch (e) { setAgentMsg(String(e)) }
+      }
+
+      /**
+       * 让它归纳（需求4）：把「该归纳了」变成一次真唤醒。
+       *
+       * 不给智能体开定时器（宿主生命周期不可控），也不让智能体自己改自己的纪律：
+       * 这里只是**提醒它去走自己的归纳周期**，归纳出来的建议仍进建议队列等人采纳。
+       */
+      const urge = async (sessionId) => {
+        try {
+          const r = await act('/review/urge', { sessionId })
+          const name = botName(bots, sessionId)
+          setUrgeMsg(`已唤醒「${name}」去做归纳：它会开 kind=agent 周期并一次性提交，建议会进建议队列`)
+          reviewQ.reload()
+        } catch (e) {
+          setUrgeMsg(`提醒「${botName(bots, sessionId)}」失败：${e.message}`)
+        }
+      }
+
+      /** 推进阶段（仅 human 周期需要；agent 周期复盘后自动闭环）。 */
       const advance = async (c) => {
         const nextPhase = PHASES[PHASES.indexOf(c.phase) + 1]
         if (!nextPhase) return
         try {
           const r = await act('/cycles/advance', { id: c.id, expectedRev: c.rev, phase: nextPhase, by: 'ui' })
-          setMsg(`周期 ${c.id} → ${PHASE_LABEL[nextPhase]}`)
-          listQ.reload()
+          setMsg(`长任务周期 ${c.id} → ${PHASE_LABEL[nextPhase]}`)
+          humanQ.reload()
         } catch (e) { setMsg(String(e)) }
       }
 
+      /** 检查（human 周期：人验货）。 */
       const check = async (c, result) => {
         try {
           const r = await act('/cycles/check', { id: c.id, expectedRev: c.rev, result, by: 'ui' })
-          setMsg(`周期 ${c.id} 检查 ${result}`)
-          listQ.reload()
+          setMsg(`长任务周期 ${c.id} 检查 ${result}`)
+          humanQ.reload()
         } catch (e) { setMsg(String(e)) }
       }
 
-      const doReview = async (c) => {
+      /** 复盘（human 周期：留在 acting，人显式确认完成；agent 周期：一次性提交并自动闭环）。 */
+      const doReview = async (c, isAgent) => {
         const lessons = reviewLessons.split('\n').filter(Boolean)
         const standards = reviewStandards.split('\n').filter(Boolean).map((line) => {
           const [title, content] = line.split('：').map((s) => s?.trim())
@@ -4296,143 +4550,380 @@ window.__ModuleLoader__.load({
           const r = await act('/cycles/review', {
             id: c.id, expectedRev: c.rev, summary: reviewSummary, lessons, standards, by: 'ui',
           })
-          setMsg(`复盘完成，提议 ${r.proposedCount} 条标准化建议`)
+          if (isAgent) {
+            setAgentMsg(`归纳周期 ${c.id} 已完成，提议 ${r.proposedCount} 条建议`)
+            agentQ.reload()
+          } else {
+            setMsg(`长任务周期 ${c.id} 复盘完成，提议 ${r.proposedCount} 条标准化建议`)
+            humanQ.reload()
+          }
           setReviewSummary(''); setReviewLessons(''); setReviewStandards('')
-          listQ.reload()
-        } catch (e) { setMsg(String(e)) }
+        } catch (e) {
+          if (isAgent) setAgentMsg(String(e))
+          else setMsg(String(e))
+        }
+      }
+
+      /** 周期卡片（human 与 agent 共用渲染，行为略有差异）。 */
+      const renderCycle = (c, isAgent) => {
+        const nextPhase = PHASES[PHASES.indexOf(c.phase) + 1]
+        const isOpen = expanded === c.id
+        const reviewMsg = isAgent ? agentMsg : msg
+        return h('div', { key: c.id, className: 'csb-card', style: { marginBottom: 8 } },
+          h('div', { className: 'csb-card-main' },
+            h('div', { className: 'csb-card-t' },
+              h('span', { className: `csb-b ${c.status === 'closed' ? 'csb-b-ok' : 'csb-b-run'}` }, PHASE_LABEL[c.phase] ?? c.phase),
+              h('span', {
+                className: 'csb-b csb-b-idle',
+                style: { marginLeft: 6 },
+                title: isAgent ? '智能体归纳周期（复盘可一次性提交）' : '人跟长任务周期（五步不可跳）',
+              }, isAgent ? '归纳' : '长任务'),
+              ` · ${c.taskId} · ${(c.objective ?? '').slice(0, 40)}`),
+            h('div', { className: 'csb-card-m' },
+              h('span', null, `状态 ${c.status}`),
+              c.progress !== undefined ? h('span', null, ` · 进度 ${c.progress}%`) : null,
+              c.rejectCount ? h('span', { className: 'csb-b csb-b-err' }, ` · 驳回 ${c.rejectCount} 次`) : null,
+              c.review ? h('span', null, ' · 已复盘') : null)),
+
+          // 操作区：human 周期有完整五步按钮；agent 周期只显示复盘（且复盘即闭环）
+          h('div', { className: 'csb-bar', style: { flexWrap: 'wrap' } },
+            // human 周期的逐步推进（agent 周期不需要：归纳完自动 done）
+            isAgent ? null : nextPhase
+              ? h('button', { className: 'csb-btn csb-btn-s', onClick: () => advance(c) }, `→ ${PHASE_LABEL[nextPhase]}`)
+              : null,
+            isAgent ? null : c.phase === 'checking'
+              ? h('button', { className: 'csb-btn csb-btn-s csb-btn-ok', onClick: () => check(c, 'pass') }, '检查通过')
+              : null,
+            isAgent ? null : c.phase === 'checking'
+              ? h('button', { className: 'csb-btn csb-btn-s csb-btn-err', onClick: () => check(c, 'reject') }, '打回')
+              : null,
+            // 复盘按钮：agent 周期在 acting 阶段直接显示「写归纳」（一次性提交）；human 周期仍需五步走完
+            c.phase === 'acting'
+              ? h('button', {
+                  className: 'csb-btn csb-btn-s',
+                  onClick: () => setExpanded(isOpen ? null : c.id),
+                }, isOpen ? '收起复盘' : isAgent ? '写归纳' : '写复盘')
+              : null),
+          isOpen ? h('div', { style: { marginTop: 8, paddingTop: 8, borderTop: '1px solid var(--dsw-alias-border)' } },
+            h('div', { className: 'csb-hint', style: { marginBottom: 4 } }, isAgent ? '归纳总结（一次性提交）' : '复盘总结'),
+            h('textarea', { className: 'csb-in', style: { width: '100%', minHeight: 60, boxSizing: 'border-box' }, placeholder: isAgent ? '这一轮归纳出了什么结论？' : '这个周期学到了什么？', value: reviewSummary, onChange: (e) => setReviewSummary(e.target.value) }),
+            h('div', { className: 'csb-hint', style: { marginTop: 8, marginBottom: 4 } }, '经验教训（每行一条）'),
+            h('textarea', { className: 'csb-in', style: { width: '100%', minHeight: 40, boxSizing: 'border-box' }, placeholder: '先写测试再写实现\n接口要先定契约', value: reviewLessons, onChange: (e) => setReviewLessons(e.target.value) }),
+            h('div', { className: 'csb-hint', style: { marginTop: 8, marginBottom: 4 } }, '标准化建议（每行一条：标题：内容）'),
+            h('textarea', { className: 'csb-in', style: { width: '100%', minHeight: 40, boxSizing: 'border-box' }, placeholder: 'TDD：先写测试再写实现', value: reviewStandards, onChange: (e) => setReviewStandards(e.target.value) }),
+            h('button', {
+              className: 'csb-btn csb-btn-s',
+              style: { marginTop: 6 },
+              onClick: () => doReview(c, isAgent),
+            }, isAgent ? '提交归纳（自动完成）' : '提交复盘（提议建议）')) : null,
+          reviewMsg ? h('div', { className: 'csb-notice csb-notice-ok', style: { marginTop: 4 } }, h('span', { className: 'csb-notice-t' }, reviewMsg)) : null)
       }
 
       return h('div', { className: 'csb-wrap' },
         h(Section, {
           title: 'PDCA 复盘周期',
-          desc: '每个任务一个周期，强制走完 计划→执行→检查→改进→完成。不许跳步——这正是「持续优化」的纪律。',
+          desc: 'PDCA 是给人的长任务做复盘跟进的，人类主导——五步不可跳，这正是「不自欺」的纪律。智能体有自己的归纳周期（周期驱动、自动闭环），折叠在下面。',
         }),
-        h('div', { className: 'csb-bar', style: { marginTop: 10, flexWrap: 'wrap', gap: 6 } },
+
+        // ── 我的长任务周期（human）────────────────────────────────────────────
+        h('div', { className: 'csb-sec-t' }, '📋 我的任务周期'),
+        h('div', { className: 'csb-set-d' }, '为你的长任务开一个周期。目标原文是「防漂移锚」——复盘时拿它对照，看有没有走偏。'),
+        h('div', { className: 'csb-bar', style: { marginTop: 8, flexWrap: 'wrap', gap: 6 } },
           h('input', { className: 'csb-in', style: { width: 120 }, placeholder: '任务 id（t-x）', value: taskId, onChange: (e) => setTaskId(e.target.value) }),
           h('input', { className: 'csb-in', style: { width: 260 }, placeholder: '目标原文（防漂移锚）', value: objective, onChange: (e) => setObjective(e.target.value) }),
           h('button', { className: 'csb-btn csb-btn-s', onClick: createCycle }, '开启周期')),
         msg ? h('div', { className: 'csb-notice csb-notice-ok', style: { marginTop: 8 } }, h('span', { className: 'csb-notice-t' }, msg)) : null,
-        listQ.error ? h('div', { className: 'csb-err' }, listQ.error) : null,
-        listQ.loading ? h(Skeleton, { n: 3 }) : null,
-        cycles.length === 0 && !listQ.loading
-          ? h(Empty, { icon: '🔄', title: '还没有复盘周期', hint: '输入任务 id 和目标，点「开启周期」开始 PDCA。' })
-          : h('div', { className: 'csb-list' }, cycles.map((c) => {
-            const nextPhase = PHASES[PHASES.indexOf(c.phase) + 1]
-            const isOpen = expanded === c.id
-            return h('div', { key: c.id, className: 'csb-card', style: { marginBottom: 8 } },
-              h('div', { className: 'csb-card-main' },
-                h('div', { className: 'csb-card-t' },
-                  h('span', { className: `csb-b ${c.status === 'closed' ? 'csb-b-ok' : 'csb-b-run'}` }, PHASE_LABEL[c.phase] ?? c.phase),
-                  ` · ${c.taskId} · ${(c.objective ?? '').slice(0, 40)}`),
-                h('div', { className: 'csb-card-m' },
-                  h('span', null, `状态 ${c.status}`),
-                  c.progress !== undefined ? h('span', null, ` · 进度 ${c.progress}%`) : null,
-                  c.rejectCount ? h('span', { className: 'csb-b csb-b-err' }, ` · 驳回 ${c.rejectCount} 次`) : null,
-                  c.review ? h('span', null, ' · 已复盘') : null)),
-              h('div', { className: 'csb-bar', style: { flexWrap: 'wrap' } },
-                nextPhase ? h('button', { className: 'csb-btn csb-btn-s', onClick: () => advance(c) }, `→ ${PHASE_LABEL[nextPhase]}`) : null,
-                c.phase === 'checking' ? h('button', { className: 'csb-btn csb-btn-s csb-btn-ok', onClick: () => check(c, 'pass') }, '检查通过') : null,
-                c.phase === 'checking' ? h('button', { className: 'csb-btn csb-btn-s csb-btn-err', onClick: () => check(c, 'reject') }, '打回') : null,
-                c.phase === 'acting' ? h('button', { className: 'csb-btn csb-btn-s', onClick: () => setExpanded(isOpen ? null : c.id) }, isOpen ? '收起复盘' : '写复盘') : null),
-              isOpen ? h('div', { style: { marginTop: 8, paddingTop: 8, borderTop: '1px solid var(--dsw-alias-border)' } },
-                h('div', { className: 'csb-hint', style: { marginBottom: 4 } }, '复盘总结'),
-                h('textarea', { className: 'csb-in', style: { width: '100%', minHeight: 60, boxSizing: 'border-box' }, placeholder: '这个周期学到了什么？', value: reviewSummary, onChange: (e) => setReviewSummary(e.target.value) }),
-                h('div', { className: 'csb-hint', style: { marginTop: 8, marginBottom: 4 } }, '经验教训（每行一条）'),
-                h('textarea', { className: 'csb-in', style: { width: '100%', minHeight: 40, boxSizing: 'border-box' }, placeholder: '先写测试再写实现\n接口要先定契约', value: reviewLessons, onChange: (e) => setReviewLessons(e.target.value) }),
-                h('div', { className: 'csb-hint', style: { marginTop: 8, marginBottom: 4 } }, '标准化建议（每行一条：标题：内容）'),
-                h('textarea', { className: 'csb-in', style: { width: '100%', minHeight: 40, boxSizing: 'border-box' }, placeholder: 'TDD：先写测试再写实现', value: reviewStandards, onChange: (e) => setReviewStandards(e.target.value) }),
-                h('button', { className: 'csb-btn csb-btn-s', style: { marginTop: 6 }, onClick: () => doReview(c) }, '提交复盘（提议建议）')) : null)})))
+        humanQ.error ? h('div', { className: 'csb-err' }, humanQ.error) : null,
+        humanQ.loading ? h(Skeleton, { n: 3 }) : null,
+        humanCycles.length === 0 && !humanQ.loading
+          ? h(Empty, { icon: '🔄', title: '还没有长任务周期', hint: '输入任务 id 和目标，点「开启周期」开始。' })
+          : h('div', { className: 'csb-list' }, humanCycles.map((c) => renderCycle(c, false))),
+
+        // ── 智能体归纳周期（agent）────────────────────────────────────────────
+        h('div', { className: 'csb-sec-t', style: { marginTop: 18 } }, '🤖 智能体归纳周期'),
+        h('div', { className: 'csb-set-d' }, '智能体用来做定期归纳提升的周期。与人的周期不同：归纳是批量总结，可以一次性提交，提交后自动完成——不需要人点「完成」，也不需要假装走完五步。'),
+        // 到期未归纳的会话：这是「定期归纳」真正被驱动的入口
+        dueSessions.length > 0
+          ? h('div', { className: 'csb-note', style: { marginTop: 8 } },
+              h('div', { className: 'csb-set-d', style: { marginBottom: 6 } },
+                `${dueSessions.length} 个会话已累计 ${reviewInterval ?? '?'} 回合以上没归纳了。`
+                + '点「让它归纳」唤醒它：它会自己开归纳周期并一次性提交（建议进队列，不会自动改纪律）。'),
+              h('div', { className: 'csb-list' },
+                dueSessions.map((sid) =>
+                  h('div', { key: sid, className: 'csb-card', style: { padding: '8px 10px' } },
+                    h('div', { className: 'csb-card-main' },
+                      h('div', { className: 'csb-card-t' }, botName(bots, sid)),
+                      h('div', { className: 'csb-card-m csb-mono' }, short(sid, 22))),
+                    h('button', { className: 'csb-btn csb-btn-s csb-btn-p', onClick: () => urge(sid) }, '让它归纳')))))
+          : null,
+        urgeMsg ? h('div', { className: 'csb-notice csb-notice-ok', style: { marginTop: 8 } }, h('span', { className: 'csb-notice-t' }, urgeMsg)) : null,
+        agentCycles.length === 0
+          ? h(Empty, { icon: '🧠', title: '智能体尚未开归纳周期', hint: '智能体通常自动创建归纳周期；如果你要手动触发，填任务 id 和归纳目标。' })
+          : h('div', { className: 'csb-list' }, agentCycles.map((c) => renderCycle(c, true))),
+        agentMsg ? h('div', { className: 'csb-notice csb-notice-ok', style: { marginTop: 8 } }, h('span', { className: 'csb-notice-t' }, agentMsg)) : null)
     }
 
     // ── 大/小团队（Teams）────────────────────────────────────────────────────
+    /**
+     * 团队页（需求3，2026-11-08 重做）。
+     *
+     * ## 用户的要求（原话）
+     *   「用户创建的团队都是大团队，我当时的概念是大团队用户主导，小团队智能体自行负责，
+     *     当前分层后，ui 页面正常只显示用户创建的团队，不需要大小团队的概念，
+     *     用户可以跳转查看所有房间，其他的都是这个原则，团队成员应该可以选择，
+     *     可以新建 bot，团队负责人要有标识」
+     *
+     * ## 由此确定的三条设计
+     *
+     * 1. **上层只显示「用户建的团队」**。智能体自建的小团队不再占用上层版面——
+     *    它们是执行细节，要看请走「穿透」。所以本页 `list({ type:'big' })` 过滤，
+     *    且 UI 上**完全不出现「大/小」字样**（用户明确说不需要这个概念）。
+     *
+     * 2. **成员是选择出来的，不是手抄 id**。手抄 36 位 UUID 必然出错（老实现的教训），
+     *    所以改多选复选框 + 一键全选/清空。
+     *
+     * 3. **负责人（队长）必须有显式标识**。用「队长」徽章 + 名字前缀把负责人
+     *    从成员列表里区分出来——用户要求「团队负责人要有标识」。
+     *
+     * ## 跳转房间（用户补充说明）
+     *   「跳房间实质是可以穿透房间，看到团队成员的子团队工作内容，或者定向搜索查看，
+     *     用户就是超级管理员」
+     *   ⇒ 每个团队卡片上有「看房间」入口，跳到房间页并按团队名筛；
+     *   房间页本身已支持列出全部房间 + 消息内容查看，超级管理员不受限制。
+     */
     function TeamsTab({ onGoto }) {
-      const listQ = useApi('/teams', [])
-      // leadId 选择器要列出「可当队长的人」——本平台的 Bot 都在 roster 里。
-      // 为什么必须从 roster 选而不是手填 id：leadId 是 sessionId（形如 bot-6b65…-…），
-      // 人手抄 36 位 UUID 必然出错，且错了要到「建团队」提交后才报错。
+      // 只取用户建的团队（big）；智能体自建的 small 不上上层
+      const listQ = useApi('/teams?type=big', [])
       const rosterQ = useApi('/roster')
       const [name, setName] = useState('')
-      const [type, setType] = useState('big')
       const [leadId, setLeadId] = useState('')
       const [purpose, setPurpose] = useState('')
-      const [newMember, setNewMember] = useState('')
+      const [selected, setSelected] = useState([])
       const [msg, setMsg] = useState(null)
+      const [busy, setBusy] = useState(false)
+      // 每个团队的行内「加成员」待选集合（teamId → 要加的 id 列表）
+      const [pendingMembers, setPendingMembers] = useState({})
       const act = (p, body) => call(p, { method: 'POST', body })
 
       const teams = listQ.data?.items ?? []
+      // 可用的 Bot（不含已退役）——成员与队长都从这里选
       const bots = (rosterQ.data?.bots ?? []).filter((b) => b.state !== 'retired')
-      const leadMissing = type === 'big' && !leadId
+      const botBySession = new Map(bots.map((b) => [b.sessionId, b]))
 
       const createTeam = async () => {
         if (!name.trim()) { setMsg('团队名必填'); return }
-        if (leadMissing) { setMsg('大团队必须指定负责人（队长）'); return }
+        if (!leadId) { setMsg('必须指定负责人（队长）'); return }
+        setBusy(true)
+        setMsg(null)
         try {
-          const r = await act('/teams', { name: name.trim(), type, leadId: leadId || undefined, purpose, by: 'ui' })
-          setMsg(`团队 ${r.team.id}（${r.team.name}）已创建`)
-          setName(''); setLeadId(''); setPurpose('')
+          const r = await act('/teams', {
+            name: name.trim(),
+            // 上层一律建「用户主导的团队」；内部类型沿用 big（智能体自建走 small，不在此页）
+            type: 'big',
+            leadId,
+            purpose: purpose.trim() || undefined,
+            memberIds: selected,
+            by: 'ui',
+          })
+          setMsg(`团队「${r.team.name}」已创建（负责人：${botBySession.get(leadId)?.name ?? leadId}）`)
+          setName(''); setLeadId(''); setPurpose(''); setSelected([])
           listQ.reload()
-        } catch (e) { setMsg(String(e)) }
+        } catch (e) { setMsg(String(e.message ?? e)) } finally { setBusy(false) }
       }
 
-      const addMember = async (t) => {
-        if (!newMember.trim()) return
+      const addMembers = async (t) => {
+        const ids = (pendingMembers[t.id] ?? []).filter((id) => !(t.members ?? []).includes(id))
+        if (ids.length === 0) { setMsg('先选要加入的 Bot'); return }
+        setBusy(true); setMsg(null)
         try {
-          const r = await act('/teams/add', { id: t.id, expectedRev: t.rev, memberId: newMember.trim(), by: 'ui' })
-          setMsg(`已加入 ${newMember.trim()}`); setNewMember('')
+          let rev = t.rev
+          for (const memberId of ids) {
+            const r = await act('/teams/add', { id: t.id, expectedRev: rev, memberId, by: 'ui' })
+            rev = r.team?.rev ?? rev + 1
+          }
+          setMsg(`已加入 ${ids.length} 个成员`)
+          setPendingMembers((s) => ({ ...s, [t.id]: [] }))
           listQ.reload()
-        } catch (e) { setMsg(String(e)) }
+        } catch (e) { setMsg(String(e.message ?? e)) } finally { setBusy(false) }
+      }
+
+      const removeMember = async (t, memberId) => {
+        setBusy(true); setMsg(null)
+        try {
+          await act('/teams/remove', { id: t.id, expectedRev: t.rev, memberId, by: 'ui' })
+          setMsg(`已移出 ${botBySession.get(memberId)?.name ?? memberId}`)
+          listQ.reload()
+        } catch (e) { setMsg(String(e.message ?? e)) } finally { setBusy(false) }
       }
 
       const closeTeam = async (t) => {
+        setBusy(true); setMsg(null)
         try {
-          const r = await act('/teams/close', { id: t.id, expectedRev: t.rev, by: 'ui' })
-          setMsg(`团队 ${t.name} 已关闭`); listQ.reload()
-        } catch (e) { setMsg(String(e)) }
+          await act('/teams/close', { id: t.id, expectedRev: t.rev, by: 'ui' })
+          setMsg(`团队「${t.name}」已关闭`)
+          listQ.reload()
+        } catch (e) { setMsg(String(e.message ?? e)) } finally { setBusy(false) }
+      }
+
+      /** Bot 多选器（成员/队长共用同一个数据源，交互不同）。 */
+      const botPicker = (value, onChange, { multiple = false, placeholder = '选择…' } = {}) => {
+        if (multiple) {
+          return h('div', { className: 'csb-pick' },
+            bots.length === 0
+              ? h('div', { className: 'csb-set-d', style: { padding: '8px 4px' } }, '还没有可选的 Bot，先去「Bot 档案」新建')
+              : bots.map((b) =>
+                  h('label', { key: b.sessionId, className: 'csb-pick-i' },
+                    h('input', {
+                      type: 'checkbox',
+                      checked: value.includes(b.sessionId),
+                      onChange: (e) => {
+                        const next = e.target.checked
+                          ? [...value, b.sessionId]
+                          : value.filter((x) => x !== b.sessionId)
+                        onChange(next)
+                      },
+                    }),
+                    h('span', null, b.name),
+                    b.label ? h('span', { className: 'csb-set-d' }, `（${b.label}）`) : null)))
+        }
+        return h('select', { className: 'csb-sel', style: { width: 220 }, value, onChange: (e) => onChange(e.target.value) },
+          h('option', { value: '' }, placeholder),
+          bots.map((b) => h('option', { key: b.sessionId, value: b.sessionId }, `${b.name}${b.label ? `（${b.label}）` : ''}`)))
       }
 
       return h('div', { className: 'csb-wrap' },
         h(Section, {
           title: '团队',
-          desc: '大团队（big）：人建的稳定协作结构，跨多个 lead bot；小团队（small）：智能体自建的临时小组。',
+          desc: '你创建的团队。每个团队有负责人（队长）、成员和讨论房间。'
+            + '智能体自己组织的临时小组不在这里（点右上角「⚙ 穿透」可查）。',
         }),
+
+        // ── 新建团队 ──────────────────────────────────────────────────────
         h('div', { className: 'csb-bar', style: { marginTop: 10, flexWrap: 'wrap', gap: 6 } },
           h('input', { className: 'csb-in', style: { width: 160 }, placeholder: '团队名', value: name, onChange: (e) => setName(e.target.value) }),
-          h('select', { className: 'csb-sel', value: type, onChange: (e) => setType(e.target.value) },
-            h('option', { value: 'big' }, '大团队'), h('option', { value: 'small' }, '小团队')),
-          h('select', { className: 'csb-sel', style: { width: 200 }, value: leadId, onChange: (e) => setLeadId(e.target.value) },
-            h('option', { value: '' }, type === 'small' ? '（可选）无负责人' : '选择队长…'),
-            bots.map((b) => h('option', { key: b.sessionId, value: b.sessionId }, `${b.name}（${b.sessionId}）`))),
-          h('button', { className: 'csb-btn csb-btn-s', onClick: () => onGoto?.('bots') }, '新建 Bot'),
-          h('input', { className: 'csb-in', style: { width: 160 }, placeholder: '用途说明', value: purpose, onChange: (e) => setPurpose(e.target.value) }),
+          botPicker(leadId, setLeadId, { placeholder: '选择负责人（队长）…' }),
+          h('input', { className: 'csb-in', style: { width: 180 }, placeholder: '用途说明（可选）', value: purpose, onChange: (e) => setPurpose(e.target.value) }),
+          h('button', { className: 'csb-btn csb-btn-s', onClick: () => onGoto?.('bots') }, '＋ 新建 Bot')),
+        h('div', { className: 'csb-note', style: { marginTop: 8 } }, '团队成员（可多选，也可以建完再添）：'),
+        botPicker(selected, setSelected, { multiple: true }),
+        h('div', { className: 'csb-bar', style: { marginTop: 8 } },
           h('button', {
-            className: 'csb-btn csb-btn-s', disabled: leadMissing || !name.trim(), onClick: createTeam,
-            title: leadMissing ? '大团队必须指定负责人（队长）' : '创建团队',
-          }, '创建团队')),
-        leadMissing
-          ? h('div', { className: 'csb-note', style: { marginTop: 6 } },
-              '大团队必须指定负责人（队长）：大团队是跨多个 lead 的稳定结构，没有队长就没人管编制与派活。')
-          : null,
+            className: 'csb-btn csb-btn-s',
+            onClick: () => setSelected(bots.map((b) => b.sessionId)),
+          }, '全选'),
+          h('button', { className: 'csb-btn csb-btn-s', onClick: () => setSelected([]) }, '清空'),
+          h('div', { className: 'csb-spacer' }),
+          h('button', {
+            className: 'csb-btn csb-btn-p csb-btn-s',
+            disabled: busy || !name.trim() || !leadId,
+            onClick: createTeam,
+          }, busy ? '创建中…' : '创建团队')),
+
         msg ? h('div', { className: 'csb-notice csb-notice-ok', style: { marginTop: 8 } }, h('span', { className: 'csb-notice-t' }, msg)) : null,
         listQ.error ? h('div', { className: 'csb-err' }, listQ.error) : null,
         listQ.loading ? h(Skeleton, { n: 3 }) : null,
+
+        // ── 团队列表 ──────────────────────────────────────────────────────
         teams.length === 0 && !listQ.loading
-          ? h(Empty, { icon: '👥', title: '还没有团队', hint: '填好团队名，选一个队长，点「创建团队」开始聚合管理。' })
-          : h('div', { className: 'csb-list' }, teams.map((t) =>
-            h('div', { key: t.id, className: 'csb-card', style: { marginBottom: 8 } },
+          ? h(Empty, {
+              icon: '👥', title: '还没有团队',
+              hint: '填团队名、选负责人，点「创建团队」开始。团队建好后可以加成员、看房间。',
+            })
+          : h('div', { className: 'csb-list' }, teams.map((t) => {
+            const members = t.members ?? []
+            const leadName = botBySession.get(t.leadId)?.name ?? (t.leadId ? short(t.leadId, 12) : '（未指定）')
+            const pending = pendingMembers[t.id] ?? []
+            const addable = bots.filter((b) => !members.includes(b.sessionId))
+            return h('div', { key: t.id, className: 'csb-card', style: { flexDirection: 'column', alignItems: 'stretch', marginBottom: 8 } },
               h('div', { className: 'csb-card-main' },
                 h('div', { className: 'csb-card-t' },
-                  h('span', { className: `csb-b ${t.status === 'closed' ? 'csb-b-idle' : 'csb-b-run'}` }, t.type === 'big' ? '大' : '小'),
-                  ` · ${t.name}`,
-                  t.purpose ? ` · ${(t.purpose ?? '').slice(0, 30)}` : null),
+                  t.name,
+                  t.status === 'closed' ? h('span', { className: 'csb-b csb-b-idle', style: { marginLeft: 8 } }, '已关闭') : null,
+                  t.purpose ? h('span', { className: 'csb-set-d' }, ` · ${t.purpose.slice(0, 40)}`) : null),
+
+                // 负责人标识（需求3：团队负责人要有标识）
                 h('div', { className: 'csb-card-m' },
-                  h('span', null, `lead ${t.leadId ? botName(rosterQ.data?.bots ?? [], t.leadId) : '（无）'}`),
-                  h('span', null, ` · 成员 ${(t.members ?? []).length} 人`),
-                  (t.members ?? []).slice(0, 5).map((m) => h('span', { key: m, className: 'csb-chip' }, m)),
-                  (t.members ?? []).length > 5 ? h('span', { className: 'csb-chip' }, `…+${(t.members ?? []).length - 5}`) : null)),
-              t.status === 'open' ? h('div', { className: 'csb-bar', style: { flexWrap: 'wrap' } },
-                h('input', { className: 'csb-in', style: { width: 140 }, placeholder: '成员 id', value: newMember, onChange: (e) => setNewMember(e.target.value) }),
-                h('button', { className: 'csb-btn csb-btn-s', onClick: () => addMember(t) }, '加入'),
-                h('button', { className: 'csb-btn csb-btn-s csb-btn-err', onClick: () => closeTeam(t) }, '关闭')) : null))))
+                  h('span', { className: 'csb-b csb-b-run', title: '团队负责人（队长）' }, '👑 负责人'),
+                  h('span', { style: { fontWeight: 600 } }, leadName),
+                  h('span', null, ` · 成员 ${members.length} 人`)),
+
+                // 成员列表（负责人单独标出）
+                members.length > 0
+                  ? h('div', { className: 'csb-card-m', style: { flexWrap: 'wrap' } },
+                      members.map((m) => {
+                        const b = botBySession.get(m)
+                        const isLead = m === t.leadId
+                        return h('span', {
+                          key: m,
+                          className: 'csb-b',
+                          style: isLead ? { fontWeight: 600 } : undefined,
+                          title: isLead ? '负责人' : undefined,
+                        }, `${isLead ? '👑 ' : ''}${b?.name ?? short(m, 12)}`)
+                      }))
+                  : h('div', { className: 'csb-set-d' }, '还没有成员')),
+
+              // 操作区
+              t.status === 'open'
+                ? h('div', { style: { marginTop: 10 } },
+                    // 加成员：Bot 多选
+                    addable.length > 0
+                      ? h('div', null,
+                          h('div', { className: 'csb-pick', style: { maxHeight: 140 } },
+                            addable.map((b) =>
+                              h('label', { key: b.sessionId, className: 'csb-pick-i' },
+                                h('input', {
+                                  type: 'checkbox',
+                                  checked: pending.includes(b.sessionId),
+                                  onChange: (e) => {
+                                    const next = e.target.checked
+                                      ? [...pending, b.sessionId]
+                                      : pending.filter((x) => x !== b.sessionId)
+                                    setPendingMembers((s) => ({ ...s, [t.id]: next }))
+                                  },
+                                }),
+                                h('span', null, b.name)))),
+                          h('div', { className: 'csb-bar', style: { marginTop: 6 } },
+                            h('button', {
+                              className: 'csb-btn csb-btn-s', disabled: busy || pending.length === 0,
+                              onClick: () => addMembers(t),
+                            }, pending.length ? `加入 ${pending.length} 个` : '加入成员')))
+                      : h('div', { className: 'csb-set-d' }, '所有 Bot 都已在这个团队里'),
+
+                    // 成员移除（点 ×）
+                    members.length > 0
+                      ? h('div', { className: 'csb-card-m', style: { marginTop: 6 } },
+                          h('span', { className: 'csb-set-d' }, '移出：'),
+                          members.map((m) => {
+                            const b = botBySession.get(m)
+                            return h('button', {
+                              key: m,
+                              className: 'csb-btn csb-btn-s csb-btn-d',
+                              style: { height: 24, fontSize: 11.5 },
+                              disabled: busy,
+                              onClick: () => removeMember(t, m),
+                              title: m === t.leadId ? '这是负责人，移出后团队将没有负责人' : '移出这个成员',
+                            }, `× ${b?.name ?? short(m, 10)}`)
+                          }))
+                      : null,
+
+                    // 跳转房间（用户补充：可以穿透房间看子团队工作内容 / 定向搜索）
+                    h('div', { className: 'csb-bar', style: { marginTop: 8 } },
+                        h('button', {
+                          className: 'csb-btn csb-btn-s',
+                          title: '查看这个团队的讨论房间与成员工作内容',
+                          onClick: () => onGoto?.('rooms', { filter: t.name }),
+                        }, '💬 看房间'),
+                        h('button', {
+                          className: 'csb-btn csb-btn-s',
+                          onClick: () => onGoto?.('bots'),
+                        }, '🤖 看 Bot'),
+                        h('div', { className: 'csb-spacer' }),
+                        h('button', {
+                          className: 'csb-btn csb-btn-s csb-btn-d',
+                          disabled: busy, onClick: () => closeTeam(t),
+                        }, '关闭团队')))
+                : null)
+          })))
     }
 
     // ── PDCA 测量（Metrics）───────────────────────────────────────────────────
@@ -6105,7 +6596,8 @@ window.__ModuleLoader__.load({
       {
         id: 'workspace', label: '工作台',
         subs: [
-          { id: 'board', label: '协作看板', Comp: TasksTab },
+          { id: 'board', label: '我的任务', Comp: UserTasksTab },
+          { id: 'ai-tasks', label: '智能体任务', Comp: AiTasksTab },
           { id: 'cycles', label: '复盘周期', Comp: CyclesTab },
           { id: 'todo', label: '我的待办', Comp: TodoTab },
           { id: 'scratch', label: '便签', Comp: ScratchTab },
@@ -6302,7 +6794,10 @@ window.__ModuleLoader__.load({
       const goTab = (id, opts) => {
         setTab(id)
         setView(null)
-        setLocate(opts && typeof opts === 'object' && opts.roomId ? opts : null)
+        // 定位参数：带 roomId（精确定位一条消息）或带 filter（需求3：定向筛房间）
+        setLocate(
+          opts && typeof opts === 'object' && (opts.roomId || opts.filter) ? opts : null,
+        )
       }
 
       // 兼容旧 goTab 调用：'tasks' → 'workspace', 'bots' → 'team'
@@ -6461,6 +6956,14 @@ window.__ModuleLoader__.load({
     // 改造07：分层架构——穿透面板 + 6 上层页签
     exports.DeepDivePanel = DeepDivePanel
     exports.TABS = TABS
+    exports.AiTasksTab = AiTasksTab
+    exports.UserTasksTab = UserTasksTab
+    // 需求2：任务对话面板（进度 + 对话内容 + 去对话）
+    exports.TaskConversationPanel = TaskConversationPanel
+    // 需求4：PDCA 周期页（human / agent 两类周期）
+    exports.CyclesTab = CyclesTab
+    // 需求3：团队页（只显示用户建的大团队）
+    exports.TeamsTab = TeamsTab
     exports.PANEL_ID = PANEL_ID
     exports.API = API
 

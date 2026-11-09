@@ -787,12 +787,21 @@ const DEFS = [
   // ── PDCA-4：复盘与标准化（Act）─────────────────────────────────────────────
   {
     name: 'bot_cycle_start',
-    description: '为一个任务开启 PDCA 复盘周期。阶段：planned→doing→checking→acting→done，不许跳步。',
+    description:
+      '为一个任务开启 PDCA 复盘周期。阶段：planned→doing→checking→acting→done，不许跳步。\n'
+      + '**kind 决定周期类型（需求4）**：\n'
+      + '  · human（默认）= 人跟长任务，五步不可跳，复盘后人显式确认完成；\n'
+      + '  · agent = 智能体事后归纳，可在 review 时一次性提交并自动闭环（用于定期总结提升）。',
     parameters: {
       type: 'object',
       properties: {
         taskId: { type: 'string', description: '任务 id' },
         objective: { type: 'string', description: '目标原文（防漂移锚）' },
+        kind: {
+          type: 'string',
+          enum: ['human', 'agent'],
+          description: '周期类型：human=人跟长任务（默认）；agent=智能体归纳（可一次性提交）',
+        },
         cycle: { type: 'string' },
         milestone: { type: 'string' },
         estimate: { type: 'number' },
@@ -811,7 +820,9 @@ const DEFS = [
   },
   {
     name: 'bot_cycle_advance',
-    description: '推进复盘阶段。**不许跳步**：planned→doing→checking→acting→done。',
+    description:
+      '推进复盘阶段。**human 周期不许跳步**：planned→doing→checking→acting→done，五步都要走。\n'
+      + 'agent 周期（智能体事后归纳）不需要逐步推进：直接 review 即可一次性提交并自动闭环。',
     parameters: {
       type: 'object',
       properties: {
@@ -835,7 +846,9 @@ const DEFS = [
   },
   {
     name: 'bot_cycle_check',
-    description: '记录检查结果。pass 前进到 acting，reject 打回 doing 重做。',
+    description:
+      '记录检查结果。pass 前进到 acting，reject 打回 doing 重做。\n'
+      + '这是**人验货**的环节（human 周期用）；agent 归纳周期不走检查，别对它调这个。',
     parameters: {
       type: 'object',
       properties: {
@@ -858,7 +871,10 @@ const DEFS = [
   },
   {
     name: 'bot_cycle_review',
-    description: '复盘（Act）：记录经验教训，并提议标准化建议（纪律/记忆）。建议走确认制，人采纳才落库。',
+    description:
+      '复盘（Act）：记录经验教训，并提议标准化建议（纪律/记忆）。建议走确认制，人采纳才落库。\n'
+      + '**human 周期**：只能在 acting 阶段提交，提交后人显式推进到 done。\n'
+      + '**agent 周期**（智能体定期归纳）：任意阶段可直接提交，提交即自动闭环 done（返回 autoClosed=true）。',
     parameters: {
       type: 'object',
       properties: {

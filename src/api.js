@@ -15,7 +15,7 @@
 import { readFileSync, readdirSync, statSync, existsSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { join, resolve, sep as pathSep } from 'node:path'
-import { registerRoute, listPresets, defaultPreset, getAgent, resumeSession } from './kernel.js'
+import { registerRoute, listPresets, defaultPreset, getAgent, resumeSession, readSessionMessages } from './kernel.js'
 import { createLibrary } from './library.js'
 import { createDirBrowser } from './dirbrowse.js'
 import { getServices } from './registry.js'
@@ -44,6 +44,8 @@ const DISCIPLINE_KINDS = ['rule', 'requirement', 'principle', 'style']
 
 /** PDCA 复盘阶段（前端展示用；与 cycle.js 的 CYCLE_PHASES 逐字一致）。 */
 const CYCLE_PHASES = ['planned', 'doing', 'checking', 'acting', 'done']
+/** 需求4：周期类型——human=人跟长任务，agent=智能体事后归纳。 */
+const CYCLE_KINDS = ['human', 'agent']
 
 /** 团队类型与角色（前端展示用；与 teams.js 的 TEAM_TYPES/TEAM_ROLES 逐字一致）。 */
 const TEAM_TYPES = ['big', 'small']
@@ -3205,6 +3207,78 @@ export function installApi(ctx, { warn } = {}) {
         sendJson(response, 200, { ok: true, ...out })
         return
       }
+      // ── 需求4：智能体定期归纳 —— 人点一下，把「该归纳了」变成一次真唤醒 ────────
+      //
+      // 为什么需要它：reviewer 只做被动计数（每回合 +1，到 interval 就 due），
+      // 它不自己起定时器（宿主生命周期不可控）。所以「定期归纳」的闭环落点是：
+      //   UI/接口看到 due → 人点「让它归纳」→ 唤醒该会话 → 会话自己用
+      //   bot_cycle_start(kind=agent) + bot_cycle_review 一次性提交并自动闭环。
+      // 归纳出来的建议仍然走 bot_suggestion_propose（确认制，人采纳才落库），
+      // 不存在「智能体自己改自己的长期纪律」这条暗道。
+      if (request.method === 'POST' && path === '/review/urge') {
+        const body = (await readBody(request)) ?? {}
+        const sessionId = typeof body.sessionId === 'string' ? body.sessionId.trim() : ''
+        if (!sessionId) {
+          sendJson(response, 400, { ok: false, reason: 'sessionId 必填' })
+          return
+        }
+        const st = await withService(services, 'reviewer', (r) => r.status({ sessionId }))
+        if (st.known === false) {
+          sendJson(response, 200, {
+            ok: false,
+            code: 'REVIEW_UNKNOWN_SESSION',
+            reason: `会话 ${sessionId} 还没被计数过（未记录任何回合），没有可归纳的内容`,
+          })
+          return
+        }
+        if (st.due !== true && body.force !== true) {
+          sendJson(response, 200, {
+            ok: false,
+            code: 'REVIEW_NOT_DUE',
+            reason: `会话 ${sessionId} 才累计 ${st.turnsSinceLastReview} 回合（阈值 ${st.interval}），还没到该归纳的时候`,
+            status: st,
+          })
+          return
+        }
+        const bots = services.roster?.list?.({ includeRetired: true }) ?? []
+        const bot = bots.find((b) => b.sessionId === sessionId || b.id === sessionId)
+        const text = '[cs-bots 归纳提醒] 你的会话已累计 ' + `${st.turnsSinceLastReview}` + ' 个回合没有归纳了。\n'
+          + '请现在做一次「事后归纳」（这是你自己的 PDCA，不需要人来跟）：\n'
+          + '  1. 用 bot_cycle_start 开一个 kind=agent 的周期，taskId 填你当前主任务的 id，objective 写这次归纳要解决什么；\n'
+          + `  2. 用 bot_cycle_review 一次性提交（id + summary + lessons[] + standards[]），提交后周期自动闭环；\n`
+          + '  3. standards 里只写**你确实想让它长期生效**的纪律/原则，它们会进建议队列等人采纳，不会自动落库。\n'
+          + '做完之后调 POST /review/mark-reviewed 把计数清零。'
+        const revive = await ensureLive(ctx, sessionId)
+        let wake
+        try {
+          const dispatcher = await withService(services, 'dispatcher', (d) => d)
+          wake = dispatcher.notify({
+            target: sessionId,
+            reason: 'timer',
+            dedupKey: `review-urge:${sessionId}:${Date.now()}`,
+            text,
+          })
+        } catch (error) {
+          sendJson(response, 503, {
+            ok: false,
+            code: 'REVIEW_URGE_NO_DISPATCHER',
+            reason: `没有可用的唤醒投递器：${error?.message ?? error}`,
+          })
+          return
+        }
+        sendJson(response, 200, {
+          ok: true,
+          sessionId,
+          ...(bot ? { bot: { id: bot.id, name: bot.name, label: bot.label ?? null } } : {}),
+          status: st,
+          live: revive.live,
+          revived: revive.revived,
+          ...(revive.live ? {} : { reviveReason: revive.reason ?? 'revive-failed' }),
+          wake,
+        })
+        return
+      }
+
       if (request.method === 'POST' && path === '/review/interval') {
         const body = (await readBody(request)) ?? {}
         const out = await withService(services, 'reviewer', (r) => r.setInterval({ interval: body.interval }))
@@ -3325,8 +3399,10 @@ export function installApi(ctx, { warn } = {}) {
       if (request.method === 'GET' && path === '/cycles') {
         const items = await withService(services, 'cycle', (c) => c.list({
           status: qp(url, 'status'), phase: qp(url, 'phase'), taskId: qp(url, 'taskId'),
+          // 需求4：kind 过滤——人只看自己的长任务周期，AI 的归纳周期另开视图
+          kind: qp(url, 'kind'),
         }))
-        sendJson(response, 200, { ok: true, items, phases: CYCLE_PHASES })
+        sendJson(response, 200, { ok: true, items, phases: CYCLE_PHASES, kinds: CYCLE_KINDS })
         return
       }
       if (request.method === 'POST' && path === '/cycles') {
@@ -3501,6 +3577,49 @@ export function installApi(ctx, { warn } = {}) {
             at: saved?.createdAt ?? Date.now(),
           },
           note: '已写入团队记忆（L2，全队可见）',
+        })
+        return
+      }
+
+      // ── 需求2：任务对话内容查看（2026-11-08）──────────────────────────────
+      // 用户反馈：「任务栏页面指派 bot 后，无法追踪任务进度，无法看到产出物，
+      //            没有跳转对话也没有对话内容查看」
+      // ⇒ 在任务详情里直接读执行者的会话历史，不必跳走。
+      if (request.method === 'GET' && path === '/tasks/conversation') {
+        const id = qp(url, 'id')
+        if (!id) {
+          sendJson(response, 400, { ok: false, reason: 'id 必填' })
+          return
+        }
+        const task = await withService(services, 'board', (b) => b.get(id))
+        if (!task) {
+          sendJson(response, 404, { ok: false, reason: `任务 ${id} 不存在` })
+          return
+        }
+        // 找执行者会话：assignee → ownerId → 平台伪身份排除
+        const candidates = [task.assignee, task.ownerId, task.anchor?.ownerId]
+          .filter((v) => typeof v === 'string' && v && !['ui', 'user', 'anyone', 'system'].includes(v))
+        if (candidates.length === 0) {
+          sendJson(response, 200, {
+            ok: false,
+            reason: '这个任务还没有执行者（未派活），没有对话可看',
+            code: 'NO_EXECUTOR',
+          })
+          return
+        }
+        // 把候选 sessionId 映射到 Bot 记录（拿真名）
+        let bot
+        try {
+          const all = services.roster?.list?.({ includeRetired: true }) ?? []
+          bot = all.find((b) => candidates.includes(b.sessionId) || candidates.includes(b.id))
+        } catch { bot = undefined }
+        const sessionId = bot?.sessionId ?? candidates[0]
+        const limit = qn(url, 'limit')
+        const out = await readSessionMessages(ctx, sessionId, { limit: limit ?? 40 })
+        sendJson(response, 200, {
+          ...(bot ? { bot: { id: bot.id, name: bot.name, label: bot.label ?? null } } : {}),
+          sessionId,
+          ...out,
         })
         return
       }

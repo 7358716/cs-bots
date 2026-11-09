@@ -24,6 +24,28 @@ try {
   kernelError = error
 }
 
+/**
+ * 周期类型（需求4，2026-11-08）。
+ *
+ * 用户原话：「我要求 pdca 是对用户长任务进行复盘跟进的，人类主导；
+ *            智能体的 pdca 流程你优化一下，看看有没有必要或优化，
+ *            我关心的是用户能否对长任务进行管理，智能体的 pdca 需要定期归纳提升」
+ *
+ * ⇒ 两种周期，语义完全不同，**不能混在一起**：
+ *
+ * | kind | 谁主导 | 用来干什么 | 阶段纪律 |
+ * |---|---|---|---|
+ * | `human` | **人** | 跟一个长任务：目标漂移没有、卡在哪、下一步是什么 | 强制走完五步（人不许跳步，防自欺） |
+ * | `agent` | 智能体 | 事后归纳：同类问题是否重复出现、该沉淀什么标准 | **可以一次性提交**（见 `review` 的快捷路径） |
+ *
+ * 为什么 agent 周期不强制走五步：智能体的复盘是「批量归纳」，
+ * 让它假装走 planned→doing 是对事实的虚构；人需要的是「结论 + 可采纳的标准」。
+ * 但**归纳本身要定期发生**——由 reviewer 的回合计数驱动（见 `reviewer.js`）。
+ */
+
+/** 合法周期类型。 */
+export const CYCLE_KINDS = Object.freeze(['human', 'agent'])
+
 /** 合法阶段（顺序即流转顺序）。 */
 export const CYCLE_PHASES = Object.freeze(['planned', 'doing', 'checking', 'acting', 'done'])
 
@@ -222,16 +244,24 @@ export function createCycle(ctx, config = {}) {
   /**
    * 为一个任务开一个复盘周期。
    * @param {{ taskId: string, objective: string, cycle?: string, milestone?: string,
-   *           estimate?: number, by: string, now?: number }} input
+   *           estimate?: number, kind?: 'human'|'agent', by: string, now?: number }} input
    */
   function start(input = {}) {
     assertAlive('start')
-    const { taskId, objective, cycle, milestone, estimate, by, now } = input ?? {}
+    const { taskId, objective, cycle, milestone, estimate, kind, by, now } = input ?? {}
     const taskIdNorm = requireString(taskId, 'taskId', 'start')
     const objectiveNorm = requireString(objective, 'objective', 'start')
     const author = requireString(by, 'by', 'start')
     const at = normalizeNow(now, 'start')
     const est = progressOf(estimate, 'start')
+    // 需求4：kind 决定这是「人跟长任务」还是「智能体事后归纳」
+    const kindNorm = kind === undefined || kind === null ? 'human' : String(kind)
+    if (!CYCLE_KINDS.includes(kindNorm)) {
+      throw new CycleError(
+        `cycle.start：kind=${JSON.stringify(kind)} 非法（合法：${CYCLE_KINDS.join(' | ')}）`,
+        'CYCLE_BAD_KIND', { kind },
+      )
+    }
 
     idCounter += 1
     const id = `c-${idCounter}`
@@ -239,6 +269,7 @@ export function createCycle(ctx, config = {}) {
     const rec = {
       id, rev: 1, taskId: taskIdNorm, objective: objectiveNorm,
       cycle: cycle ?? null, milestone: milestone ?? null, estimate: est ?? null,
+      kind: kindNorm,
       status: 'open', phase: 'planned', progress: 0,
       review: null, closedAt: null,
       createdAt: at, createdBy: author, updatedAt: at, updatedBy: author,
@@ -344,11 +375,15 @@ export function createCycle(ctx, config = {}) {
     }
 
     const current = cas(id, expectedRev, 'review')
-    if (current.phase !== 'acting') {
+    // 需求4：human 周期强制 acting 阶段（人不许跳步，防自欺）；
+    //        agent 周期是批量归纳，允许一次性提交（不必假装走完 planned→doing→checking）。
+    const isAgent = (current.kind ?? 'human') === 'agent'
+    if (!isAgent && current.phase !== 'acting') {
       throw new CycleError(
-        `cycle.review：周期 ${id} 当前阶段 ${current.phase}，复盘只能在 acting 阶段做 —— 请先 check pass`,
+        `cycle.review：周期 ${id} 当前阶段 ${current.phase}，复盘只能在 acting 阶段做 —— 请先 check pass`
+        + '（只有 agent 类型的周期允许一次性提交）',
         'CYCLE_BAD_PHASE',
-        { id, phase: current.phase },
+        { id, phase: current.phase, kind: current.kind ?? 'human' },
       )
     }
 
@@ -407,7 +442,22 @@ export function createCycle(ctx, config = {}) {
         warn(`[cs-bots/cycle] 周期 ${id} 提议教训记忆失败（${error?.message ?? error}）`)
       }
     }
-    return { cycle: clone(next), suggestions: proposed, proposedCount: proposed.length, degraded: false }
+    // 需求4：agent 周期归纳完即闭环——智能体不需要「人点完成」这个仪式；
+    //        human 周期留在 acting，由人显式 advance 到 done（人要对复盘结论负责）。
+    if (isAgent) {
+      const closed = clone(next)
+      closed.rev = next.rev + 1
+      closed.phase = 'done'
+      closed.status = 'closed'
+      closed.closedAt = at
+      closed.updatedAt = at
+      closed.updatedBy = author
+      commit('advance', at, author, clone(next), closed)
+      info(`[cs-bots/cycle] 周期 ${id}（agent）归纳完成 → done`)
+      return { cycle: clone(closed), suggestions: proposed, proposedCount: proposed.length, degraded: false, autoClosed: true }
+    }
+
+    return { cycle: clone(next), suggestions: proposed, proposedCount: proposed.length, degraded: false, autoClosed: false }
   }
 
   // ── API：读 ────────────────────────────────────────────────────────────────
@@ -415,6 +465,8 @@ export function createCycle(ctx, config = {}) {
   function list(query = {}) {
     assertAlive('list')
     let rows = [...entries.values()]
+    // 需求4：按 kind 分离——人只关心 human 周期（长任务跟进），不着 AI 的归纳周期
+    if (query?.kind !== undefined && query?.kind !== null) rows = rows.filter((r) => (r.kind ?? 'human') === query.kind)
     if (query?.status !== undefined && query?.status !== null) rows = rows.filter((r) => r.status === query.status)
     if (query?.phase !== undefined && query?.phase !== null) rows = rows.filter((r) => r.phase === query.phase)
     if (query?.taskId !== undefined && query?.taskId !== null) rows = rows.filter((r) => r.taskId === query.taskId)
@@ -430,11 +482,14 @@ export function createCycle(ctx, config = {}) {
   function stats() {
     const byPhase = {}
     const byStatus = {}
+    const byKind = {}
     for (const r of entries.values()) {
       byPhase[r.phase] = (byPhase[r.phase] ?? 0) + 1
       byStatus[r.status] = (byStatus[r.status] ?? 0) + 1
+      const k = r.kind ?? 'human'
+      byKind[k] = (byKind[k] ?? 0) + 1
     }
-    return { total: entries.size, open: byStatus.open ?? 0, closed: byStatus.closed ?? 0, byPhase, byStatus, events: events.length, diagnostics: clone(diagnostics) }
+    return { total: entries.size, open: byStatus.open ?? 0, closed: byStatus.closed ?? 0, byPhase, byStatus, byKind, events: events.length, diagnostics: clone(diagnostics) }
   }
 
   function replay() { hydrate(); diagnostics.lastReplayAt = Date.now(); return { from: diagnostics.hydratedFrom, events: events.length, bad: diagnostics.badLines } }

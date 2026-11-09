@@ -764,8 +764,12 @@ test('S8 回归：onGoto("tasks") 经 safeGoTab 映射到 workspace（ArtifactsT
   assert.match(SOURCE, /tasks:\s*'workspace'/, 'safeGoTab 把 tasks 映射到 workspace')
   // goTab 的第二参数必须是可选的（单参数时不产生任何定位副作用）
   assert.match(SOURCE, /const goTab = \(id, opts\) => \{/, 'goTab 必须支持可选第二参数 opts')
-  assert.match(SOURCE, /setLocate\(opts && typeof opts === 'object' && opts\.roomId \? opts : null\)/,
-    '单参数调用时 locate 必须落回 null（行为逐字不变）')
+  // 单参数（opts 缺省/非对象/无 roomId/无 filter）时 locate 必须落回 null —— 行为逐字不变
+  const goTabAt = SOURCE.indexOf('const goTab = (id, opts) =>')
+  const goTabBody = SOURCE.slice(goTabAt, SOURCE.indexOf('const safeGoTab', goTabAt))
+  assert.match(goTabBody, /setLocate\(/, 'goTab 必须把定位参数写进 locate')
+  assert.match(goTabBody, /opts && typeof opts === 'object' && \(opts\.roomId \|\| opts\.filter\) \? opts : null/,
+    '定位参数必须同时认 roomId 与 filter，非定位参数时落空（行为逐字不变）')
   // 改造07：任务页签已升级为工作台
   assert.match(SOURCE, /id:\s*'workspace',\s*label:\s*'工作台'/, '任务页签已升级为工作台（改造07）')
 })
@@ -800,7 +804,7 @@ test('S9 Workbench：onGoto("rooms", {roomId,seq}) 会把定位参数传给 Room
 })
 
 test('S9b TasksTab 把 onGoto 透传给 TaskDrawer（来源跳转的跨页签路径）', () => {
-  assert.match(SOURCE, /function TasksTab\(\{ onGoto \}\)/, 'TasksTab 必须接 onGoto')
+  assert.match(SOURCE, /function TasksTab\(\{[^}]*onGoto[^}]*\}\)/, 'TasksTab 必须接 onGoto')
   assert.match(
     SOURCE,
     /openId \? h\(TaskDrawer, \{\s*id: openId, bots, workflows,\s*onClose: \(\) => setOpenId\(null\),\s*onChange: reload,\s*onGotoSource: onGoto,/,
@@ -1000,17 +1004,308 @@ test('N2b 交付物预览：http(s) 链接渲染「打开链接」，不渲染�
 
 // ── N3 大团队 leadId 选择器（需求1）：源码级断言 ─────────────────────────────
 
-test('N3 团队页：大团队 leadId 是下拉选择器，从 roster 选，且无队长时禁用创建', () => {
+test('N3 团队页（需求3）：只显示用户团队、负责人有标识、成员可选、可新建 Bot', () => {
   // TeamsTab 未导出，按源码级断言（客户端静态装载测试同口径）
-  assert.match(SOURCE, /rosterQ = useApi\('\/roster'\)/, 'TeamsTab 必须从 /roster 读队长候选')
+  assert.match(SOURCE, /rosterQ = useApi\('\/roster'\)/, 'TeamsTab 必须从 /roster 读成员候选')
   assert.match(SOURCE, /function TeamsTab\(\{ onGoto \}\)/, 'TeamsTab 应接收 onGoto')
-  assert.match(SOURCE, /bots\.map\(\(b\) => h\('option'/, '队长选择器应列出每个 Bot 作为选项')
-  assert.match(SOURCE, /\$\{b\.name\}（\$\{b\.sessionId\}）/, '选项文案应是「名字（sessionId）」')
-  assert.match(SOURCE, /leadMissing/, '应计算「大团队缺队长」状态')
-  assert.match(SOURCE, /disabled: leadMissing/, '缺队长时创建按钮必须禁用')
-  assert.match(SOURCE, /大团队必须指定负责人/, '缺队长时应给出可读提示')
+
+  // 需求3：只显示用户建的团队（type=big），不出现大小团队概念
+  assert.match(SOURCE, /useApi\('\/teams\?type=big'/, '团队列表必须只取 type=big（用户建的团队）')
+  assert.ok(!/大团队（big）/.test(SOURCE), '不得再出现「大团队（big）」这类表述')
+
+  // 负责人必须有显式标识
+  assert.match(SOURCE, /👑 负责人/, '团队卡片必须显示「👑 负责人」标识')
+  assert.match(SOURCE, /const leadName = botBySession\.get\(t\.leadId\)/, '负责人名字必须从 Bot 记录解析')
+
+  // 成员多选（不是手抄 id）
+  assert.match(SOURCE, /botPicker\(selected, setSelected, \{ multiple: true \}\)/, '成员必须是多选')
+  assert.match(SOURCE, /const addMembers = async/, '应有批量加成员方法')
+
+  // 可新建 Bot
   assert.match(SOURCE, /onGoto\?\.\('bots'\)/, '应提供「新建 Bot」跳转')
-  assert.match(SOURCE, /botName\(rosterQ\.data\?\.bots \?\? \[\], t\.leadId\)/, '团队卡片应显示队长名字而非裸 ID')
+
+  // 可跳房间（用户补充：穿透房间看子团队工作内容）
+  assert.match(SOURCE, /onGoto\?\.\('rooms'/, '团队卡片应能跳转房间')
+})
+
+// ── N4 PDCA 周期分层（需求4）：人跟长任务 + 智能体归纳 ───────────────────────
+
+test('N4 周期页（需求4）：人类周期五步不可跳，智能体周期归纳自动闭环', () => {
+  // 需求4：kind 把周期分成 human / agent 两种，语义不同
+  assert.match(SOURCE, /\/cycles\?kind=human/, '应只取 human 周期作为「我的长任务」')
+  assert.match(SOURCE, /\/cycles\?kind=agent/, '应只取 agent 周期作为「智能体归纳」')
+
+  // 人类周期：目标原文是防漂移锚，五步不可跳
+  assert.match(SOURCE, /目标原文（防漂移锚）/, '人类周期必须有目标锚输入')
+  assert.match(SOURCE, /开启周期/, '人类周期要能开启')
+  assert.match(SOURCE, /检查通过/, '人类周期有检查步骤')
+  assert.match(SOURCE, /打回/, '人类周期允许驳回重做')
+  assert.match(SOURCE, /写复盘/, '人类周期复盘不能跳过')
+
+  // 智能体周期：一次性提交归纳，自动完成
+  assert.match(SOURCE, /智能体归纳周期/, '必须有智能体归纳分区')
+  assert.match(SOURCE, /写归纳/, '智能体周期用「写归纳」而非「写复盘」')
+  assert.match(SOURCE, /提交归纳（自动完成）/, '智能体周期提交即闭环')
+
+  // 两者语义不能混：周期页区段内不得出现大小团队那套口吻
+  const start = SOURCE.indexOf('function CyclesTab')
+  // 边界取 TeamsTab 的文档注释起点（注释在 function 声明之前）
+  const end = SOURCE.indexOf('团队页（需求3', start)
+  assert.ok(start >= 0 && end > start, 'CyclesTab 区段应存在')
+  const cyclesSrc = SOURCE.slice(start, end)
+  assert.ok(!/大小团队/.test(cyclesSrc), '周期页不得出现「大小团队」表述')
+  assert.ok(!/大团队（big）/.test(cyclesSrc), '周期页不得出现「大团队（big）」表述')
+})
+
+// ── N5 房间页支持定向筛选（需求3 补充：穿透房间看子团队）────────────────────
+
+test('N5 房间页（需求3 补充）：支持「看房间」带 filter，且是前端定向过滤', () => {
+  assert.match(SOURCE, /const roomFilter = \(locate\?\.filter \?\? ''\)\.toString\(\)\.trim\(\)/, 'RoomsTab 必须读 locate.filter')
+  assert.match(SOURCE, /rooms\.filter\(\(r\) => \(r\.name \?\? ''\)\.toLowerCase\(\)\.includes\(roomFilter\.toLowerCase\(\)\)\)/, '房间列表按名字过滤')
+  assert.match(SOURCE, /setLocate\(null\)/, '必须有清掉筛选的入口')
+  assert.match(SOURCE, /筛选房间：包含/, '过滤结果要向人说明（不然用户不知道在筛什么）')
+  assert.match(SOURCE, /onGoto\?\.\('rooms', \{ filter: t\.name \}\)/, '团队卡片必须带团队名做筛选')
+})
+
+// ── N6 任务对话面板（需求2）：运行时真的请求 /tasks/conversation 并渲染对话 ──────
+
+test('N6 任务对话面板（需求2）：运行时请求 /tasks/conversation，渲染执行者与消息', async () => {
+  const h = loadClientStateful()
+  h.setResponder((url) => {
+    if (url.includes('/tasks/conversation')) {
+      return {
+        ok: true,
+        bot: { id: 'b-1', name: '后端', label: 'API 实现' },
+        sessionId: 'sess-exec-1',
+        available: true,
+        total: 2,
+        messages: [
+          { role: 'user', kind: 'text', text: '把登录接口写出来', at: 1762000000000 },
+          { role: 'assistant', kind: 'text', text: '已完成 /login，顺带补了限流', at: 1762000100000 },
+        ],
+      }
+    }
+    return EMPTY_RESPONSE()
+  })
+  try {
+    h.render({
+      Comp: h.exports.TaskConversationPanel,
+      props: { taskId: 't-9', task: { id: 't-9', rev: 1, assignee: 'sess-exec-1' }, bots: [] },
+    })
+    await h.flush()
+    const urls = h.records.fetches.join('\n')
+    assert.match(urls, /\/tasks\/conversation\?id=t-9/, '运行时必须请求任务对话接口')
+    assert.match(urls, /limit=40/, '默认取最近 40 条')
+    const text = allText(h.records.renders.at(-1))
+    assert.match(text, /任务对话/, '应渲染任务对话区块标题')
+    assert.match(text, /执行者/, '应显示执行者身份')
+    assert.match(text, /后端/, '应显示执行者 Bot 名字')
+    assert.match(text, /把登录接口写出来/, '应渲染用户侧消息')
+    assert.match(text, /已完成 \/login/, '应渲染执行者侧消息')
+    assert.match(text, /去对话（打开会话）/, '必须提供跳转对话入口（需求2 原话：没有跳转对话）')
+    assert.match(text, /刷新对话/, '必须能刷新')
+    assert.match(text, /看全部（含工具调用）/, '默认隐藏工具/思维链，要能展开')
+  } finally {
+    h.restore()
+  }
+})
+
+test('N6b 任务对话面板：没有执行者时是空态而不是报错（后端 NO_EXECUTOR）', async () => {
+  const h = loadClientStateful()
+  h.setResponder((url) => {
+    if (url.includes('/tasks/conversation')) {
+      return { ok: false, code: 'NO_EXECUTOR', reason: '这个任务还没有执行者（未派活），没有对话可看' }
+    }
+    return EMPTY_RESPONSE()
+  })
+  try {
+    h.render({
+      Comp: h.exports.TaskConversationPanel,
+      props: { taskId: 't-10', task: { id: 't-10', rev: 1 }, bots: [] },
+    })
+    await h.flush()
+    const text = allText(h.records.renders.at(-1))
+    assert.match(text, /还没有执行者/, '未派活应是空态标题')
+    assert.match(text, /先在「可以做什么」里派活/, '空态必须给下一步')
+    assert.ok(!text.includes('读不到对话'), 'NO_EXECUTOR 是正常空态，不得显示成故障')
+  } finally {
+    h.restore()
+  }
+})
+
+test('N6c 任务对话面板：默认不渲染工具调用与思维链，展开后才显示', async () => {
+  const h = loadClientStateful()
+  h.setResponder((url) => {
+    if (url.includes('/tasks/conversation')) {
+      return {
+        ok: true, bot: { id: 'b-1', name: '后端' }, sessionId: 's-1', available: true,
+        messages: [
+          { role: 'assistant', kind: 'text', text: '看这条就够了' },
+          { role: 'assistant', kind: 'reasoning', text: '我在想限流怎么加' },
+          { role: 'tool', kind: 'tool-call', text: '{"cmd":"npm test"}', toolName: 'bash' },
+        ],
+      }
+    }
+    return EMPTY_RESPONSE()
+  })
+  try {
+    h.render({
+      Comp: h.exports.TaskConversationPanel,
+      props: { taskId: 't-11', task: { id: 't-11', rev: 1, ownerId: 's-1' }, bots: [] },
+    })
+    await h.flush()
+    const closed = allText(h.records.renders.at(-1))
+    assert.match(closed, /看这条就够了/, '默认应显示正文消息')
+    assert.ok(!closed.includes('我在想限流怎么加'), '默认不得渲染思维链（手机上会被淹没）')
+    assert.ok(!closed.includes('npm test'), '默认不得渲染工具调用')
+  } finally {
+    h.restore()
+  }
+})
+
+// ── N7 PDCA 周期页（需求4）：运行时真的按 kind 分两类拉取 ─────────────────────
+
+test('N7 周期页（需求4）：运行时分别请求 /cycles?kind=human 与 /cycles?kind=agent', async () => {
+  const h = loadClientStateful()
+  h.setResponder((url) => {
+    if (url.includes('/cycles?kind=human')) {
+      return {
+        ok: true, phases: ['planned', 'doing', 'checking', 'acting', 'done'], kinds: ['human', 'agent'],
+        items: [{ id: 'c-h1', rev: 1, taskId: 't-1', objective: '把登录重构完', phase: 'doing', status: 'open', kind: 'human' }],
+      }
+    }
+    if (url.includes('/cycles?kind=agent')) {
+      return {
+        ok: true, items: [{ id: 'c-a1', rev: 1, taskId: 't-2', objective: '本周归纳', phase: 'acting', status: 'open', kind: 'agent' }],
+      }
+    }
+    return EMPTY_RESPONSE()
+  })
+  try {
+    h.render({ Comp: h.exports.CyclesTab, props: {} })
+    await h.flush()
+    const urls = h.records.fetches.join('\n')
+    assert.match(urls, /\/cycles\?kind=human/, '人的长任务周期必须单独拉取')
+    assert.match(urls, /\/cycles\?kind=agent/, '智能体归纳周期必须单独拉取')
+    const text = allText(h.records.renders.at(-1))
+    assert.match(text, /我的任务周期/, '第一区：人的长任务周期')
+    assert.match(text, /智能体归纳周期/, '第二区：智能体归纳周期')
+    assert.match(text, /把登录重构完/, '应渲染人的周期')
+    assert.match(text, /本周归纳/, '应渲染智能体周期')
+    assert.match(text, /长任务/, 'human 周期打「长任务」标')
+    assert.match(text, /归纳/, 'agent 周期打「归纳」标')
+    assert.match(text, /开启周期/, '必须能开新周期')
+  } finally {
+    h.restore()
+  }
+})
+
+test('N7b 周期页：human 周期有「检查通过 / 打回 / 写复盘」，agent 周期只给「写归纳」', async () => {
+  const h = loadClientStateful()
+  h.setResponder((url) => {
+    if (url.includes('/cycles?kind=human')) {
+      return {
+        ok: true, items: [
+          { id: 'c-h1', rev: 1, taskId: 't-1', objective: '人的周期', phase: 'checking', status: 'open', kind: 'human' },
+          { id: 'c-h2', rev: 1, taskId: 't-2', objective: '人的周期2', phase: 'acting', status: 'open', kind: 'human' },
+        ],
+      }
+    }
+    if (url.includes('/cycles?kind=agent')) {
+      return {
+        ok: true, items: [
+          { id: 'c-a1', rev: 1, taskId: 't-3', objective: '智能体周期', phase: 'checking', status: 'open', kind: 'agent' },
+          { id: 'c-a2', rev: 1, taskId: 't-4', objective: '智能体周期2', phase: 'acting', status: 'open', kind: 'agent' },
+        ],
+      }
+    }
+    return EMPTY_RESPONSE()
+  })
+  try {
+    h.render({ Comp: h.exports.CyclesTab, props: {} })
+    await h.flush()
+    const tree = h.records.renders.at(-1)
+    const text = allText(tree)
+    // human checking 周期 → 两个检查按钮都在
+    assert.equal(findButtonsByText(tree, '检查通过').length, 1, 'human checking 周期必须有「检查通过」')
+    assert.equal(findButtonsByText(tree, '打回').length, 1, 'human checking 周期必须有「打回」')
+    // human acting 周期 → 写复盘
+    assert.equal(findButtonsByText(tree, '写复盘').length, 1, 'human acting 周期按钮是「写复盘」')
+    // agent checking 周期 → 不许出现「检查通过」/「打回」（智能体周期不给人做检查）
+    assert.equal(findButtonsByText(tree, '检查通过').length, 1, 'agent 周期不得多出「检查通过」按钮')
+    // agent acting 周期 → 写归纳（一次性提交）
+    assert.equal(findButtonsByText(tree, '写归纳').length, 1, 'agent acting 周期按钮是「写归纳」')
+    // 人的五步纪律提示必须在页上
+    assert.match(text, /五步不可跳|不自欺/, '人的周期要说明「五步不可跳」的纪律')
+  } finally {
+    h.restore()
+  }
+})
+
+// ── N7c 周期页：到期会话能被看见，并且「让它归纳」真的调 /review/urge ─────────
+
+test('N7c 周期页（需求4）：到期会话显示「让它归纳」，点击真的 POST /review/urge', async () => {
+  const h = loadClientStateful()
+  const posts = []
+  h.setResponder((url) => {
+    if (url.includes('/review/status')) {
+      return { ok: true, status: { interval: 5, sessions: 2, due: true, dueSessions: ['sess-due-1'], totalTurns: 12 } }
+    }
+    if (url.includes('/roster')) {
+      return { ok: true, bots: [{ id: 'b-1', name: '后端', sessionId: 'sess-due-1' }] }
+    }
+    if (url.includes('/cycles?kind=human')) return { ok: true, items: [] }
+    if (url.includes('/cycles?kind=agent')) return { ok: true, items: [] }
+    if (url.includes('/review/urge')) return { ok: true, sessionId: 'sess-due-1', wake: { sent: 1 } }
+    return EMPTY_RESPONSE()
+  })
+  try {
+    h.render({ Comp: h.exports.CyclesTab, props: {} })
+    await h.flush()
+    const urls = h.records.fetches.join('\n')
+    assert.match(urls, /\/review\/status/, '周期页必须查「谁到期待归纳」')
+    assert.match(urls, /\/roster/, '到期会话要显示成人名')
+    const text = allText(h.records.renders.at(-1))
+    assert.match(text, /没归纳了/, '要告诉人「有几个会话到期待归纳」')
+    assert.match(text, /后端/, '到期会话应显示 Bot 名字而不是裸 id')
+    const btns = findButtonsByText(h.records.renders.at(-1), '让它归纳')
+    assert.equal(btns.length, 1, '到期会话必须有「让它归纳」按钮')
+  } finally {
+    h.restore()
+  }
+})
+
+// ── N8 团队页（需求3）：运行时只拉用户建的大团队 ───────────────────────────────
+
+test('N8 团队页（需求3）：运行时只请求 /teams?type=big 与 /roster', async () => {
+  const h = loadClientStateful()
+  h.setResponder((url) => {
+    if (url.includes('/teams?type=big')) {
+      return {
+        ok: true,
+        items: [{ id: 'team-1', rev: 2, name: '发布协调', type: 'big', leadId: 'sess-lead-1', members: ['sess-lead-1', 'sess-m-2'], purpose: '管发布' }],
+      }
+    }
+    if (url.includes('/roster')) {
+      return { ok: true, bots: [{ id: 'b-1', name: '队长', sessionId: 'sess-lead-1' }, { id: 'b-2', name: '组员', sessionId: 'sess-m-2' }] }
+    }
+    return EMPTY_RESPONSE()
+  })
+  try {
+    h.render({ Comp: h.exports.TeamsTab, props: { onGoto: () => {} } })
+    await h.flush()
+    const urls = h.records.fetches.join('\n')
+    assert.match(urls, /\/teams\?type=big/, '只拉用户建的大团队')
+    assert.match(urls, /\/roster/, '需要 roster 把人名显示出来')
+    assert.ok(!/\/teams\?type=small/.test(urls), '不得请求小团队（用户不需要这个分类）')
+    const text = allText(h.records.renders.at(-1))
+    assert.match(text, /发布协调/, '应渲染团队名')
+    assert.match(text, /队长/, '应把 leadId 解析成人名')
+    assert.match(text, /负责人/, '负责人要有标识')
+    assert.ok(!text.includes('大团队（big）'), 'UI 不暴露「大团队（big）」这种内部概念')
+  } finally {
+    h.restore()
+  }
 })
 
 // ── S11 新增代码没有引入相对 require（沿用 C11 的口径，覆盖本文件全部新增） ──
