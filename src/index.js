@@ -17,9 +17,10 @@ import { createRoom } from './room.js'
 import { createMemory } from './memory.js'
 import { installTools } from './tools.js'
 import { setServices } from './registry.js'
-import { service, stateDir as kernelStateDir, onLlmStream, sessionMeta } from './kernel.js'
+import { service, stateDir as kernelStateDir, onLlmStream, sessionMeta, readSessionWatermark as kernelWatermark } from './kernel.js'
 import { installLlmStreamHint } from './routing/hints.js'
 import { installApi } from './api.js'
+import { createDeliveryWatch, DEFAULT_GRACE_MS, DEFAULT_TICK_MS } from './delivery-watch.js'
 import { createLibrary } from './library.js'
 import { createDiscipline } from './discipline.js'
 import { createTodo } from './todo.js'
@@ -313,6 +314,44 @@ function applyInner(ctx, config, { log, warn }) {
     log(`[cs-bots] subscription 就绪（${services.subscription.stats().active} 条活订阅）`)
   } catch (error) {
     warn(`[cs-bots] subscription 装配失败（房间→任务扇出不可用）：${error?.message ?? error}`)
+  }
+
+  // ── 投递回执看护（2026-11-09 · 补 superagent 的 inputsRead 那一层）─────────────
+  // 「投递成功」不等于「真的在跑」：现场出现过 wake 记 sent、会话 turns/steps 全 0、
+  // 任务卡在「进行中」且页面无异常。看护在投递后盯事件水位，超时没涨就把
+  // 「已投递但执行者未开始动作」写进 task.delivery.error，让它以 person/delivery 显形。
+  try {
+    const graceMs = Number(process?.env?.CS_BOTS_DELIVERY_GRACE_MS) || DEFAULT_GRACE_MS
+    services.deliveryWatch = createDeliveryWatch(ctx, {
+      logger: { info: log, warn },
+      watermark: (sessionId) => kernelWatermark(ctx, sessionId),
+      markFailure: async (taskId, reason) => {
+        const board = services.board
+        if (!board) return false
+        const current = board.get(taskId)
+        if (!current || current.status === 'deleted' || current.status === 'completed') return false
+        try {
+          await board.update({
+            id: taskId,
+            expectedRev: current.rev,
+            action: 'set',
+            byId: 'cs-bots.watchdog',
+            delivery: { error: reason, at: Date.now(), by: 'cs-bots.watchdog' },
+          })
+          return true
+        } catch {
+          return false
+        }
+      },
+      options: {
+        graceMs,
+        tickMs: Number(process?.env?.CS_BOTS_DELIVERY_TICK_MS) || DEFAULT_TICK_MS,
+      },
+    })
+    log(`[cs-bots] 投递回执看护就绪（宽限 ${Math.round(graceMs / 1000)}s）`)
+  } catch (error) {
+    warn(`[cs-bots] 投递回执看护装配失败（投递仍可用，只是不追踪回执）：${error?.message ?? error}`)
+    services.deliveryWatch = undefined
   }
 
   // ── 页面数据面：HTTP API（页面层靠它拿数据；没有它 UI 是空壳）──────────────

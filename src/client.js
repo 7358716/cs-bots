@@ -5357,14 +5357,37 @@ window.__ModuleLoader__.load({
     function TeamSpacesTab({ onGoto }) {
       const listQ = useApi('/teams?type=big', [])
       const rosterQ = useApi('/roster')
+      // 补挂工作区（2026-11-09）：存量 Bot 的会话从没进过 Workspace，
+      // 所以永远躺在左侧栏「未分组」。这里也给一个人能找到的入口 ——
+      // 用户是在「工作区」页签找这个功能的，按钮不能只藏在「Bot 档案」里。
+      const [attaching, setAttaching] = useState(false)
+      const [attachMsg, setAttachMsg] = useState(null)
       const [expanded, setExpanded] = useState({})
       const [copied, setCopied] = useState(null)
       const copyTimerRef = useRef(null)
       useEffect(() => () => { if (copyTimerRef.current) clearTimeout(copyTimerRef.current) }, [])
+      const reloadBots = () => { try { rosterQ.reload?.() } catch { /* 失败不影响补挂结果 */ } }
 
       const teams = listQ.data?.items ?? []
       const bots = (rosterQ.data?.bots ?? []).filter((b) => b.state !== 'retired')
       const botBySession = new Map(bots.map((b) => [b.sessionId, b]))
+
+      const attachWorkspaces = async () => {
+        setAttachMsg(null)
+        setAttaching(true)
+        try {
+          const d = await call('/roster/attach-workspaces', { method: 'POST', body: {} })
+          setAttachMsg({
+            kind: d?.failed ? 'err' : 'ok',
+            text: d?.note ?? `已挂 ${d?.attached ?? 0} / ${d?.total ?? 0}`,
+          })
+          reloadBots()
+        } catch (e) {
+          setAttachMsg({ kind: 'err', text: `补挂失败：${e.message}` })
+        } finally {
+          setAttaching(false)
+        }
+      }
 
       const copyPath = (p) => {
         try {
@@ -5445,6 +5468,16 @@ window.__ModuleLoader__.load({
           desc: '每个团队在这里有一个工作区：负责人、成员、各自的工作目录，以及直达房间的入口。'
             + '「点左侧 ◈ 协作平台 → 团队 → 工作区」即可到达。',
         },
+          // 左侧栏「未分组」的根治按钮 —— 存量 Bot 的会话必须显式挂一次
+          h('div', { className: 'csb-bar', style: { marginTop: 8, flexWrap: 'wrap' } },
+            h('button', { className: 'csb-btn csb-btn-p', disabled: attaching, onClick: attachWorkspaces },
+              attaching ? '补挂中…' : '把 Bot 会话挂进左侧栏工作区'),
+            h('span', { className: 'csb-set-d' },
+              '新建的 Bot 会自动挂；存量 Bot（改版前建的）点这里补挂一次，'
+              + '它们的对话就会出现在左侧栏对应的工作目录分组里，而不是「未分组」')),
+          attachMsg
+            ? h(Notice, { kind: attachMsg.kind, onClose: () => setAttachMsg(null) }, attachMsg.text)
+            : null,
           listQ.error
             ? h('div', { className: 'csb-notice csb-notice-err' }, `读取团队失败：${listQ.error.message ?? listQ.error}`)
             : null,

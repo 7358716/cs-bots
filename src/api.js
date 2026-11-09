@@ -15,7 +15,7 @@
 import { readFileSync, readdirSync, statSync, existsSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { join, resolve, sep as pathSep } from 'node:path'
-import { registerRoute, listPresets, defaultPreset, getAgent, resumeSession, readSessionMessages, attachToWorkspace } from './kernel.js'
+import { registerRoute, listPresets, defaultPreset, getAgent, resumeSession, readSessionMessages, attachToWorkspace, readSessionWatermark } from './kernel.js'
 import { createLibrary } from './library.js'
 import { createDirBrowser } from './dirbrowse.js'
 import { getServices } from './registry.js'
@@ -786,6 +786,55 @@ async function ensureLive(ctx, sessionId) {
     return { ok: true, live: true, revived: true }
   } catch (error) {
     return { ok: false, live: false, revived: false, reason: `resume-failed:${error?.message ?? error}` }
+  }
+}
+
+/**
+ * 投递前取「会话水位」基线（用于投递后判定执行者到底动没动）。
+ *
+ * 读不到水位就返回 undefined —— 宁可不追踪，也不要拿假基线去误报。
+ *
+ * @param {object} ctx
+ * @param {string} sessionId
+ * @returns {Promise<object|undefined>}
+ */
+async function takeWatermarkBaseline(ctx, sessionId) {
+  try {
+    const wm = await readSessionWatermark(ctx, sessionId)
+    return wm?.ok ? wm : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * 投递成功后登记一条「等回执」期望（2026-11-09 · 补 superagent inputsRead 那一层）。
+ *
+ * 为什么必须在**投递前**取基线：等投递完再读，可能已经把这次投递算进基线里，
+ * 于是「水位从来没涨过」也看不出差异 —— 那就等于没追踪。
+ *
+ * @param {object} services
+ * @param {string} taskId
+ * @param {string} sessionId
+ * @param {object|undefined} baseline 投递前 takeWatermarkBaseline() 的结果
+ * @param {object|undefined} wake dispatcher.notify 的返回
+ */
+function armDeliveryWatch(services, taskId, sessionId, baseline, wake) {
+  const watch = services.deliveryWatch
+  if (!watch || !baseline || !baseline.ok) return undefined
+  // 只有真的「发出去了」才等回执：failed/pending 各有各的显形方式，不该混进来。
+  if (!wake || wake.result !== 'sent') return undefined
+  try {
+    const out = watch.expect({
+      taskId,
+      sessionId,
+      baselineSeq: baseline.seq,
+      baselineUserMessages: baseline.userMessages,
+      wakeId: wake.wakeId,
+    })
+    return out?.ok ? out : undefined
+  } catch {
+    return undefined
   }
 }
 
@@ -2159,6 +2208,8 @@ export function installApi(ctx, { warn } = {}) {
             })
             return
           }
+          // 投递前取基线：投递后靠它判断「执行者到底动没动」
+          const assignBaseline = await takeWatermarkBaseline(ctx, body.ownerId)
           wake = services.dispatcher.notify({
             target: body.ownerId,
             reason: 'task-assigned',
@@ -2174,6 +2225,8 @@ export function installApi(ctx, { warn } = {}) {
           if (wake && wake.result === 'failed') {
             await markDeliveryFailure(services, task.id, wake.reason ?? 'wake-failed', body.ownerId)
           }
+          // 发出去了就等回执：过了宽限期会话水位还没涨 ⇒ 判「未开始动作」
+          armDeliveryWatch(services, task.id, body.ownerId, assignBaseline, wake)
         }
         sendJson(response, 200, { ok: true, task, wake, prepare, ...reviveFields(revive) })
         return
@@ -2312,12 +2365,15 @@ export function installApi(ctx, { warn } = {}) {
           // 唤醒文案 = 完整锚定文案（含刚追加的这条）+ 【新增补充说明】<text>
           // 这正是「长任务不失真」的落点：Bot 每次被唤醒都看到全量目标原文。
           const notes = readTaskNotes(services, task.id)
+          services.deliveryWatch?.cancelByTask?.(task.id)
+          const noteBaseline = await takeWatermarkBaseline(ctx, task.ownerId)
           wake = dispatcher.notify({
             target: task.ownerId,
             reason: 'task-assigned',
             dedupKey: `task-note:${task.id}:${note.id}`,
             text: `${buildTaskAnchorText(task, notes, readLongrunMeta(services, task.id))}\n\n【新增补充说明】${note.text}`,
           })
+          armDeliveryWatch(services, task.id, task.ownerId, noteBaseline, wake)
         }
         sendJson(response, 200, { ok: true, note, wake, ...reviveFields(revive) })
         return
@@ -2479,6 +2535,9 @@ export function installApi(ctx, { warn } = {}) {
           })
           return
         }
+        // 人点「重试」= 重新建立一次期望（旧的那条自然被覆盖）
+        services.deliveryWatch?.cancelByTask?.(task.id)
+        const wakeBaseline = await takeWatermarkBaseline(ctx, task.ownerId)
         const wake = dispatcher.notify({
           target: task.ownerId,
           reason: 'task-assigned',
@@ -2488,6 +2547,7 @@ export function installApi(ctx, { warn } = {}) {
         if (wake && wake.result === 'failed') {
           await markDeliveryFailure(services, task.id, wake.reason ?? 'wake-failed', task.ownerId)
         }
+        armDeliveryWatch(services, task.id, task.ownerId, wakeBaseline, wake)
         sendJson(response, 200, {
           ok: true,
           taskId: task.id,

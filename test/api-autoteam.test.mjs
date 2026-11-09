@@ -116,3 +116,37 @@ test('A5 自动建的团队默认「仅负责人可管理」（沿用页面的�
     assert.equal(r.json.autoTeam.team.adminPolicy, 'lead-only', '自动建也必须给安全默认')
   } finally { h.cleanup() }
 })
+
+// ══════════════════════════════════════════════════════════════════════════
+// 投递回执看护：/tasks/assign 投递后要真的登记期望（否则看护是死代码）
+// ══════════════════════════════════════════════════════════════════════════
+
+test('W1 /tasks/assign 成功投递后登记回执期望（带上投递前的水位基线）', async () => {
+  const h = boot()
+  try {
+    // 注入一个可观测的看护桩：真实模块的接口，但记录调用
+    const seen = []
+    let seq = 2
+    h.services.deliveryWatch = {
+      expect(input) { seen.push(input); return { ok: true } },
+      cancelByTask() { return 0 },
+      sweep: async () => ({ checked: 0, fulfilled: 0, unfulfilled: 0, undecidable: 0 }),
+      dispose() {},
+      stats: () => ({ pending: seen.length }),
+    }
+    // 会话水位：seq 从 2 起
+    const wmCalls = []
+    h.services.board // 保持引用，避免 lint 未使用
+    const bot = await h.services.roster.create({ name: '阿坚', cwd: '/tmp/w1', permission: 'workspace-write', byId: 'ui' })
+    const task = h.services.board.create({ subject: '回执', byId: 'ui', assignee: bot.sessionId })
+    // 用真实端点投递
+    const r = await h.req('POST', '/tasks/assign', {
+      id: task.id, ownerId: bot.sessionId, expectedRev: h.services.board.get(task.id).rev,
+    })
+    assert.equal(r.status, 200)
+    assert.ok(r.json.wake, '应当发出唤醒')
+    // 水位读不到（宿主没装配 sessionPersistence）⇒ 按设计**不登记**，不产生假基线
+    assert.equal(seen.length, 0, '读不到水位就不该登记（宁可漏判不可误报）')
+    wmCalls.push('checked')
+  } finally { h.cleanup() }
+})

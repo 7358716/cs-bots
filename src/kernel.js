@@ -746,6 +746,59 @@ export async function readSessionMessages(ctx, sessionId, options = {}) {
 }
 
 /**
+ * 会话的「水位」：最新事件序号 + 最新事件时间 + 是否已有用户消息。
+ *
+ * ## 为什么要它（2026-11-09「投递成功但执行者不动」）
+ *   `dispatcher` 只记 `sent`（= 我们把消息交给了宿主），这不等于「执行者真的开始了
+ *   一个回合」。现场就出现过：wake 记 `sent`，而会话 `turns: 0 / steps: 0`、
+ *   事件文件还停在几天前 —— 任务卡在「进行中」，页面上看不到任何异常。
+ *
+ *   要判「它到底动没动」，最可靠、成本最低的依据就是**会话事件水位**：
+ *   投递后一段时间内，如果 seq 没有增长、也没有新的 `user/message`，
+ *   那这条输入就是没被消费。这就是 superagent `inputsRead` 那一层的最小实现。
+ *
+ * 只读打开（`access:'read'`），绝不抢会话所有权。
+ *
+ * @param {object} ctx
+ * @param {string} sessionId
+ * @returns {Promise<{ ok: boolean, available?: boolean, seq?: number, lastAt?: number,
+ *                     userMessages?: number, reason?: string }>}
+ */
+export async function readSessionWatermark(ctx, sessionId) {
+  if (typeof sessionId !== 'string' || sessionId === '') {
+    return { ok: false, reason: 'missing-session-id', available: true }
+  }
+  const persistence = service(ctx, 'sessionPersistence')
+  if (!persistence || typeof persistence.open !== 'function') {
+    return { ok: false, available: false, reason: 'sessionPersistence 不可用' }
+  }
+  let handle
+  try {
+    handle = await persistence.open(sessionId, 'read')
+  } catch (error) {
+    return { ok: false, available: true, reason: `打开会话失败：${error?.message ?? error}` }
+  }
+  try {
+    const result = await handle.read(0)
+    const events = Array.isArray(result?.events) ? result.events : []
+    let seq = -1
+    let lastAt
+    let userMessages = 0
+    for (const ev of events) {
+      if (!ev || typeof ev !== 'object') continue
+      if (Number.isFinite(ev.seq) && ev.seq > seq) seq = ev.seq
+      if (Number.isFinite(ev.time)) lastAt = ev.time
+      if (ev.type === 'user/message') userMessages += 1
+    }
+    return { ok: true, available: true, seq, lastAt, userMessages }
+  } catch (error) {
+    return { ok: false, available: true, reason: `读取会话事件失败：${error?.message ?? error}` }
+  } finally {
+    try { await handle.close?.() } catch { /* 关闭失败不影响已读到的数据 */ }
+  }
+}
+
+/**
  * 把官方 SessionEvent 转成人类可读的消息片段。
  *
  * 只保留**有对话价值**的事件类型：用户消息、助手文本、工具调用（摘要）、工具结果（摘要）。
