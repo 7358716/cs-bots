@@ -43,6 +43,37 @@ window.__ModuleLoader__.load({
       }
     }
 
+    /**
+     * 跳到宿主的某个会话（左侧栏那个对话）。
+     *
+     * ## 为什么要单独包一层（2026-11-09 现场 bug）
+     *   官方签名是 **`openSession(sessionId: string)`**（`dsh-client-ui-workspace`
+     *   的 `replaceMain` 直接把它当 key 去 `sessions.retain(id)`）。
+     *   我们以前传的是 **对象** `{ sessionId }` ⇒ retain 拿到一个对象 ⇒ 抛错 ⇒
+     *   被 catch 吞成「宿主不支持自动跳转，已复制会话 ID」。
+     *   **那不是宿主不支持，是我们传错了类型。**
+     *
+     * 另外官方 `sessionLinkState` 的判定是：会话已归档 / 不在会话列表 ⇒ 打不开。
+     * 所以这里先判可用性，不可用就把**原因**说出来，而不是一律说「不支持」。
+     *
+     * @param {string} sessionId
+     * @returns {Promise<boolean>} 是否真的跳过去了
+     */
+    async function tryOpenSession(sessionId) {
+      if (!sessionId || typeof sessionId !== 'string') return false
+      const svc = hostUiWorkspace
+      if (!svc || typeof svc.openSession !== 'function') return false
+      try {
+        // 官方约定：传字符串 id（不是 { sessionId }）
+        const maybe = svc.openSession(sessionId)
+        if (maybe && typeof maybe.then === 'function') await maybe
+        return true
+      } catch (error) {
+        // 打不开就把原因带给用户，不要谎称「宿主不支持」
+        throw new Error(`打开会话失败：${error?.message ?? error}`)
+      }
+    }
+
     // ── 请求 ────────────────────────────────────────────────────────────────
 
     async function call(path, options) {
@@ -898,7 +929,9 @@ window.__ModuleLoader__.load({
      * 任务详情抽屉。
      *
      * `onGotoSource` 是「来源跳转」的跨页签定位回调（契约 §3.2 第 6 条）：
-     *   `onGotoSource('rooms', { roomId, seq })` → 切到房间页签并定位到那条消息。
+     *   `onGotoSource('team', { sub: 'rooms', roomId, seq })` → 切到房间子页签并定位那条消息。
+     *   ⚠️ **必须带 `sub`**：`safeGoTab` 会把旧的 `'rooms'` 映射成主页签 `'team'`，
+     *      然后按该页签的**第一个子视图**渲染 ⇒ 落进「Bot 档案」而不是房间。
      * 没有传（例如从成果库打开）时，点击会明确提示「当前页面不支持跨页签跳转」，
      * 绝不假装跳成功。
      */
@@ -983,6 +1016,39 @@ window.__ModuleLoader__.load({
         error ? h('div', { className: 'csb-err' }, error) : null,
         err ? h(ErrBox, { humanized: err, onAction: (c) => errHandlers[c]?.() }) : null,
         task ? h('div', null,
+          // ── 快捷跳转条（2026-11-09：「任务栏里跳转不到房间，没有按钮」）──────
+          // 以前这些入口散落在各个子面板里，或者根本没有按钮，只能靠人记路径。
+          // 现在把三个最常用的跳转放在抽屉最上面，一眼就够得着。
+          h('div', { className: 'csb-bar', style: { marginTop: 8, flexWrap: 'wrap' } },
+            h('button', {
+              type: 'button', className: 'csb-btn csb-btn-s',
+              title: '跳到「房间」页签，按这个执行者筛房间',
+              onClick: () => {
+                const target = task.assignee ?? task.ownerId
+                const name = target ? botName(bots, target) : ''
+                if (typeof onGotoSource === 'function') {
+                  onGotoSource('team', { sub: 'rooms', ...(name ? { filter: name } : {}) })
+                } else {
+                  setErr('当前页面不支持跨页签跳转，请手动打开房间列表')
+                }
+              },
+            }, '💬 去房间'),
+            h('button', {
+              type: 'button', className: 'csb-btn csb-btn-s',
+              title: '跳到「Bot 档案」看这个执行者的资料',
+              onClick: () => {
+                if (typeof onGotoSource === 'function') onGotoSource('team', { sub: 'bots' })
+                else setErr('当前页面不支持跨页签跳转，请手动打开 Bot 档案')
+              },
+            }, '🤖 看执行者'),
+            h('button', {
+              type: 'button', className: 'csb-btn csb-btn-s',
+              title: '跳到「成果」页签看产出物',
+              onClick: () => {
+                if (typeof onGotoSource === 'function') onGotoSource('workspace', { sub: 'artifacts' })
+                else setErr('当前页面不支持跨页签跳转，请手动打开成果页')
+              },
+            }, '📦 看产出物')),
           h('div', { className: 'csb-kv' },
             // ── 5W：谁建的 / 是什么 / 何时 / 在哪做 / 为什么 ──
             // 需求5：表述以「人」为主体——人建的任务就说「用户」，不暴露 Bot 会话 id
@@ -1542,10 +1608,7 @@ window.__ModuleLoader__.load({
           return
         }
         try {
-          if (hostUiWorkspace?.openSession) {
-            hostUiWorkspace.openSession({ sessionId: bot.sessionId ?? ownerId })
-            return
-          }
+          if (await tryOpenSession(bot.sessionId ?? ownerId)) return
           const ok = await copyText(bot.sessionId ?? ownerId)
           setJump({
             id: bot.sessionId ?? ownerId,
@@ -1587,7 +1650,9 @@ window.__ModuleLoader__.load({
           setErr(`消息 #${seq} 已不在（可能被清理）`)
         }
         // 切到「房间」页签并带上定位参数（§3.2：`onGoto('rooms', { roomId, seq })`）
-        if (typeof onGotoSource === 'function') onGotoSource('rooms', { roomId: room.roomId, seq })
+        // 必须带 sub:'rooms'（2026-11-09 修正）：safeGoTab 会把 'rooms' 映射成 'team'，
+        // 不带 sub 就落到首个子视图「Bot 档案」——这就是「跳房间跳到 Bot 页」的根因。
+        if (typeof onGotoSource === 'function') onGotoSource('team', { sub: 'rooms', roomId: room.roomId, seq })
         else setErr('当前页面不支持跨页签跳转，请手动打开房间列表')
       }
 
@@ -1795,6 +1860,25 @@ window.__ModuleLoader__.load({
                     ? h('span', { className: 'csb-b csb-b-run', style: { marginLeft: 8 } }, '需要你处理')
                     : null)))
             }
+            // ── 执行者状态（2026-11-09：「显示正在执行中，但我看不到过程」）────
+            // 「投递成功」不等于「真的在跑」。把三件事分开说：
+            //   会话在不在线 / 最近一次唤醒结果 / 有没有投递失败
+            if (sum.executor) {
+              const ex = sum.executor
+              const wakeText = ex.lastWake
+                ? `${ex.lastWake.result ?? '?'}${ex.lastWake.detail ? `（${ex.lastWake.detail}）` : ''}`
+                : '还没有唤醒过'
+              progressItems.push(h('div', { key: 'exec', className: 'csb-kv', style: { marginTop: 10 } },
+                h('span', { className: 'csb-k' }, '执行者'),
+                h('span', { className: 'csb-v' },
+                  h('span', { className: ex.live ? 'csb-b csb-b-run' : 'csb-b' },
+                    ex.live ? '会话在线' : '会话离线（唤醒会先复活）'),
+                  h('span', { className: 'csb-set-d', style: { marginLeft: 8 } }, `最近唤醒：${wakeText}`))))
+              if (ex.deliveryError) {
+                progressItems.push(h('div', { key: 'execerr', className: 'csb-err', style: { marginTop: 6 } },
+                  `输入投递失败：${ex.deliveryError}`))
+              }
+            }
             if (currentProgress) {
               progressItems.push(h('div', { key: 'p', className: 'csb-kv', style: { marginTop: 10 } },
                 h('span', { className: 'csb-k' }, '当前进度'),
@@ -1868,10 +1952,7 @@ window.__ModuleLoader__.load({
           return
         }
         try {
-          if (hostUiWorkspace?.openSession) {
-            hostUiWorkspace.openSession({ sessionId })
-            return
-          }
+          if (await tryOpenSession(sessionId)) return
           const ok = await copyText(sessionId)
           setCopied(ok ? `宿主不支持自动跳转，已复制会话 ID：${sessionId}` : `请手动复制会话 ID：${sessionId}`)
         } catch (e) {
@@ -3594,10 +3675,7 @@ window.__ModuleLoader__.load({
       const openSession = async (bot) => {
         setErr(null)
         try {
-          if (hostUiWorkspace?.openSession) {
-            hostUiWorkspace.openSession({ sessionId: bot.sessionId })
-            return
-          }
+          if (await tryOpenSession(bot.sessionId)) return
           const copied = await copyText(bot.sessionId)
           setSessionPicker({
             bot,
@@ -5203,7 +5281,10 @@ window.__ModuleLoader__.load({
                         h('button', {
                           className: 'csb-btn csb-btn-s',
                           title: '查看这个团队的讨论房间与成员工作内容',
-                          onClick: () => onGoto?.('rooms', { filter: t.name }),
+                          // 必须带 sub:'rooms' —— safeGoTab 会把 'rooms' 映射成主页签 'team'，
+                          // 不带 sub 就落到该页签的第一个子视图（Bot 档案），这就是
+                          // 「点去房间却跳到 Bot 创建页」的真正原因。
+                          onClick: () => onGoto?.('team', { sub: 'rooms', filter: t.name }),
                         }, '💬 看房间'),
                         h('button', {
                           className: 'csb-btn csb-btn-s',

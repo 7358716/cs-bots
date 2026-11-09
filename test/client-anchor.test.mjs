@@ -605,7 +605,9 @@ test('S3 来源跳转：kind:"room" 渲染「回到消息出处（房间名 #7�
     assert.notEqual(btn.props.disabled, true, '可跳时按钮不得禁用')
     assert.equal(typeof btn.props.onClick, 'function')
     await btn.props.onClick()
-    assert.deepEqual(gotos, [['rooms', { roomId: 'room-a1b2c3d4', seq: 7 }]], '必须调 onGoto("rooms", {roomId, seq})')
+    // 修正（2026-11-09）：必须带 sub:'rooms'。safeGoTab 把 'rooms' 映射成主页签
+    // 'team' 后按**首个子视图**渲染 ⇒ 原来那版实际落到「Bot 档案」。
+    assert.deepEqual(gotos, [['team', { sub: 'rooms', roomId: 'room-a1b2c3d4', seq: 7 }]], '必须调 onGoto("team", {sub:"rooms", roomId, seq})')
   } finally {
     h.restore()
   }
@@ -646,7 +648,7 @@ test('S4 来源跳转：messageExists:false → 提示「消息 #7 已不在（�
     assert.ok(btn, '消息不在但房间还在 → 仍可切房间')
     assert.notEqual(btn.props.disabled, true, '消息不在时按钮仍可用（能切到房间）')
     await btn.props.onClick()
-    assert.deepEqual(gotos, [['rooms', { roomId: 'room-a1b2c3d4', seq: 7 }]], '仍要切到房间页签')
+    assert.deepEqual(gotos, [['team', { sub: 'rooms', roomId: 'room-a1b2c3d4', seq: 7 }]], '仍要切到房间页签（带 sub:rooms）')
   } finally {
     h.restore()
   }
@@ -1025,7 +1027,9 @@ test('N3 团队页（需求3）：只显示用户团队、负责人有标识、�
   assert.match(SOURCE, /onGoto\?\.\('bots'\)/, '应提供「新建 Bot」跳转')
 
   // 可跳房间（用户补充：穿透房间看子团队工作内容）
-  assert.match(SOURCE, /onGoto\?\.\('rooms'/, '团队卡片应能跳转房间')
+  // 修正（2026-11-09）：`onGoto('rooms')` 会被 safeGoTab 映射成 'team' 并按
+  // **首个子视图**渲染 ⇒ 实际落到「Bot 档案」。必须显式带 sub:'rooms'。
+  assert.match(SOURCE, /onGoto\?\.\('team', \{ sub: 'rooms', filter: t\.name \}\)/, '团队卡片应能跳转房间（落到 rooms 子页签）')
 })
 
 // ── N4 PDCA 周期分层（需求4）：人跟长任务 + 智能体归纳 ───────────────────────
@@ -1064,7 +1068,8 @@ test('N5 房间页（需求3 补充）：支持「看房间」带 filter，且�
   assert.match(SOURCE, /rooms\.filter\(\(r\) => \(r\.name \?\? ''\)\.toLowerCase\(\)\.includes\(roomFilter\.toLowerCase\(\)\)\)/, '房间列表按名字过滤')
   assert.match(SOURCE, /setLocate\(null\)/, '必须有清掉筛选的入口')
   assert.match(SOURCE, /筛选房间：包含/, '过滤结果要向人说明（不然用户不知道在筛什么）')
-  assert.match(SOURCE, /onGoto\?\.\('rooms', \{ filter: t\.name \}\)/, '团队卡片必须带团队名做筛选')
+  // 修正（2026-11-09）：必须带 sub:'rooms'，否则会被 safeGoTab 落到首个子视图
+  assert.match(SOURCE, /onGoto\?\.\('team', \{ sub: 'rooms', filter: t\.name \}\)/, '团队卡片必须带团队名做筛选，且落到 rooms 子页签')
 })
 
 // ── N6 任务对话面板（需求2）：运行时真的请求 /tasks/conversation 并渲染对话 ──────

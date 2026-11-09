@@ -15,7 +15,7 @@
 import { readFileSync, readdirSync, statSync, existsSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { join, resolve, sep as pathSep } from 'node:path'
-import { registerRoute, listPresets, defaultPreset, getAgent, resumeSession, readSessionMessages } from './kernel.js'
+import { registerRoute, listPresets, defaultPreset, getAgent, resumeSession, readSessionMessages, attachToWorkspace } from './kernel.js'
 import { createLibrary } from './library.js'
 import { createDirBrowser } from './dirbrowse.js'
 import { getServices } from './registry.js'
@@ -790,6 +790,101 @@ async function ensureLive(ctx, sessionId) {
 }
 
 /**
+ * 执行者状态（「任务在跑吗、为什么没动」）。
+ *
+ * ## 三条事实分开说，别混成一句「进行中」
+ *   1. `live`：会话现在在不在宿主里活着（不在线 ⇒ 压根没法跑）
+ *   2. `lastWake`：最近一次唤醒的结果（sent 只是「交出去了」，不代表对方读了）
+ *   3. `deliveryError`：有没有投递失败留痕（这是**一等状态**，会一直显示到被解决）
+ *
+ * @param {object} ctx
+ * @param {object} services
+ * @param {object} task
+ * @returns {{ sessionId: string|null, live: boolean, lastWake: object|null, deliveryError: string|null }}
+ */
+function buildExecutorStatus(ctx, services, task) {
+  const sessionId = task?.ownerId ?? task?.assignee ?? null
+  if (!sessionId) return { sessionId: null, live: false, lastWake: null, deliveryError: null }
+  let live = false
+  try { live = Boolean(getAgent(ctx, sessionId)) } catch { live = false }
+
+  let lastWake = null
+  try {
+    const rows = readTaskWakes(services, task.id)
+    if (rows.length) {
+      const w = rows[rows.length - 1]
+      lastWake = {
+        at: w.at ?? null,
+        result: w.result ?? null,
+        detail: w.detail ?? null,
+        reason: w.reason ?? null,
+      }
+    }
+  } catch { lastWake = null }
+
+  const deliveryError = typeof task?.delivery?.error === 'string' && task.delivery.error
+    ? task.delivery.error
+    : null
+  return { sessionId, live, lastWake, deliveryError }
+}
+
+/**
+ * 确保「执行某个任务的 Bot」有一个团队（需求4，2026-11-09）。
+ *
+ * 用户原话：「任务创建完成应该自动建一个团队，可以只有一个人，后续我再增加」。
+ *
+ * ## 为什么是「每 Bot 一个团队」而不是「每任务一个团队」
+ *   任务会不断产生，团队是组织结构、不该跟着任务膨胀。一个 Bot 一个团队 =
+ *   它的固定协作单元，人后续往里加人即可；同一个 Bot 的多个任务共享这个团队。
+ *
+ * ## 幂等
+ *   已经有以该 Bot 为负责人的团队 → 直接返回那个（不重复建）。
+ *
+ * ## 失败不阻断
+ *   建团队失败**不影响任务本身**（任务已经建好了）。只回一个 `autoTeam.reason`，
+ *   让用户知道「团队没建上，但不影响干活」。
+ *
+ * @param {object} services
+ * @param {string} botSessionId 执行者会话 id
+ * @param {string} by 谁触发的（用于留痕）
+ * @returns {Promise<{ team?: object, created?: boolean, reason?: string } | undefined>}
+ */
+async function ensureTeamForBot(services, botSessionId, by) {
+  const teams = services.teams
+  if (!teams || typeof teams.create !== 'function' || typeof botSessionId !== 'string' || !botSessionId) {
+    return undefined
+  }
+  try {
+    const existing = teams.list({ type: 'big' }).find((t) => t.leadId === botSessionId && t.status === 'open')
+    if (existing) return { team: existing, created: false }
+
+    // 团队名用 Bot 的真名（roster 里查），查不到就用会话 id 缩写
+    let botName = ''
+    try {
+      const bots = services.roster?.list?.() ?? []
+      const hit = bots.find((b) => b.sessionId === botSessionId)
+      if (hit?.name) botName = hit.name
+    } catch { /* roster 不在就算了 */ }
+    const name = `${botName || `Bot ${String(botSessionId).slice(-8)}`} 的团队`
+
+    const team = teams.create({
+      name,
+      type: 'big',
+      leadId: botSessionId,
+      // 「可以只有一个人」：成员列表先空着，负责人就是唯一成员，人后续再加
+      memberIds: [],
+      purpose: '由任务派活自动创建；后续可在「团队」页加人或调整权限',
+      // 人建的团队默认「仅负责人可管理」，自动建的沿用同一安全默认
+      adminPolicy: 'lead-only',
+      by,
+    })
+    return { team, created: true }
+  } catch (error) {
+    return { reason: `自动建团队失败：${error?.message ?? error}` }
+  }
+}
+
+/** 
  * 投递能力预检（2026-11-09 修复「任务指派后卡在排队中、失败无声」）。
  *
  * ## 现场问题
@@ -1242,6 +1337,15 @@ export function installApi(ctx, { warn } = {}) {
           }),
         )
 
+        // ── 需求4：任务建好自动配一个团队（可以只有一个人，后续再加）────────
+        // 有负责人（assignee）才有意义：团队要有 lead，而 lead 就是执行这个活的人。
+        // 没指派时**不建**（建一个没有负责人的团队等于制造垃圾数据）。
+        // 失败不阻断：任务已经建好了，团队没建上只是少一份组织关系。
+        let autoTeam
+        if (rest.assignee && rest.autoTeam !== false) {
+          autoTeam = await ensureTeamForBot(services, rest.assignee, rest.byId ?? 'ui')
+        }
+
         // 阶段清单落在 task-meta.jsonl（与 evolve 同一份存储、同一形状）⇒
         // `buildTaskAnchorText` 自动带上，第一次唤醒就可见，不需要再转。
         if (wantsLongrun) {
@@ -1254,13 +1358,13 @@ export function installApi(ctx, { warn } = {}) {
             at: Date.now(),
           })
           sendJson(response, 200, {
-            ok: true, task, phases: normalizedPhases, longrun: true,
+            ok: true, task, phases: normalizedPhases, longrun: true, autoTeam,
             note: '已按长任务创建；此后每次唤醒都会带上阶段清单',
           })
           return
         }
 
-        sendJson(response, 200, { ok: true, task })
+        sendJson(response, 200, { ok: true, task, autoTeam })
         return
       }
 
@@ -1309,6 +1413,50 @@ export function installApi(ctx, { warn } = {}) {
       }
 
       // ── Bot 注册表 ────────────────────────────────────────────────────────
+      // ── 工作区补挂（2026-11-09：「主页面左侧栏还是看不到工作区和对话」）──────
+      //
+      // 新建的 Bot 会话现在会自动挂进「cwd 对应的工作区」（kernel.attachToWorkspace）。
+      // 但**存量 Bot**（本次修复之前建的）从来没挂过，于是永远躺在「未分组」里。
+      // 这个端点做一次性补挂：遍历 roster，把每个 Bot 的会话挂到它 cwd 的工作区。
+      //
+      // 为什么不在装配时自动跑：attachSession 会**写**宿主的工作区注册表，
+      // 插件装配期做写操作是不可接受的副作用（用户没要求、失败还难查）。
+      // 做成显式端点（页面「Bot 档案」有按钮，也可手动调）。
+      if (request.method === 'POST' && path === '/roster/attach-workspaces') {
+        const bots = await withService(services, 'roster', (r) => r.list({ includeRetired: false }))
+        const results = []
+        for (const bot of bots) {
+          if (typeof bot.cwd !== 'string' || bot.cwd.trim() === '') {
+            results.push({ name: bot.name, ok: false, reason: '没有工作目录' })
+            continue
+          }
+          try {
+            const attached = await attachToWorkspace(ctx, bot.cwd, bot.sessionId)
+            results.push({
+              name: bot.name,
+              cwd: bot.cwd,
+              sessionId: bot.sessionId,
+              ok: attached,
+              reason: attached ? null : '宿主未提供 workspaceRegistry（版本过旧）',
+            })
+          } catch (error) {
+            results.push({ name: bot.name, ok: false, reason: `挂载失败：${error?.message ?? error}` })
+          }
+        }
+        const okCount = results.filter((r) => r.ok).length
+        sendJson(response, 200, {
+          ok: true,
+          total: results.length,
+          attached: okCount,
+          failed: results.length - okCount,
+          results,
+          note: okCount > 0
+            ? `已把 ${okCount} 个 Bot 的会话挂进各自工作目录对应的工作区，刷新左侧栏即可看到`
+            : '没有需要补挂的（或宿主版本过旧不支持工作区）',
+        })
+        return
+      }
+
       if (request.method === 'GET' && path === '/roster') {
         const includeRetired = qp(url, 'includeRetired') === '1'
         const bots = await withService(services, 'roster', (r) => [
@@ -2219,6 +2367,11 @@ export function installApi(ctx, { warn } = {}) {
           stageInfo: deriveStage(task),
           stepConclusions,
           nextStep: lastNoteContent ? extractNextStep(lastNoteContent) : null,
+          // ── 执行者状态（2026-11-09：「任务显示正在执行中，但我看不到过程」）────
+          // 「投递成功」不等于「真的在跑」。这里把三件事一次说清：
+          //   会话在不在线 / 最近一次唤醒的结果 / 有没有投递失败
+          // 这样用户能区分「Bot 在干活」和「Bot 根本没动」。
+          executor: buildExecutorStatus(ctx, services, task),
           note: SUMMARY_NOTE,
         })
         return
