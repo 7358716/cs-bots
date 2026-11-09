@@ -9,7 +9,7 @@
 
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync, readFileSync, existsSync } from 'node:fs'
+import { mkdtempSync, rmSync, readFileSync, existsSync, appendFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -953,4 +953,28 @@ test('2026-11-09：WIP 报文里带人优先的依据（limit 与 baseLimit 区�
   assert.equal(err.details.baseLimit, 1)
   assert.equal(err.details.personBonus, false)
   assert.equal(err.details.current, 1)
+})
+
+test('2026-11-09 回归：事件流里已有更大 id 时，新建任务不得撞号（防数据覆盖）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cs-bots-idguard-'))
+  // 场景：事件流记录了 t-32 的 create（历史/外部写入），但内存 idCounter 只到 31。
+  // 若新建时分配 t-32，回放时 `ev.rev <= before.rev` 会把**新任务**当成重复投递跳过 →
+  // 任务凭空消失。hydrate 必须让 idCounter 至少到事件流里的最大 id。
+  const board = createBoard({}, { stateDir: dir })
+  const seed = await board.create({ subject: 'seed', byId: 'ui' })
+  assert.equal(seed.id, 't-1')
+  const board2 = createBoard({}, { stateDir: dir })
+  // 直接往事件流追加一条 t-99 的 create（模拟外部/历史写入）
+  appendFileSync(join(dir, 'board.jsonl'), JSON.stringify({
+    taskId: 't-99', rev: 1, action: 'create', byId: 'external', at: Date.now(),
+    before: null,
+    after: { id: 't-99', rev: 1, subject: 'external-write', description: '', status: 'pending',
+      blockedBy: [], writeScopes: [], labels: [], triaged: false, progress: 0,
+      createdAt: Date.now(), createdBy: 'external' },
+  }) + '\n')
+  // 全新实例回放后，新任务必须跳过 t-99
+  const board3 = createBoard({}, { stateDir: dir })
+  const next = await board3.create({ subject: 'after-external', byId: 'ui' })
+  assert.notEqual(next.id, 't-99', '不得复用事件流里已存在的 id')
+  assert.equal(next.id, 't-100', `应顺延为 t-100，实际 ${next.id}`)
 })
