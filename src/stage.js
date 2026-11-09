@@ -140,7 +140,17 @@ export function deriveStage(task) {
 
   // 5. 排队中：任务已激活但还没有人领（无 owner / 无租约）。
   if (!hasOwner(t)) {
-    return result(STAGES.WORKING_QUEUED, '尚未被认领，等待 Bot 接活')
+    // 2026-11-09 现场：「建了任务、也指派给了 Bot，页面却只显示『排队中』」。
+    // 指派（`assignee`）与持有（`ownerId` / 租约）是两件事：指派只是把活放到了
+    // 某人名下，真正开工由对方 claim 产生租约。但「有人管」和「没人管」对用户
+    // 是**完全不同的两件事**，不能都叫「排队中」——
+    //   有 assignee ⇒ 已经有人负责，在等对方接活（可重试唤醒 / 换人）
+    //   无 assignee ⇒ 真的没人管，需要先指派
+    const assignee = typeof t.assignee === 'string' && t.assignee.trim() !== '' ? t.assignee.trim() : ''
+    if (assignee) {
+      return result(STAGES.WORKING_QUEUED, `已指派给 ${shortId(assignee)}，等待对方接活`)
+    }
+    return result(STAGES.WORKING_QUEUED, '尚未指派，等待分配给某个 Bot')
   }
 
   // 6. 空闲：有人领、但最新报告是 waiting，说明这一轮干完了，等新触发。
@@ -160,6 +170,14 @@ function result(stage, reason) {
     needsPerson: group === 'person',
     reason,
   }
+}
+
+/** 会话 id 缩写（`bot-6b654c19-…` → `6b654c19`）—— 页面上一行长文案要短。 */
+function shortId(id) {
+  const raw = String(id)
+  const m = /^bot-([0-9a-f]{8})/.exec(raw)
+  if (m) return m[1]
+  return raw.length > 12 ? `${raw.slice(0, 12)}…` : raw
 }
 
 /** 是否有投递失败（`task.delivery` 存在且未被清除）。 */

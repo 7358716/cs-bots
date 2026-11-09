@@ -124,6 +124,11 @@ const PATCH_FIELDS = [
   // P0-B 新增可选字段
   'labels', 'milestone', 'cycle', 'estimate', 'assignee', 'reviewer',
   'startedAt', 'completedAt', 'archivedAt', 'triaged', 'progress',
+  // 投递失败留痕（2026-11-09）：`stage.js` 的 `hasDeliveryFailure()` 读的就是它。
+  // 在此之前**全项目没有任何代码写这个字段** —— 读的人存在、写的人不存在，
+  // 于是「唤醒失败」这类错误永远显形不了（任务静默卡在排队中，见 api.js
+  // `markDeliveryFailure` 的现场说明）。
+  'delivery',
 ]
 /** P0-B 新增可选字段（create/edit/set 三条入口共用同一套校验）。 */
 const NEW_FIELD_NAMES = [

@@ -326,3 +326,31 @@ test('needsPerson 只对 person/* 阶段为 true', () => {
     )
   }
 })
+
+// ── 2026-11-09 修复：已指派 vs 未指派（现场「建了任务却只显示排队中」）──────────
+test('排队中：已指派（assignee 存在但未 claim）时说明「等对方接活」', () => {
+  const s = deriveStage({ status: 'pending', assignee: 'bot-6b654c19-6ea0-4c95-a73d-0913ce9c25c5' })
+  assert.equal(s.stage, 'working/queued')
+  assert.match(s.reason, /已指派给/, '必须区分「已指派」与「没人管」')
+  assert.match(s.reason, /6b654c19/, '要显示是谁（缩写即可）')
+})
+
+test('排队中：未指派时说明「尚未指派」', () => {
+  const s = deriveStage({ status: 'pending' })
+  assert.equal(s.stage, 'working/queued')
+  assert.match(s.reason, /尚未指派/)
+})
+
+test('投递失败：task.delivery.error 存在 ⇒ person/delivery 且压过其它阶段', () => {
+  const base = { status: 'pending', assignee: 'bot-x' }
+  const failed = deriveStage({ ...base, delivery: { error: '会话没有模型路由', at: 1 } })
+  assert.equal(failed.stage, 'person/delivery')
+  assert.equal(failed.group, 'person')
+  assert.equal(failed.needsPerson, true)
+  assert.match(failed.reason, /模型路由/, '原因要透传到页面（人得知道去修什么）')
+})
+
+test('投递失败：delivery 存在但 error 为空 ⇒ 不算失败（视为已恢复）', () => {
+  const s = deriveStage({ status: 'pending', delivery: { error: '', at: 1 } })
+  assert.notEqual(s.stage, 'person/delivery')
+})

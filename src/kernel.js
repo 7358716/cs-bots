@@ -318,13 +318,101 @@ export async function createSession(ctx, options) {
   if (agentPreset) meta.agentPreset = agentPreset
   if (parentAgent) meta.parentSession = parentAgent.id
 
-  return agents.create({
+  // ── 模型选择（2026-11-09 修复「bot has no provider/model」）───────────────
+  // 官方 agent-loop 在每一步 preStep 都会 `this.model.current()`，
+  // 得到 undefined 就直接抛 `agent "X" has no provider/model`。
+  // 官方 Web UI 建会话时由 session-controller 记录一次 model selection；
+  // 我们走 agents.create 这条窄接口，**没有人替我们记录** ⇒ 必须自己带上。
+  // 取值优先级：调用方显式给 > 宿主的全局默认（agentDefaultModel.currentSelection()）。
+  const route = agentOptions ?? defaultModelSelection(ctx)
+
+  const handle = await agents.create({
     sessionId,
     ...(parentAgent ? { parentAgent } : {}),
     ...(Object.keys(meta).length ? { meta } : {}),
-    ...(agentOptions ? { agentOptions } : {}),
+    ...(route ? { agentOptions: route } : {}),
     ...(signal ? { signal } : {}),
   })
+
+  // ── 挂进工作区（2026-11-09 修复「左侧栏未分组」）─────────────────────────
+  // 官方把会话归组进 Workspace（`workspaceRegistry`），attachSession 的
+  // 前置条件是「会话 header 的 cwd 与 workspace.path 完全相同」。
+  // 我们建会话时正好指定了 cwd，所以这里补上「建/复用 workspace + attach」，
+  // 否则会话永远落在「未分组」里（2026-11-09 现场：bot-6b654c19… 就是）。
+
+  // 注意顺序：attach 必须在会话创建之后（attach 要读会话 header 的 cwd）。
+  if (cwd) {
+    try {
+      await attachToWorkspace(ctx, cwd, pickSessionId(handle, sessionId))
+    } catch {
+      /* 工作区挂载是「锦上添花」：失败不影响会话可用（只是仍显示未分组） */
+    }
+  }
+  return handle
+}
+
+/**
+ * 宿主全局默认模型（`agentDefaultModel.currentSelection()`）。
+ * 缺失/异常一律返回 undefined —— 不因拿不到默认模型就让建会话失败。
+ * @param {object} ctx
+ * @returns {{ provider: string, model: string, reasoningEffort?: string } | undefined}
+ */
+function defaultModelSelection(ctx) {
+  try {
+    const svc = service(ctx, 'agentDefaultModel')
+    if (!svc || typeof svc.currentSelection !== 'function') return undefined
+    const sel = svc.currentSelection()
+    if (!sel || typeof sel.provider !== 'string' || typeof sel.model !== 'string') return undefined
+    if (sel.provider === '' || sel.model === '') return undefined
+    return {
+      provider: sel.provider,
+      model: sel.model,
+      ...(sel.reasoningEffort === undefined ? {} : { reasoningEffort: sel.reasoningEffort }),
+    }
+  } catch {
+    return undefined
+  }
+}
+
+/** 从 AgentHandle 里取 session id（宿主可能返回 { agent } / { sessionId } / 字符串）。 */
+function pickSessionId(handle, fallback) {
+  if (typeof handle === 'string' && handle) return handle
+  const id = handle?.agent?.id ?? handle?.sessionId ?? handle?.id
+  return typeof id === 'string' && id ? id : fallback
+}
+
+/**
+ * 把会话挂到「路径 = 该会话 cwd」的工作区（不存在则先建）。
+ *
+ * 官方契约（`dsh-workspace/lib/index.js`）：
+ *   - `workspaceRegistry.create(path)` 建（同路径已存在时会复用，返回 created=false）
+ *   - `workspace.attachSession(sessionId)` 挂，前提是会话 cwd === workspace.path
+ *   - 两个方法都可能不存在（老宿主）⇒ 全程 try/catch，静默降级
+ *
+ * @param {object} ctx
+ * @param {string} cwd 已存在的绝对目录
+ * @param {string} sessionId
+ * @returns {Promise<boolean>} 是否挂上
+ */
+export async function attachToWorkspace(ctx, cwd, sessionId) {
+  const registry = service(ctx, 'workspaceRegistry')
+  if (!registry || typeof sessionId !== 'string' || !sessionId) return false
+  let workspace
+  try {
+    if (typeof registry.resolveByPath === 'function') {
+      workspace = await registry.resolveByPath(cwd)
+    }
+  } catch {
+    workspace = undefined
+  }
+  if (!workspace) {
+    if (typeof registry.create !== 'function') return false
+    const out = await registry.create(cwd) // 官方可能返回 { workspace, created } 或直接返回 workspace
+    workspace = out?.workspace ?? out
+  }
+  if (!workspace || typeof workspace.attachSession !== 'function') return false
+  await workspace.attachSession(sessionId)
+  return true
 }
 
 /**

@@ -754,6 +754,79 @@ async function ensureLive(ctx, sessionId) {
 }
 
 /**
+ * 投递能力预检（2026-11-09 修复「任务指派后卡在排队中、失败无声」）。
+ *
+ * ## 现场问题
+ *   任务建好并指派给 `bot-6b654c19…`，`wakes.jsonl` 记录 `result=sent`（我们把消息
+ *   交出去了），但 Bot 那一轮立刻失败：
+ *     `agent "bot-…" has no provider/model: set AgentOptions.provider and
+ *      AgentOptions.model or record a model selection`
+ *   失败发生在**宿主内部**，信封（wake）早已记为成功 ⇒ 任务停在 pending、
+ *   阶段判定没有 `delivery` 依据 ⇒ 页面显示「排队中」，人看不到任何错误。
+ *   **这是最坏的一类失败：静默失败。**
+ *
+ * ## 处置
+ *   唤醒**之前**先确认「这个会话真的能跑起来」——即它是否已有模型路由。
+ *   没有就**不发唤醒**，而是把原因写进 `task.delivery.error`：
+ *     - 阶段判定（`src/stage.js`）读到 delivery.error ⇒ 派 `person/delivery`
+ *     - 页面显示「输入投递失败：…」，人立刻知道要做什么（去给 Bot 补 model）
+ *
+ * @param {object} ctx
+ * @param {string} sessionId
+ * @returns {{ ok: boolean, reason?: string }}
+ */
+function assertDeliverable(ctx, sessionId) {
+  const agent = getAgent(ctx, sessionId)
+  // 会话不 live 不算硬失败 —— ensureLive() 会先复活它，复活失败时才报错。
+  if (!agent) return { ok: true }
+  try {
+    // 只有「真的带 model 访问器」的 agent 才能判定；测试替身/老宿主没有访问器时
+    // **一律放行** —— 预检的职责是拦住已知必败的投递，不是给所有投递加一道门。
+    if (typeof agent.model?.current !== 'function') return { ok: true }
+    const selection = agent.model.current()
+    if (selection && typeof selection.provider === 'string' && typeof selection.model === 'string') {
+      return { ok: true }
+    }
+    return {
+      ok: false,
+      reason: `会话 ${sessionId} 没有模型路由（provider/model 均为空）——`
+        + '请在「Bot 档案」给这个 Bot 选一个模型，或把它的会话模型补上再派活',
+    }
+  } catch (error) {
+    return { ok: false, reason: `读取会话模型失败：${error?.message ?? error}` }
+  }
+}
+
+/**
+ * 把投递失败落到任务上（`task.delivery.error`），让阶段机看得见。
+ * 失败**不吞**：写不进去时返回 false，调用方仍会把 reason 回给用户。
+ *
+ * @param {object} services
+ * @param {string} taskId
+ * @param {string} reason
+ * @param {string} by
+ * @returns {Promise<boolean>}
+ */
+async function markDeliveryFailure(services, taskId, reason, by) {
+  try {
+    const board = services.board
+    if (!board) return false
+    const current = board.get(taskId)
+    if (!current) return false
+    await board.update({
+      id: taskId,
+      expectedRev: current.rev,
+      action: 'set',
+      byId: by,
+      delivery: { error: String(reason), at: Date.now(), by },
+    })
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
  * 执行 Bot 的开工准备命令（改造07 · 借鉴 Super-agent 的 prepare command）。
  *
  * 安全边界（与 verify 的 kind:'command' 同口径）：
@@ -1859,12 +1932,28 @@ export function installApi(ctx, { warn } = {}) {
           // 契约 bots05 §2.3：投递前先确保会话 live（重启后宿主懒加载 → 否则必然
           // agent-not-live）。复活失败**不阻断**：仍照原样 notify，让 wake 如实报 reason。
           revive = await ensureLive(ctx, body.ownerId)
+          // 2026-11-09：投递能力预检 —— 没有模型路由的会话**唤醒了也必然失败**，
+          // 且失败发生在宿主内部、wake 仍记 sent ⇒ 任务静默卡在「排队中」。
+          // 这里改成「先判、不投、把原因写到任务上」，让它以 person/delivery 显形。
+          const deliverable = assertDeliverable(ctx, body.ownerId)
+          if (!deliverable.ok) {
+            const marked = await markDeliveryFailure(services, task.id, deliverable.reason, body.ownerId)
+            wake = { result: 'failed', reason: `undeliverable:${deliverable.reason}`, target: body.ownerId }
+            sendJson(response, 200, {
+              ok: true, task, wake, prepare, marked, ...reviveFields(revive),
+            })
+            return
+          }
           wake = services.dispatcher.notify({
             target: body.ownerId,
             reason: 'task-assigned',
             dedupKey: `task-assigned:${task.id}:${task.rev}`,
             text: `新任务 ${task.id}：${task.subject}\n${task.description ?? ''}`.trim(),
           })
+          // wake 层就失败了（agent-not-live / dispatcher 拒收）→ 同样落到任务上。
+          if (wake && wake.result === 'failed') {
+            await markDeliveryFailure(services, task.id, wake.reason ?? 'wake-failed', body.ownerId)
+          }
         }
         sendJson(response, 200, { ok: true, task, wake, prepare, ...reviveFields(revive) })
         return
@@ -2150,12 +2239,30 @@ export function installApi(ctx, { warn } = {}) {
         const dedupKey = typeof body.dedupKey === 'string' && body.dedupKey.trim()
           ? body.dedupKey.trim()
           : (force ? `task-wake:${task.id}:${Date.now()}` : `task-wake:${task.id}:${task.rev}`)
+        // 2026-11-09：同一道投递能力预检（手动重试也不该往死会话里投）。
+        const deliverable = assertDeliverable(ctx, task.ownerId)
+        if (!deliverable.ok) {
+          const marked = await markDeliveryFailure(services, task.id, deliverable.reason, task.ownerId)
+          sendJson(response, 200, {
+            ok: true,
+            taskId: task.id,
+            ownerId: task.ownerId,
+            live: revive.live,
+            revived: revive.revived,
+            marked,
+            wake: { result: 'failed', reason: `undeliverable:${deliverable.reason}`, target: task.ownerId },
+          })
+          return
+        }
         const wake = dispatcher.notify({
           target: task.ownerId,
           reason: 'task-assigned',
           dedupKey,
           text: buildTaskAnchorText(task, readTaskNotes(services, task.id), readLongrunMeta(services, task.id)),
         })
+        if (wake && wake.result === 'failed') {
+          await markDeliveryFailure(services, task.id, wake.reason ?? 'wake-failed', task.ownerId)
+        }
         sendJson(response, 200, {
           ok: true,
           taskId: task.id,
