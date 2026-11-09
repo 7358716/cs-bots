@@ -31,6 +31,15 @@ window.__ModuleLoader__.load({
     const PANEL_ID = 'cs-bots'
     const API = '/cs-bots/api'
 
+    // ── 人类身份的统一称谓（2026-11-09）────────────────────────────────────
+    // 页面上以前一会儿叫「你」、一会儿叫「用户」、一会儿叫「派活方」，
+    // 同一个人三种叫法，读起来像三个角色。统一成 **Boss**：
+    //   · HUMAN_LABEL      —— 作为「身份」出现时（谁建的、谁派的、消息发送者）
+    //   · HUMAN_SELF_LABEL —— 作为「对自己说话」时（对话里「你」发的那条）
+    // 两者都是同一个 Boss，只是语法位置不同；**不要**再引入第三个词。
+    const HUMAN_LABEL = 'Boss'
+    const HUMAN_SELF_LABEL = 'Boss（你）'
+
     // ── 宿主上下文（apply 时捕获；取代不可靠的全局猜测）────────────────────
     let hostCtx = null
     let hostUiWorkspace = null
@@ -484,7 +493,7 @@ window.__ModuleLoader__.load({
      */
     const ERROR_MAP = {
       BOARD_WIP_EXCEEDED: {
-        actionLabel: '查看我的任务',
+        actionLabel: `查看${HUMAN_LABEL}的任务`,
         text: '你已经在管 N 个任务了（上限 M），先完成或释放一些再接新的',
         hint: 'WIP 超限：同一 Bot 名下进行中的任务数达到上限',
       },
@@ -1053,9 +1062,9 @@ window.__ModuleLoader__.load({
             // ── 5W：谁建的 / 是什么 / 何时 / 在哪做 / 为什么 ──
             // 需求5：表述以「人」为主体——人建的任务就说「用户」，不暴露 Bot 会话 id
             h('span', { className: 'csb-k' }, '谁建的'),
-            h('span', { className: 'csb-v' }, task.source === 'human' ? '用户' : (task.createdBy ? botName(bots, task.createdBy) : '智能体')),
+            h('span', { className: 'csb-v' }, task.source === 'human' ? HUMAN_LABEL : (task.createdBy ? botName(bots, task.createdBy) : '智能体')),
             h('span', { className: 'csb-k' }, '来源'),
-            h('span', { className: 'csb-v' }, task.source === 'human' ? '用户自建' : '智能体分发'),
+            h('span', { className: 'csb-v' }, task.source === 'human' ? `${HUMAN_LABEL} 自建` : '智能体分发'),
             h('span', { className: 'csb-k' }, '优先级'), h('span', { className: 'csb-v' }, task.priority !== undefined ? `${task.priority}（${task.priority >= 8 ? '紧急' : '一般'}）` : '未设'),
             h('span', { className: 'csb-k' }, '截止'), h('span', { className: 'csb-v' }, task.dueAt ? fmt(task.dueAt) : '未设'),
             h('span', { className: 'csb-k' }, '状态'), h('span', { className: 'csb-v' }, h(Badge, { status: task.status })),
@@ -1961,7 +1970,7 @@ window.__ModuleLoader__.load({
       }
 
       const roleLabel = (m) => {
-        if (m.role === 'user') return '你/派活方'
+        if (m.role === 'user') return HUMAN_SELF_LABEL
         if (m.role === 'assistant') return bot?.name ?? '执行者'
         if (m.role === 'tool') return m.toolName ? `工具 · ${m.toolName}` : '工具'
         return m.role ?? '?'
@@ -2780,16 +2789,16 @@ window.__ModuleLoader__.load({
       return h('div', { className: 'csb-wrap' },
         h(Section, {
           // 需求1：按来源给不同标题与说明——人只看自己建的，AI 的任务走独立子页签
-          title: isAi ? '智能体任务' : '我的任务',
+          title: isAi ? '智能体任务' : `${HUMAN_LABEL}的任务`,
           desc: isAi
-            ? 'Bot 自行创建或分发的任务，按状态分类。这些是执行细节，平时不用盯；出问题（受阻/失败）时会出现在「我的任务」的待处理里。'
+            ? `Bot 自行创建或分发的任务，按状态分类。这些是执行细节，平时不用盯；出问题（受阻/失败）时会出现在「${HUMAN_LABEL}的任务」的待处理里。`
             : (attentionOnly
               ? '只看需要你管的（卡住 / 高优先 / 逾期 / 待验收）。智能体自己派发的任务在「智能体任务」子页签。'
               : '全部你建的任务。点下方回到「只看需要我管的」。'),
         }),
         isAi ? null : h('div', { className: 'csb-bar', style: { marginTop: 8 } },
           attentionOnly
-            ? h('button', { className: 'csb-btn csb-btn-s', onClick: () => setAttentionOnly(false) }, '看全部我的任务')
+            ? h('button', { className: 'csb-btn csb-btn-s', onClick: () => setAttentionOnly(false) }, `看全部${HUMAN_LABEL}的任务`)
             : h('button', { className: 'csb-btn csb-btn-s', onClick: () => setAttentionOnly(true) }, '只看需要我管的')),
         h('div', { className: 'csb-bar', style: { marginTop: 12 } },
           h('input', {
@@ -4439,7 +4448,7 @@ window.__ModuleLoader__.load({
                       ref: focused ? focusSeqRef : undefined,
                     },
                       h('div', { className: 'csb-msg-h' },
-                        h('span', { className: 'csb-msg-sender' }, botName(bots, m.from)),
+                        h('span', { className: 'csb-msg-sender' }, isMe ? HUMAN_LABEL : botName(bots, m.from)),
                         h('span', null, `#${m.seq}`),
                         m.bodyRef ? h('span', { className: 'csb-b' }, '长正文') : null,
                         m.bodyError ? h('span', { className: 'csb-b csb-b-err' }, '正文读取失败') : null,
@@ -4886,7 +4895,7 @@ window.__ModuleLoader__.load({
               h('span', {
                 className: 'csb-b csb-b-idle',
                 style: { marginLeft: 6 },
-                title: isAgent ? '智能体归纳周期（复盘可一次性提交）' : '人跟长任务周期（五步不可跳）',
+                title: isAgent ? '智能体归纳周期（复盘可一次性提交）' : `${HUMAN_LABEL} 的长任务周期（五步不可跳）`,
               }, isAgent ? '归纳' : '长任务'),
               ` · ${c.taskId} · ${(c.objective ?? '').slice(0, 40)}`),
             h('div', { className: 'csb-card-m' },
@@ -4936,7 +4945,7 @@ window.__ModuleLoader__.load({
         }),
 
         // ── 我的长任务周期（human）────────────────────────────────────────────
-        h('div', { className: 'csb-sec-t' }, '📋 我的任务周期'),
+        h('div', { className: 'csb-sec-t' }, `📋 ${HUMAN_LABEL} 的任务周期`),
         h('div', { className: 'csb-set-d' }, '为你的长任务开一个周期。目标原文是「防漂移锚」——复盘时拿它对照，看有没有走偏。'),
         h('div', { className: 'csb-bar', style: { marginTop: 8, flexWrap: 'wrap', gap: 6 } },
           h('input', { className: 'csb-in', style: { width: 120 }, placeholder: '任务 id（t-x）', value: taskId, onChange: (e) => setTaskId(e.target.value) }),
@@ -7157,7 +7166,7 @@ window.__ModuleLoader__.load({
       {
         id: 'workspace', label: '工作台',
         subs: [
-          { id: 'board', label: '我的任务', Comp: UserTasksTab },
+          { id: 'board', label: `${HUMAN_LABEL}的任务`, Comp: UserTasksTab },
           { id: 'ai-tasks', label: '智能体任务', Comp: AiTasksTab },
           { id: 'cycles', label: '复盘周期', Comp: CyclesTab },
           { id: 'todo', label: '我的待办', Comp: TodoTab },

@@ -20,7 +20,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 
-import { attachToWorkspace, createSession, resumeSession } from '../src/kernel.js'
+import { attachToWorkspace, createSession, resumeSession, buildMessage } from '../src/kernel.js'
 
 /** 假 ctx：只提供本测试需要的两个服务，其余缺失（验证降级路径）。 */
 function fakeCtx({ defaultSelection, registry } = {}) {
@@ -137,4 +137,23 @@ test('K10 复活会话：调用方显式给模型时优先', async () => {
   }
   await resumeSession(ctx, { resumeSessionId: 'bot-x', agentOptions: { provider: 'p1', model: 'm1' } })
   assert.deepEqual(calls[0].agentOptions, { provider: 'p1', model: 'm1' })
+})
+
+// ── 2026-11-09 现场：`format v4 message requires a producer-owned source kind` ──
+// 我们把 UserMessage.source 写成 { kind:'plugin', name:'cs-bots' }。
+// 'plugin' 是 v3 的「包装写法」，v4 新消息**明确拒收**（迁移层只允许在回放时改写）。
+// 后果：每次唤醒投递都被宿主在准入处拒收，而 followup() 已返回 ok ⇒ 任务静默卡住。
+
+test('M1 投递消息的 source.kind 不得是废弃的 plugin 包装', async () => {
+  const msg = buildMessage('唤醒文案')
+  assert.ok(msg.source, '必须带 source（否则会话日志无法追溯来源）')
+  assert.notEqual(msg.source.kind, 'plugin', 'v4 拒收 kind:plugin —— 这正是现场报错的直接原因')
+  assert.equal(typeof msg.source.kind, 'string')
+  assert.ok(msg.source.kind.length > 0)
+})
+
+test('M2 source.kind 与 v3→v4 迁移层的映射逐字对齐（plugin:<name>）', async () => {
+  const msg = buildMessage('x')
+  // 迁移层 producerKind()：非已发布同名生产者 → `plugin:${plugin}`
+  assert.equal(msg.source.kind, 'plugin:cs-bots', '新建消息形状要与历史回放后的形状一致')
 })

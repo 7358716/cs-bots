@@ -1193,7 +1193,9 @@ test('N7 周期页（需求4）：运行时分别请求 /cycles?kind=human 与 /
     assert.match(urls, /\/cycles\?kind=human/, '人的长任务周期必须单独拉取')
     assert.match(urls, /\/cycles\?kind=agent/, '智能体归纳周期必须单独拉取')
     const text = allText(h.records.renders.at(-1))
-    assert.match(text, /我的任务周期/, '第一区：人的长任务周期')
+  // 结论区标题 2026-11-09 统一人类称谓为 Boss（需求：「人类用户操作的都叫用户或 Boss」），
+  // 断言跟着改成「Boss 的任务周期」，不是放宽。
+    assert.match(text, /Boss 的任务周期/, '第一区：Boss 的长任务周期')
     assert.match(text, /智能体归纳周期/, '第二区：智能体归纳周期')
     assert.match(text, /把登录重构完/, '应渲染人的周期')
     assert.match(text, /本周归纳/, '应渲染智能体周期')

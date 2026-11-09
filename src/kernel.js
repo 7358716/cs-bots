@@ -209,10 +209,25 @@ export function listAgents(ctx) {
 // ── 投递（唤醒）─────────────────────────────────────────────────────────────
 
 /**
- * 消息来源标记 —— 官方 `UserMessage.source` 需要它。
- * 未经标识的消息在会话日志里无法追溯，故统一走这里。
+ * 消息来源标记 —— 官方 `UserMessage.source` 需要它。未经标识的消息在会话日志里
+ * 无法追溯，故统一走这里。
+ *
+ * ## ⚠️ 这里踩过一个坐实的坑（2026-11-09）
+ * 原来写的是 `{ kind: 'plugin', name: 'cs-bots' }`。看起来「很官方」，实际上
+ * **v4 格式明令拒收 `kind:'plugin'`**（`dsh-session-format-v3-to-v4/lib/index.js:126`）：
+ *
+ *     if (... source["kind"] === "plugin") throw new SessionFormatError(
+ *       "format v4 message requires a producer-owned source kind")
+ *
+ * 'plugin' 是 **v3 时代的「包装写法」**，只允许出现在**历史回放**里由迁移层
+ * 改写成 `plugin:<name>`；**新建消息**必须直接给「生产者自己的 kind」。
+ * 后果：cs-bots 每次唤醒投递都被宿主在准入处拒收，而 `followup()` 早已返回
+ * ok —— 于是任务静默卡在「进行中」，页面看不到任何异常。
+ *
+ * 取值与迁移层的映射**逐字对齐**（`producerKind()`：非已发布同名生产者 →
+ * `plugin:<name>`），这样新建的消息与历史回放后的形状完全一致。
  */
-const SOURCE = { kind: 'plugin', name: 'cs-bots' }
+const SOURCE = { kind: 'plugin:cs-bots' }
 
 /**
  * 构造一条可投递的用户消息。**不投递**，只构造（便于幂等键先记账再发送）。

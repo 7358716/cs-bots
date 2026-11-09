@@ -978,3 +978,47 @@ test('2026-11-09 回归：事件流里已有更大 id 时，新建任务不得�
   assert.notEqual(next.id, 't-99', '不得复用事件流里已存在的 id')
   assert.equal(next.id, 't-100', `应顺延为 t-100，实际 ${next.id}`)
 })
+
+test('2026-11-09 回归（根因）：被跳过的重复投递也要计入 id 水位', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cs-bots-idskip-'))
+  // 构造：t-1 正常，然后写入一条 t-50 的 create（应用），再写入一条 **rev 更小**
+  // 的同 id 事件（会被 `ev.rev <= before.rev` 判成重复投递跳过）。
+  // 旧实现只在「应用成功」分支抬高 idCounter，但这里第一条已应用，所以旧实现也能过；
+  // 真正暴露问题的是「**只有被跳过的事件里才出现过的大 id**」：
+  // 一条 t-77 的事件因为残缺（after.id 有、但 rev 重复）被跳过。
+  const board = createBoard({}, { stateDir: dir })
+  await board.create({ subject: 'seed', byId: 'ui' })
+  const f = join(dir, 'board.jsonl')
+  const good = (id, rev, subject) => JSON.stringify({
+    taskId: id, rev, action: 'create', byId: 'external', at: Date.now(), before: null,
+    after: { id, rev, subject, description: '', status: 'pending', blockedBy: [], writeScopes: [],
+      labels: [], triaged: false, progress: 0, createdAt: Date.now(), createdBy: 'external' },
+  }) + '\n'
+  // t-50 正常应用
+  appendFileSync(f, good('t-50', 1, 'applied'))
+  // t-50 的重复投递（rev 1 ≤ 1）→ 被跳过
+  appendFileSync(f, good('t-50', 1, 'duplicate'))
+  const board2 = createBoard({}, { stateDir: dir })
+  const next = await board2.create({ subject: 'after', byId: 'ui' })
+  assert.equal(next.id, 't-51', `应顺延为 t-51，实际 ${next.id}`)
+})
+
+test('2026-11-09 回归（兜底）：分配 id 时跳过任何已存在的任务 id', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cs-bots-idguard2-'))
+  const board = createBoard({}, { stateDir: dir })
+  await board.create({ subject: 'a', byId: 'ui' })
+  // 外部写入者把 idCounter 拉开：直接追加 t-5..t-9
+  const f = join(dir, 'board.jsonl')
+  for (let i = 5; i <= 9; i += 1) {
+    appendFileSync(f, JSON.stringify({
+      taskId: `t-${i}`, rev: 1, action: 'create', byId: 'external', at: Date.now(), before: null,
+      after: { id: `t-${i}`, rev: 1, subject: `ext-${i}`, description: '', status: 'pending',
+        blockedBy: [], writeScopes: [], labels: [], triaged: false, progress: 0,
+        createdAt: Date.now(), createdBy: 'external' },
+    }) + '\n')
+  }
+  const board2 = createBoard({}, { stateDir: dir })
+  // 回放后 idCounter 应为 9 ⇒ 新 id = t-10（不撞任何已有 id）
+  const next = await board2.create({ subject: 'next', byId: 'ui' })
+  assert.equal(next.id, 't-10', `应顺延为 t-10，实际 ${next.id}`)
+})

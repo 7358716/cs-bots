@@ -768,6 +768,23 @@ export function createBoard(ctx, config = {}) {
       return
     }
 
+    // ── id 水位：必须先于「是否应用」的判定（2026-11-09 修复 id 撞号根因）──────
+    // 原来的写法只在**应用成功**的分支里 `idCounter = max(idCounter, idNumber(taskId))`，
+    // 于是「被跳过的重复投递」里的任务 id 不会抬高计数器：
+    //   快照 idCounter=31、事件流最大 id=33 ⇒ 新任务仍分配 t-32 ⇒ **与既有 id 相撞**。
+    // 撞号的后果不是报错，而是更坏的静默覆盖：重启回放时那条 create 事件因
+    // `ev.rev <= before.rev` 被判成「重复投递」跳过 ⇒ 新任务凭空消失。
+    // 所以：**凡是出现在事件流里的 taskId，无论该事件是否被应用，都要计入水位。**
+    for (const ev of rows) {
+      if (!ev || typeof ev.taskId !== 'string') continue
+      const n = idNumber(ev.taskId)
+      if (Number.isFinite(n) && n > idCounter) idCounter = n
+      if (ev.after && typeof ev.after.id === 'string') {
+        const n2 = idNumber(ev.after.id)
+        if (Number.isFinite(n2) && n2 > idCounter) idCounter = n2
+      }
+    }
+
     // 事件流是真相源：只接受 rev 递增的事件（同 rev 重放幂等，容忍重复投递）
     let skipped = 0
     for (const ev of rows) {
@@ -1050,7 +1067,14 @@ export function createBoard(ctx, config = {}) {
     }
 
     const at = normalizeNow(now, 'create')
-    const nextCounter = idCounter + 1
+    // ── id 分配的兜底（2026-11-09）────────────────────────────────────────────
+    // 主口径是 `idCounter + 1`，但内存计数器与事件流可能被**外部写入者**拉开距离
+    // （例如脚本/另一个进程直接往 board.jsonl 追加）。此时分配到的 id 会在重启回放时
+    // 被 `ev.rev <= before.rev` 判成「重复投递」而跳过 ⇒ 任务凭空消失（静默覆盖）。
+    // 这里加一道极便宜的兜底：**跳过任何已存在于当前任务表的 id**。
+    // 它不解决「多写者」这个根问题（那需要文件锁），但保证不会撞到**已知**的 id。
+    let nextCounter = idCounter + 1
+    while (tasks.has(`t-${nextCounter}`)) nextCounter += 1
     const taskId = `t-${nextCounter}`
     assertDependencyGraph(taskId, deps)
 
