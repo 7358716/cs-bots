@@ -162,3 +162,89 @@ test('TEAM_TYPES / TEAM_ROLES 冻结', () => {
   assert.deepEqual([...TEAM_TYPES], ['big', 'small'])
   assert.deepEqual([...TEAM_ROLES], ['lead', 'member'])
 })
+
+// ── 团队管理员权限边界（2026-11-09「管理员权限边界从页面控制」）──────────────
+// 背景：`src/teams.js` 在 8e613e1 就引入了 adminPolicy，但**零测试覆盖**。
+// 权限是安全边界，没测试等于没实现 —— 这里把 10 条行为锁成不变量。
+
+test('adminPolicy：缺省为 open（升级不改变既有行为）', async (_t) => {
+  const { svc } = setup(_t)
+  const s = svc
+  const t = s.create({ name: 'T', type: 'big', by: 'ui', leadId: 'bot-lead', memberIds: ['bot-a'] })
+  assert.equal(t.adminPolicy, 'open', '缺省必须是 open，否则所有既有调用方都会被拒')
+})
+
+test('adminPolicy：非法值直接拒绝，绝不静默降级', async (_t) => {
+  const { svc } = setup(_t)
+  const s = svc
+  assert.throws(
+    () => s.create({ name: 'T', type: 'big', by: 'ui', leadId: 'x', adminPolicy: 'bogus' }),
+    (e) => e.code === 'TEAM_BAD_POLICY',
+  )
+})
+
+test('adminPolicy=lead-only：非负责人调 removeMember 被拒（TEAM_FORBIDDEN）', async (_t) => {
+  const { svc } = setup(_t)
+  const s = svc
+  const t = s.create({ name: 'T', type: 'big', by: 'ui', leadId: 'bot-lead', memberIds: ['bot-a', 'bot-b'], adminPolicy: 'lead-only' })
+  assert.throws(
+    () => s.removeMember({ id: t.id, memberId: 'bot-b', expectedRev: t.rev, by: 'bot-a' }),
+    (e) => e.code === 'TEAM_FORBIDDEN',
+  )
+})
+
+test('adminPolicy=lead-only：负责人自己可以管理', async (_t) => {
+  const { svc } = setup(_t)
+  const s = svc
+  const t = s.create({ name: 'T', type: 'big', by: 'ui', leadId: 'bot-lead', memberIds: ['bot-a', 'bot-b'], adminPolicy: 'lead-only' })
+  const out = s.removeMember({ id: t.id, memberId: 'bot-b', expectedRev: t.rev, by: 'bot-lead' })
+  assert.ok(!out.members.includes('bot-b'))
+})
+
+test('adminPolicy：人（ui）永远是超级管理员，不受任何策略限制', async (_t) => {
+  const { svc } = setup(_t)
+  const s = svc
+  const t = s.create({ name: 'T', type: 'big', by: 'ui', leadId: 'bot-lead', memberIds: ['bot-a'], adminPolicy: 'lead-only' })
+  const out = s.addMember({ id: t.id, memberId: 'bot-c', expectedRev: t.rev, by: 'ui' })
+  assert.ok(out.members.includes('bot-c'), '人必须能操作 lead-only 团队')
+})
+
+test('adminPolicy=any-member：成员可管理，非成员被拒', async (_t) => {
+  const { svc } = setup(_t)
+  const s = svc
+  const t = s.create({ name: 'T', type: 'big', by: 'ui', leadId: 'bot-lead', memberIds: ['bot-a'], adminPolicy: 'any-member' })
+  const afterAdd = s.addMember({ id: t.id, memberId: 'bot-d', expectedRev: t.rev, by: 'bot-a' })
+  assert.ok(afterAdd.members.includes('bot-d'), '成员应能加成员')
+  assert.throws(
+    () => s.addMember({ id: t.id, memberId: 'bot-e', expectedRev: afterAdd.rev, by: 'bot-outsider' }),
+    (e) => e.code === 'TEAM_FORBIDDEN',
+  )
+})
+
+test('不变量：负责人永不可被移出（与 adminPolicy 无关，人是超级管理员也不行）', async (_t) => {
+  const { svc } = setup(_t)
+  const s = svc
+  for (const policy of ['open', 'lead-only', 'any-member']) {
+    const t = s.create({ name: `T-${policy}`, type: 'big', by: 'ui', leadId: 'bot-lead', memberIds: ['bot-a'], adminPolicy: policy })
+    assert.throws(
+      () => s.removeMember({ id: t.id, memberId: 'bot-lead', expectedRev: t.rev, by: 'ui' }),
+      (e) => e.code === 'TEAM_LEAD_IMMUTABLE',
+      `策略 ${policy} 下负责人竟可被移除`,
+    )
+  }
+})
+
+test('setPolicy：改策略本身留痕，且策略立即生效', async (_t) => {
+  const { svc: _svc, dir: _t_dir } = setup(_t)
+  const s = _svc
+  const t = s.create({ name: 'T', type: 'big', by: 'ui', leadId: 'bot-lead', memberIds: ['bot-a', 'bot-b'], adminPolicy: 'open' })
+  const out = s.setPolicy({ id: t.id, expectedRev: t.rev, adminPolicy: 'lead-only', by: 'ui' })
+  assert.equal(out.adminPolicy, 'lead-only')
+  // 改完立刻生效：非负责人不能再操作
+  assert.throws(
+    () => s.removeMember({ id: t.id, memberId: 'bot-b', expectedRev: out.rev, by: 'bot-a' }),
+    (e) => e.code === 'TEAM_FORBIDDEN',
+  )
+  // 且事件流里有 setPolicy 事件（留痕是审计底线）
+  assert.ok(readEvents(_t_dir).some((e) => e.action === 'setPolicy'), '策略变更必须留痕')
+})
