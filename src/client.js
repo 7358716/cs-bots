@@ -1430,15 +1430,26 @@ window.__ModuleLoader__.load({
       }
 
       const label = `${prefix ?? ''}${wakeLabel(shown)}${autoRevived ? '（已自动启动该 Bot 会话）' : ''}`
+      // ── 按钮可见性（2026-11-09 修复：「我没有看到重试唤醒的按钮」）──────────
+      // 原实现只在 `reason.startsWith('agent-not-live')` 时渲染按钮 —— 于是只有
+      // 「会话不在线」这一类失败能看到按钮，而**投递被拒收 / 水位没动 / 看护判未消费**
+      // 这些同样需要重试的失败，人只能干看着一条红字。用户明确反馈过这一点。
+      // 现在的口径：
+      //   · 只要这次唤醒「没成功」（bad）⇒ **一定给「重试唤醒」**
+      //   · 只有确实是会话不在线（notLive）时才额外给「启动该 Bot 会话」
+      //     （不是离线导致的失败，给「启动会话」是误导）
+      const canRetry = bad
       return h('div', { className: 'csb-wake' },
         h(Notice, { kind: bad ? 'err' : 'ok' }, label),
-        notLive
+        canRetry
           ? h('div', { className: 'csb-bar', style: { marginTop: 6 } },
-              h('button', {
-                className: 'csb-btn csb-btn-s',
-                disabled: busy === 'revive',
-                onClick: doRevive,
-              }, busy === 'revive' ? '启动中…' : '启动该 Bot 会话'),
+              notLive
+                ? h('button', {
+                    className: 'csb-btn csb-btn-s',
+                    disabled: busy === 'revive',
+                    onClick: doRevive,
+                  }, busy === 'revive' ? '启动中…' : '启动该 Bot 会话')
+                : null,
               h('button', {
                 className: 'csb-btn csb-btn-s csb-btn-p',
                 disabled: busy === 'retry',
@@ -1665,6 +1676,38 @@ window.__ModuleLoader__.load({
         else setErr('当前页面不支持跨页签跳转，请手动打开房间列表')
       }
 
+      /**
+       * 手动重试唤醒（2026-11-09，用户原话：「我没有看到重试唤醒的按钮」）。
+       *
+       * `POST /tasks/wake {id}`：后端会先 ensureLive、再预检投递能力、最后 notify，
+       * 成功后还会**清掉上一次的 delivery.error**（见 api.js `clearDeliveryFailure`）。
+       * 所以这个按钮不只是「再发一次」——它同时修复了任务的阶段：
+       * 之前被失败留痕劫持成「输入投递失败」，点它之后会回到正常阶段。
+       *
+       * 结果复用 `wake` 状态 + `WakeNotice` 渲染，与其它唤醒路径口径一致；
+       * 额外触发 summaryQ.reload，让「执行者」区块立刻反映新的投递状态。
+       */
+      const retryWake = async () => {
+        if (busy) return null
+        setBusy('retry-wake')
+        setErr(null)
+        setWake(null)
+        setRevived(false)
+        try {
+          const d = await call('/tasks/wake', { method: 'POST', body: { id: taskId } })
+          setWake(d?.wake ?? null)
+          setRevived(d?.revived === true)
+          summaryQ.reload()
+          onChange?.()
+          return d
+        } catch (e) {
+          setErr(`重试唤醒失败：${e.message}`)
+          return null
+        } finally {
+          setBusy(null)
+        }
+      }
+
       /** 追加补充说明：成功后清空、刷新历史、显示唤醒结果。 */
       const sendNote = async () => {
         const text = noteText.trim()
@@ -1884,8 +1927,17 @@ window.__ModuleLoader__.load({
                     ex.live ? '会话在线' : '会话离线（唤醒会先复活）'),
                   h('span', { className: 'csb-set-d', style: { marginLeft: 8 } }, `最近唤醒：${wakeText}`))))
               if (ex.deliveryError) {
-                progressItems.push(h('div', { key: 'execerr', className: 'csb-err', style: { marginTop: 6 } },
-                  `输入投递失败：${ex.deliveryError}`))
+                // 2026-11-09：失败不能只是一条红字 —— 人需要「一键重来」。
+                // 用户原话：「我没有看到重试唤醒的按钮」。这里给的是同一个动作
+                // （POST /tasks/wake），成功后后端会清掉这条失败留痕。
+                progressItems.push(h('div', { key: 'execerr', style: { marginTop: 6 } },
+                  h('div', { className: 'csb-err' }, `输入投递失败：${ex.deliveryError}`),
+                  h('div', { className: 'csb-bar', style: { marginTop: 6 } },
+                    h('button', {
+                      className: 'csb-btn csb-btn-s csb-btn-p',
+                      disabled: busy === 'retry-wake',
+                      onClick: retryWake,
+                    }, busy === 'retry-wake' ? '重试中…' : '重试唤醒'))))
               }
             }
             if (currentProgress) {

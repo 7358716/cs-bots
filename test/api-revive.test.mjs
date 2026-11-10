@@ -385,3 +385,103 @@ test('R16 /tasks/wake：复活失败仍投递，并回传 reviveReason', async (
   assert.equal(calls.length, 1)
   assert.equal(r.json.wake.result, 'failed')
 })
+// ── 2026-11-09：投递失败留痕（delivery）的两个真缺陷 ─────────────────────────
+//
+// 用户反馈「没有看到重试唤醒的按钮」。追下去发现这背后是一串：
+//   ① `stage.js:hasDeliveryFailure()` 只看 `delivery.error` 是否存在，而
+//      **全项目只有写入、没有人清除** ⇒ 一次投递失败之后，即使重试成功、
+//      Bot 把活干完，任务也**永远**停在「输入投递失败」—— 阶段机被一条过期
+//      事实永久劫持，人看到的是假红字。这是「按钮点了像没反应」的直接原因。
+//   ② `markDeliveryFailure` / 看护用的是**整体覆盖**写 `delivery`，
+//      会抹掉该字段上已有的其它键（api.js 的 `clearedAt`/`clearedBy`）。
+//
+// 这四条用例钉住：失败能写入、成功能清除、合并写入不丢键、阶段机随之恢复。
+
+test('R17 /tasks/wake：重试投递成功后必须清掉 delivery.error（否则任务永久假红）', async (t) => {
+  const h = boot()
+  t.after(() => h.cleanup())
+  h.stubDispatcher({ ok: true, result: 'sent' })
+  const bot = await h.makeBot('rev-deliver1')
+  const task = h.createTask({ subject: '重试成功' })
+  h.claimTask(task, bot.sessionId)
+
+  // 先制造一次投递失败留痕（模拟此前唤醒失败过）。
+  // 注意 CAS：claim 已把 rev 抬到 2，必须读最新 rev 再写，否则 BoardError。
+  const claimed = h.services.board.get(task.id)
+  await h.services.board.update({
+    id: task.id,
+    expectedRev: claimed.rev,
+    action: 'set',
+    byId: bot.sessionId,
+    delivery: { error: 'undeliverable:agent-not-live', at: 1000, by: bot.sessionId },
+  })
+  const stagedBefore = await import('../src/stage.js')
+  assert.equal(stagedBefore.deriveStage(h.services.board.get(task.id)).stage, 'person/delivery', '写失败后阶段应显形')
+
+  const r = await h.req('POST', '/tasks/wake', { id: task.id })
+  assert.equal(r.status, 200)
+  assert.equal(r.json.wake.result, 'sent')
+
+  const after = h.services.board.get(task.id)
+  assert.equal(after.delivery?.error, undefined, '重试成功后必须清除失败留痕，否则任务永远停在 person/delivery')
+  assert.notEqual(stagedBefore.deriveStage(after).stage, 'person/delivery', '清除后阶段机应恢复')
+})
+
+test('R18 /tasks/wake：投递失败时写入 delivery.error（让人看得见）', async (t) => {
+  const h = boot()
+  t.after(() => h.cleanup())
+  h.stubDispatcher({ ok: false, result: 'failed', reason: 'agent-not-live' })
+  const bot = await h.makeBot('rev-deliver2')
+  const task = h.createTask({ subject: '唤醒失败' })
+  h.claimTask(task, bot.sessionId)
+
+  const r = await h.req('POST', '/tasks/wake', { id: task.id })
+  assert.equal(r.status, 200)
+  assert.equal(r.json.wake.result, 'failed')
+  const after = h.services.board.get(task.id)
+  assert.match(String(after.delivery?.error), /agent-not-live/, '失败原因必须落到任务上，否则页面只看到一条红字、任务永远停在排队中')
+})
+
+test('R19 /tasks/wake：delivery 是合并写入，不抹掉已有键', async (t) => {
+  const h = boot()
+  t.after(() => h.cleanup())
+  h.stubDispatcher({ ok: false, result: 'failed', reason: 'agent-not-live' })
+  const bot = await h.makeBot('rev-deliver3')
+  const task = h.createTask({ subject: '合并写入' })
+  h.claimTask(task, bot.sessionId)
+
+  // 先留一条「自定义键」（模拟将来会在 delivery 上扩展 attempt/统计等）
+  const claimedRev = h.services.board.get(task.id).rev
+  const seeded = h.services.board.update({
+    id: task.id,
+    expectedRev: claimedRev,
+    action: 'set',
+    byId: bot.sessionId,
+    delivery: { attempt: 3, error: 'old', at: 1, by: bot.sessionId },
+  })
+  assert.equal(seeded.delivery?.attempt, 3)
+
+  await h.req('POST', '/tasks/wake', { id: task.id })
+  const after = h.services.board.get(task.id)
+  assert.equal(after.delivery?.attempt, 3, '整体覆盖会抹掉 delivery 上已有的键 —— 必须合并写入')
+  assert.match(String(after.delivery?.error), /agent-not-live/, '同时新失败要写进去')
+})
+
+test('R20 /tasks/assign：投递失败写 delivery，重试成功后阶段机恢复', async (t) => {
+  const h = boot()
+  t.after(() => h.cleanup())
+  h.stubDispatcher({ ok: false, result: 'failed', reason: 'agent-not-live' })
+  const bot = await h.makeBot('rev-deliver4')
+  const task = h.createTask({ subject: 'assign 失败留痕' })
+
+  const failed = await h.req('POST', '/tasks/assign', { id: task.id, ownerId: bot.sessionId, expectedRev: task.rev })
+  assert.equal(failed.status, 200, `assign 应成功，实际：${JSON.stringify(failed.json)}`)
+  assert.equal(failed.json.wake.result, 'failed')
+  assert.match(String(h.services.board.get(task.id).delivery?.error), /agent-not-live/)
+
+  // 修好会话后重派：这次成功 ⇒ 留痕必须清掉
+  h.stubDispatcher({ ok: true, result: 'sent' })
+  const retry = await h.req('POST', '/tasks/assign', { id: task.id, ownerId: bot.sessionId, expectedRev: h.services.board.get(task.id).rev })
+  assert.equal(retry.json.wake.result, 'sent')
+  assert.equal(h.services.board.get(task.id).delivery?.error, undefined, '重派成功后不得残留失败留痕')
+})

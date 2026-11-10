@@ -331,12 +331,16 @@ function applyInner(ctx, config, { log, warn }) {
         const current = board.get(taskId)
         if (!current || current.status === 'deleted' || current.status === 'completed') return false
         try {
+          // ⚠️ **合并写入**（2026-11-09）：`board.set` 对 `delivery` 是整体替换，
+          // 直接写 `{ error, at, by }` 会抹掉这个字段上已有的其它键
+          // （比如 api.js 记下的 `clearedAt`/`clearedBy`）。先读再展开。
+          const prev = (current.delivery && typeof current.delivery === 'object') ? current.delivery : {}
           await board.update({
             id: taskId,
             expectedRev: current.rev,
             action: 'set',
             byId: 'cs-bots.watchdog',
-            delivery: { error: reason, at: Date.now(), by: 'cs-bots.watchdog' },
+            delivery: { ...prev, error: reason, at: Date.now(), by: 'cs-bots.watchdog' },
           })
           return true
         } catch {

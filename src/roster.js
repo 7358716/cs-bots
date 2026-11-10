@@ -724,6 +724,7 @@ export function createRoster(ctx, config = {}) {
       handle = await kernel.createSession(ctx, {
         sessionId: id,
         cwd: dir,
+        warn,
         ...(preset !== undefined && preset !== null && preset !== '' ? { agentPreset: String(preset) } : {}),
       })
     } catch (error) {

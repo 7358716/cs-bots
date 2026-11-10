@@ -219,13 +219,26 @@ test('R3 agent-not-live 唤醒失败：WakeNotice 首渲染不抛，两个按钮
   assert.equal(findButtons(tree, '重试唤醒').length, 1)
 })
 
-test('R3b 非 agent-not-live 失败不显示操作按钮；成功且 revived 时提示已自动启动', () => {
+test('R3b 任何唤醒失败都要给「重试唤醒」；成功且 revived 时提示已自动启动', () => {
   const { exports } = loadClient()
 
+  // 2026-11-09 修复：此前按钮只在 `reason.startsWith('agent-not-live')` 时渲染，
+  // 于是**投递被拒收 / 水位没动 / 看护判未消费**这些同样需要重试的失败，
+  // 人只能干看一条红字 —— 用户原话「我没有看到重试唤醒的按钮」。
   const other = exports.WakeNotice({ wake: { ok: false, result: 'failed', reason: 'backpressure' }, taskId: 't-1' })
-  assert.equal(findButtons(other, '启动该 Bot 会话').length, 0, '其他失败原因不该出现启动按钮')
+  assert.equal(findButtons(other, '启动该 Bot 会话').length, 0, '非「会话离线」类失败不该出现启动按钮（误导）')
+  assert.equal(findButtons(other, '重试唤醒').length, 1, '投递/唤醒失败必须能重试 —— 这是用户点名要的按钮')
   assert.match(allText(other), /backpressure/)
 
+  // 投递能力预检失败（`undeliverable:`）同样要能重试
+  const undeliverable = exports.WakeNotice({
+    wake: { ok: false, result: 'failed', reason: 'undeliverable:会话没有模型路由' },
+    taskId: 't-2',
+  })
+  assert.equal(findButtons(undeliverable, '重试唤醒').length, 1, '投递被拒收同样要能重试')
+  assert.equal(findButtons(undeliverable, '启动该 Bot 会话').length, 0)
+
+  // 成功时不需要重试按钮
   const revived = exports.WakeNotice({ wake: { ok: true, result: 'sent' }, revived: true })
   assert.match(allText(revived), /已自动启动该 Bot 会话/)
   assert.equal(findButtons(revived, '重试唤醒').length, 0, '成功时不需要重试按钮')
@@ -377,4 +390,25 @@ test('R11 新增代码没有引入相对 require', () => {
   const matches = [...SOURCE.matchAll(/require\(\s*['"]([^'"]+)['"]\s*\)/g)].map((m) => m[1])
   const relative = matches.filter((s) => s.startsWith('.') || s.startsWith('/'))
   assert.deepEqual(relative, [], `不得 require 相对路径，实际=${relative}`)
+})
+
+// ── 2026-11-09：任务详情「执行者」区块也要能重试 ──────────────────────────
+// 用户看到执行者区块「输入投递失败：…」只有一条红字，没有按钮 —— 那是和
+// WakeNotice 同源的缺陷，只是藏在任务详情里没被发现。这里用源码级断言钉住：
+//   · 有 deliveryError 时渲染「重试唤醒」按钮
+//   · 按钮打的是 POST /tasks/wake（同一个动作，重试成功会清掉失败留痕）
+test('R3c 任务详情「输入投递失败」区块带「重试唤醒」按钮，且走 POST /tasks/wake', () => {
+  const idx = SOURCE.indexOf("输入投递失败：${ex.deliveryError}")
+  assert.ok(idx > 0, '执行者区块应有「输入投递失败」提示')
+  // 按钮本身（区块内）
+  const btnRegion = SOURCE.slice(idx, idx + 900)
+  assert.match(btnRegion, /重试唤醒/, '投递失败处必须给「重试唤醒」按钮')
+  assert.match(btnRegion, /onClick: retryWake/, '按钮应复用 retryWake（不重复实现一套动作）')
+
+  // retryWake 的行为（定义在该区块上方，单独取它的函数体）
+  const defIdx = SOURCE.indexOf('const retryWake = async () => {')
+  assert.ok(defIdx > 0, '应有 retryWake 处理器')
+  const defRegion = SOURCE.slice(defIdx, defIdx + 900)
+  assert.match(defRegion, /\/tasks\/wake/, '必须走 /tasks/wake（重试成功会清掉 delivery.error）')
+  assert.match(defRegion, /summaryQ\.reload\(/, '重试后要刷新任务摘要，否则执行者状态不更新')
 })

@@ -27,11 +27,14 @@ import { createRequire } from 'node:module'
 import { existsSync } from 'node:fs'
 
 const HOST_LLM = '@deepseek-ai/dsh-llm'
+const HOST_AGENT = '@deepseek-ai/dsh-agent'
 
 /** @type {Function | null} */
 let _createUserMessage = null
 /** @type {Error | null} */
 let _loadError = null
+/** 宿主模块缓存：`spec → module | Error`（同一个 spec 只解析一次，失败也缓存）。 */
+const _hostModules = new Map()
 
 /**
  * 探测 dsh 安装锚点（按可靠性排序）。
@@ -60,6 +63,50 @@ function dshAnchors() {
 }
 
 /**
+ * 惰性加载一个宿主包（**通用版**）。
+ *
+ * 为什么不用静态 import：官方包只存在于 dsh 安装目录（本机
+ * `/home/ubuntu/.npm-global/lib/node_modules/@deepseek-ai/dsh/node_modules/`），
+ * 而 plugin 的 profile `node_modules/@deepseek-ai/` 只有 cosmokit 与 schemastery
+ * ——**解析不到**任何 dsh 子包（2026-11-09 实测）。所以必须从锚点 `createRequire`。
+ *
+ * 结果按 spec 缓存：同一个 spec 只解析一次，**失败也缓存**（避免反复重试空转）。
+ *
+ * @param {string} spec 包名（如 `@deepseek-ai/dsh-agent`）
+ * @returns {unknown} 模块导出
+ * @throws {Error} 所有锚点都失败时（带排查提示，不静默）
+ */
+export function loadHostModule(spec) {
+  const cached = _hostModules.get(spec)
+  if (cached instanceof Error) throw cached
+  if (cached !== undefined) return cached
+
+  const tried = []
+  for (const anchor of dshAnchors()) {
+    try {
+      // 文件锚点需先存在，createRequire 才不会因怪路径抛错
+      if (anchor.startsWith('/') && !existsSync(anchor)) continue
+      const req = createRequire(anchor)
+      const mod = req(spec)
+      if (mod !== undefined) {
+        _hostModules.set(spec, mod)
+        return mod
+      }
+      tried.push(`${anchor}: 已解析但模块为空`)
+    } catch (error) {
+      tried.push(`${anchor}: ${error?.code ?? error?.message ?? error}`)
+    }
+  }
+  const err = new Error(
+    `cs-bots kernel: 无法解析宿主包 ${spec}。\n` +
+      `  已知锚点尝试：\n    ${tried.join('\n    ')}\n` +
+      `  对策：设 CS_BOTS_DSH_ROOT=<dsh 安装目录>，或用 \`dsh --profile <p>\` 启动（宿主会暴露解析锚）。`,
+  )
+  _hostModules.set(spec, err)
+  throw err
+}
+
+/**
  * 惰性加载宿主的 `createUserMessage`。
  * @returns {Function}
  * @throws {Error} 所有锚点都失败时（**带排查提示**，不静默）
@@ -68,28 +115,17 @@ function loadCreateUserMessage() {
   if (_createUserMessage) return _createUserMessage
   if (_loadError) throw _loadError
 
-  const tried = []
-  for (const anchor of dshAnchors()) {
-    try {
-      // 文件锚点需先存在，createRequire 才不会因怪路径抛错
-      if (anchor.startsWith('/') && !existsSync(anchor)) continue
-      const req = createRequire(anchor)
-      const mod = req(HOST_LLM)
-      const fn = mod?.createUserMessage
-      if (typeof fn === 'function') {
-        _createUserMessage = fn
-        return fn
-      }
-      tried.push(`${anchor}: 已解析但无 createUserMessage 导出`)
-    } catch (error) {
-      tried.push(`${anchor}: ${error?.code ?? error?.message ?? error}`)
+  try {
+    const mod = /** @type {any} */ (loadHostModule(HOST_LLM))
+    const fn = mod?.createUserMessage
+    if (typeof fn === 'function') {
+      _createUserMessage = fn
+      return fn
     }
+  } catch (error) {
+    _loadError = /** @type {Error} */ (error)
   }
-  _loadError = new Error(
-    `cs-bots kernel: 无法解析宿主包 ${HOST_LLM}。\n` +
-      `  已知锚点尝试：\n    ${tried.join('\n    ')}\n` +
-      `  对策：设 CS_BOTS_DSH_ROOT=<dsh 安装目录>，或用 \`dsh --profile <p>\` 启动（宿主会暴露解析锚）。`,
-  )
+  _loadError = _loadError ?? new Error(`cs-bots kernel: 已解析 ${HOST_LLM} 但没有 createUserMessage 导出`)
   throw _loadError
 }
 
@@ -305,6 +341,116 @@ export function steer(ctx, sessionId, text) {
 // ── 会话创建（**唯一能指定 cwd 的路径**）──────────────────────────────────────
 
 /**
+ * 组装「Agent 级 setup 回调」—— 把 preset 的工具面挂上去。
+ *
+ * ## 为什么必须自己拼（2026-11-09 复核，源码级证据链）
+ *
+ * 官方 `agents.create(options)` 只透传 `AgentOptions`，而
+ * `AgentOptions`（`dsh-agent/lib/types/runtime-types.d.ts:27-36`）**没有
+ * tools/preset 字段**；preset 挂载完全发生在 `setup` 回调里：
+ *   1. `dsh-api-session-controller/lib/index.js:264-278` 的 `composeAgent(presetId)`
+ *      才是官方唯一的装配入口 —— 它返回
+ *      `{ agentPreset, setup: async (agentCtx) => { installModelSelection(agentCtx); await presets.mount(agentCtx, resolvedId) } }`
+ *   2. `dsh-agent-loop/lib/index.js:1574-1576` 在 `initializeAgent` 里真正调用
+ *      `setup?.(agent.ctx, agent)`；`:543` 证实 `agent.ctx` 带 scope（`mount` 的前置条件）
+ *   3. `dsh-agent-preset-registry/lib/index.js:702-711` 的 `mount()` → `retain` + `bind(ctx, generation)`
+ *      **这一步才挂载工具面**
+ *
+ * cs-bots 走的 `agents.create({ sessionId, meta, agentOptions })` 这条窄接口
+ * **从不传 `setup`** ⇒ preset 从未被挂载 ⇒ Bot 只有 cs-bots 自己注册的
+ * `bot_*` 工具，**没有 read / exec / web_fetch 等任何宿主能力**。
+ * 这就是「Bot 说它没有文件读写能力」的根因（用户：「无法调用工具会失去很多功能」）。
+ *
+ * ## 降级策略（沿用本文件「绝不阻塞启动」纪律）
+ *   - 缺 `agentPresets` 服务 → 退化成只装 model selection（官方同款降级，见 ①）
+ *   - 缺宿主包 / `mount` 抛错 → warn + 返回 setup 的降级版，**不抛**
+ *     （「没挂上工具面」仍然好过「会话建不起来」）
+ *
+ * @param {object} ctx
+ * @param {string | undefined} presetId 调用方显式给的 preset；不给则用宿主默认
+ * @param {(msg: string) => void} [warn] 告警出口（缺省静默）
+ * @returns {Promise<{ setup?: (agentCtx: object) => Promise<void>, agentPreset?: string }>}
+ */
+export async function composePresetSetup(ctx, presetId, warn = () => {}) {
+  /** @type {(agentCtx: object) => Promise<void>} */
+  let setup = async () => {}
+  let agentPreset
+
+  // ① 惰性取宿主的 installModelSelection（复用 loadHostModule 的锚点机制）
+  //    注意：不能静态 import —— profile 的 node_modules/@deepseek-ai/ 解析不到
+  //    dsh 子包（实测 ERR_MODULE_NOT_FOUND），必须从锚点 createRequire。
+  let installModelSelection = null
+  try {
+    const mod = /** @type {any} */ (loadHostModule(HOST_AGENT))
+    installModelSelection = typeof mod?.installModelSelection === 'function' ? mod.installModelSelection : null
+  } catch (error) {
+    warn(`cs-bots: 无法解析 ${HOST_AGENT}（model-selection 兜底将缺失）：${error?.message ?? error}`)
+  }
+
+  /** 安全装 model selection：任何异常都只 warn，绝不向上抛（见下方 mount 同纪律）。 */
+  const safeInstall = async (agentCtx) => {
+    if (!installModelSelection) return
+    try {
+      installModelSelection(agentCtx)
+    } catch (error) {
+      warn(`cs-bots: installModelSelection 失败（不影响工具面挂载）：${error?.message ?? error}`)
+    }
+  }
+
+  const presets = service(ctx, 'agentPresets')
+  if (!presets || typeof presets.mount !== 'function') {
+    // 官方同款降级：只有 model selection，没有 preset 工具面
+    if (installModelSelection) setup = safeInstall
+    warn('cs-bots: agentPresets 服务不可用 —— Bot 将只挂 model selection，不会挂 preset 工具面')
+    return { setup: installModelSelection ? setup : undefined }
+  }
+
+  // ② resolve → 拿到真实 id（未给则用宿主默认；官方 `composeAgent` 同款）
+  let resolvedId
+  try {
+    const resolved = await presets.resolve(presetId)
+    resolvedId = /** @type {any} */ (resolved)?.id
+  } catch (error) {
+    // 请求的 preset 不可用（未知 / 已下架）⇒ 回落**宿主默认**。
+    // ⚠️ 回落目标必须是 `presets.defaultId`，不能是 `presetId` —— 那等于拿同一个
+    //    坏值再 resolve 一次，必然再失败（2026-11-09 测试 P4 揪出来的真 bug：
+    //    上一版写 `presetId ?? presets.defaultId`，presetId 非空所以永远不回落）。
+    const fallback = presets.defaultId
+    warn(
+      `cs-bots: preset ${JSON.stringify(presetId ?? null)} 不可用（${error?.message ?? error}）`
+      + `，回落到宿主默认 ${JSON.stringify(fallback ?? null)}`,
+    )
+    if (typeof fallback === 'string' && fallback) {
+      try {
+        const resolved = await presets.resolve(fallback)
+        resolvedId = /** @type {any} */ (resolved)?.id
+      } catch (err) {
+        warn(`cs-bots: 连默认 preset ${JSON.stringify(fallback)} 都 resolve 不了，跳过挂载：${err?.message ?? err}`)
+      }
+    }
+  }
+  if (typeof resolvedId !== 'string' || !resolvedId) {
+    warn('cs-bots: preset resolve 返回的 id 无效，跳过挂载')
+    return { setup: installModelSelection ? safeInstall : undefined }
+  }
+  agentPreset = resolvedId
+
+  // ③ 真正拼 setup：installModelSelection + presets.mount
+  //    两步必须**各自独立兜底**：installModelSelection 抛错（宿主版本不匹配、
+  //    agentCtx 形状不符）时绝不允许连带跳过 mount —— 那等于把整个工具面也丢了。
+  //    纪律：会话必须建得起来，挂不上的部分如实 warn。
+  setup = async (agentCtx) => {
+    await safeInstall(agentCtx)
+    try {
+      await presets.mount(agentCtx, resolvedId)
+    } catch (error) {
+      warn(`cs-bots: preset ${resolvedId} mount 失败（会话仍可用，但工具面未挂上）：${error?.message ?? error}`)
+    }
+  }
+  return { setup, agentPreset }
+}
+
+/**
  * 创建一个 root Agent 会话，**可指定工作目录**。
  *
  * ⚠️ 这是本平台「共用工作目录」问题的**唯一解法**，务必不要用官方
@@ -325,12 +471,19 @@ export async function createSession(ctx, options) {
   if (!agents || typeof agents.create !== 'function') {
     throw new Error('cs-bots kernel: agents.create 不可用（宿主未提供 agents 服务）')
   }
-  const { sessionId, cwd, parentAgent, agentPreset, agentOptions, signal } = options ?? {}
+  const { sessionId, cwd, parentAgent, agentPreset, agentOptions, signal, warn } = options ?? {}
   if (!sessionId) throw new Error('cs-bots kernel: createSession 需要 sessionId')
+
+  // ── preset 装配（2026-11-09 修复「Bot 没有任何工具」）──────────────────────
+  // 必须走 setup 回调，理由见 composePresetSetup 的注释（源码级证据链）。
+  // 先 resolve，再拿它回填 meta.agentPreset —— 这样落盘的 preset 与会话真正
+  // 挂载的 preset **是同一个**（官方 composeAgent 也是先 resolve 再写 meta）。
+  const composition = await composePresetSetup(ctx, agentPreset, warn)
 
   const meta = {}
   if (cwd) meta.cwd = cwd
-  if (agentPreset) meta.agentPreset = agentPreset
+  const effectivePreset = composition.agentPreset ?? agentPreset
+  if (effectivePreset) meta.agentPreset = effectivePreset
   if (parentAgent) meta.parentSession = parentAgent.id
 
   // ── 模型选择（2026-11-09 修复「bot has no provider/model」）───────────────
@@ -346,6 +499,7 @@ export async function createSession(ctx, options) {
     ...(parentAgent ? { parentAgent } : {}),
     ...(Object.keys(meta).length ? { meta } : {}),
     ...(route ? { agentOptions: route } : {}),
+    ...(composition.setup ? { setup: composition.setup } : {}),
     ...(signal ? { signal } : {}),
   })
 
@@ -432,8 +586,17 @@ export async function attachToWorkspace(ctx, cwd, sessionId) {
 
 /**
  * 在既有持久会话上恢复 Agent（重启后复活会话用）。
+ *
+ * ⚠️ resume 也必须传 `setup`（2026-11-09 同源修复）。
+ * 官方 resume 路径同样装配 preset：`dsh-api-session-controller/lib/index.js:364-370`
+ * 传的是 `setup: this.reuseSetup(composition)`，其中 `reuseSetup`（382-397）
+ * 除了 installModelSelection + mount，还会在 preset 变化时 append
+ * `agent-preset/selected` 事件。**不传 setup 的 resume 出来的 Agent 同样没有工具面**
+ * —— 存量 Bot 光靠「复活」不会自动长出 read/exec，必须在这里补挂。
+ *
  * @param {object} ctx
- * @param {{ resumeSessionId: string, signal?: AbortSignal }} options
+ * @param {{ resumeSessionId: string, signal?: AbortSignal, agentPreset?: string,
+ *           agentOptions?: object, warn?: (msg: string) => void }} options
  * @returns {Promise<object>} AgentHandle
  */
 export async function resumeSession(ctx, options) {
@@ -441,7 +604,7 @@ export async function resumeSession(ctx, options) {
   if (!agents || typeof agents.resume !== 'function') {
     throw new Error('cs-bots kernel: agents.resume 不可用')
   }
-  const { resumeSessionId, signal, agentOptions } = options ?? {}
+  const { resumeSessionId, signal, agentOptions, agentPreset, warn } = options ?? {}
   if (!resumeSessionId) throw new Error('cs-bots kernel: resumeSession 需要 resumeSessionId')
   // 2026-11-09 同源修复：**存量会话**从来没有记录过模型选择（当时走的是不带
   // agentOptions 的创建路径），复活后依然 `model.current() === undefined`，
@@ -449,9 +612,12 @@ export async function resumeSession(ctx, options) {
   // 调用方显式给 > 会话自己已记录的 > 宿主全局默认（由宿主负责，我们只在
   // 前两者都没有时才传，避免把用户后来改过的会话级选择覆盖回默认值）。
   const route = agentOptions ?? defaultModelSelection(ctx)
+  // preset 装配：与 createSession 同源（见 composePresetSetup 的注释）。
+  const composition = await composePresetSetup(ctx, agentPreset, warn)
   return agents.resume({
     resumeSessionId,
     ...(route ? { agentOptions: route } : {}),
+    ...(composition.setup ? { setup: composition.setup } : {}),
     ...(signal ? { signal } : {}),
   })
 }

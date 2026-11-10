@@ -32,6 +32,15 @@ const MAX_BODY = 2 * 1024 * 1024
 export const API_BASE = '/cs-bots/api'
 
 /**
+ * 模块级告警出口。
+ *
+ * `ensureLive()` 是模块级函数，拿不到 `installApi(ctx, { warn })` 里的 warn，
+ * 但 preset 装配（`resumeSession` 内部）的降级告警必须能说出来 —— 所以在这里
+ * 挂一个可变出口，由 `installApi` 在装配时注入（缺省静默，绝不抛）。
+ */
+let moduleWarn = () => {}
+
+/**
  * 页面操作者身份。
  * 域服务用 `'user'` 表示「人类所有者 = 超级管理员」（见 room.js 的 USER 常量）。
  * 之前 API 传的是 `'ui'`，导致房间设置页一改就 `ROOM_NOT_MEMBER` —— 人类反而没权限。
@@ -782,7 +791,7 @@ async function ensureLive(ctx, sessionId) {
   // 已经 live：**什么都不做**（不得多出任何副作用，保证既有行为完全一致）。
   if (getAgent(ctx, id)) return { ok: true, live: true, revived: false }
   try {
-    await resumeSession(ctx, { resumeSessionId: id })
+    await resumeSession(ctx, { resumeSessionId: id, warn: moduleWarn })
     return { ok: true, live: true, revived: true }
   } catch (error) {
     return { ok: false, live: false, revived: false, reason: `resume-failed:${error?.message ?? error}` }
@@ -993,12 +1002,61 @@ async function markDeliveryFailure(services, taskId, reason, by) {
     if (!board) return false
     const current = board.get(taskId)
     if (!current) return false
+    // ⚠️ **合并写入**，不是整体覆盖（2026-11-09）。
+    // `board.set` 对 `delivery` 是 `next[k] = fields[k]` —— 整体替换。
+    // 直接写 `{ error, at, by }` 会冲掉这个字段上已有的其它键（将来若加
+    // attempt/最后一次成功时间等，会被静默抹掉）。先读再展开才是安全写法。
+    const prev = (current.delivery && typeof current.delivery === 'object') ? current.delivery : {}
     await board.update({
       id: taskId,
       expectedRev: current.rev,
       action: 'set',
       byId: by,
-      delivery: { error: String(reason), at: Date.now(), by },
+      delivery: { ...prev, error: String(reason), at: Date.now(), by },
+    })
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * 清掉投递失败留痕（**重试成功后必须清**，2026-11-09 修复）。
+ *
+ * ## 为什么必须有它（现场缺陷）
+ * `stage.js:hasDeliveryFailure()` 的判定是「`task.delivery.error` 存在且非空」，
+ * 而全项目**只有写入、没有人清除**（`grep delivery:` 只有两处 set）。
+ * 后果：一次投递失败之后，即使人点「重试唤醒」投递成功、Bot 正常把活干完，
+ * 任务也**永远**停在 `person/delivery`「输入投递失败：…」——
+ * 阶段机被一条过期事实永久劫持，人看到的是假红字。
+ *
+ * 清除口径（故意保守）：
+ *   - 只在**这一次投递确实成功**（`sent` 或 `skipped` 幂等命中）时清
+ *   - `pending`（已排队未送达）不清 —— 还没真投出去，失败留痕仍是事实
+ *   - `failed` 当然不清
+ *
+ * @param {object} services
+ * @param {string} taskId
+ * @param {{ result?: string }} [wake]
+ * @returns {Promise<boolean>} 是否真的清了
+ */
+async function clearDeliveryFailure(services, taskId, wake) {
+  const result = wake?.result
+  if (result !== 'sent' && result !== 'skipped') return false
+  try {
+    const board = services.board
+    if (!board) return false
+    const current = board.get(taskId)
+    if (!current) return false
+    const prev = current.delivery
+    if (!prev || typeof prev !== 'object') return false
+    if (typeof prev.error !== 'string' || prev.error === '') return false
+    await board.update({
+      id: taskId,
+      expectedRev: current.rev,
+      action: 'set',
+      byId: 'cs-bots',
+      delivery: { ...prev, error: undefined, clearedAt: Date.now(), clearedBy: wake?.target ?? 'cs-bots' },
     })
     return true
   } catch {
@@ -1283,6 +1341,8 @@ function statusText(status) {
  * @returns {(() => void) | undefined} disposer
  */
 export function installApi(ctx, { warn } = {}) {
+  /** 模块级告警出口：ensureLive 这类模块级函数也要能把 preset 装配失败说出来。 */
+  moduleWarn = warn ?? (() => {})
   // ⚠️ 修复（2026-11-04 测试，P0）：此前本 API **完全没有鉴权**——
   //   公网 `curl -X POST http://<IP>/cs-bots/api/tasks` 直接 200，
   //   任何人都能建任务/改记忆/写房间/改 Bot 注册表，并借此绕过下游的受保护区写闸门。
@@ -2231,6 +2291,11 @@ export function installApi(ctx, { warn } = {}) {
           // wake 层就失败了（agent-not-live / dispatcher 拒收）→ 同样落到任务上。
           if (wake && wake.result === 'failed') {
             await markDeliveryFailure(services, task.id, wake.reason ?? 'wake-failed', body.ownerId)
+          } else if (wake) {
+            // 2026-11-09：投递真的成功了 ⇒ 清掉上一次的失败留痕（否则任务会
+            // 永远停在「输入投递失败」，阶段机被过期事实劫持，见
+            // `clearDeliveryFailure` 的说明）。
+            await clearDeliveryFailure(services, task.id, wake)
           }
           // 发出去了就等回执：过了宽限期会话水位还没涨 ⇒ 判「未开始动作」
           armDeliveryWatch(services, task.id, body.ownerId, assignBaseline, wake)
@@ -2553,6 +2618,10 @@ export function installApi(ctx, { warn } = {}) {
         })
         if (wake && wake.result === 'failed') {
           await markDeliveryFailure(services, task.id, wake.reason ?? 'wake-failed', task.ownerId)
+        } else if (wake) {
+          // 2026-11-09：手动重试成功 ⇒ 清掉上次的失败留痕（否则任务永久停在
+          // 「输入投递失败」），见 `clearDeliveryFailure` 的说明。
+          await clearDeliveryFailure(services, task.id, wake)
         }
         armDeliveryWatch(services, task.id, task.ownerId, wakeBaseline, wake)
         sendJson(response, 200, {
