@@ -679,3 +679,51 @@ test('改造07 prepare：prepare_command_set 动作写进事件流（审计可�
   assert.equal(prep.length, 1)
   assert.equal(prep[0].byId, 'lead')
 })
+
+// ── bots04：setPreset（补能力缺口）─────────────────────────────────────────
+// 为什么要有：`preset` 此前只能 create 时设置，之后无接口可改。
+// 实测后果：myfree调研员 preset 为空（= 工具面无保证），想修只能删了重建，
+// 而重建会丢 sessionId 与全部历史关联 —— 代价过高。
+
+test('setPreset：改 preset 生效，且诚实标注「下次会话才真生效」', async (t) => {
+  const h = setup(t)
+  const bot = await seed(h.roster, h.ws, { name: 'preset-target' })
+  assert.equal(bot.preset, undefined, '起始应无 preset')
+
+  const r = h.roster.setPreset({
+    id: bot.id, preset: 'dev-steward', expectedRev: bot.rev, byId: 'ui',
+  })
+  assert.equal(r.preset, 'dev-steward')
+  assert.equal(r.rev, bot.rev + 1, 'rev 必须递增')
+  assert.equal(r.appliesOnNextSession, true, '必须诚实告知不会立刻影响已存在会话')
+})
+
+test('setPreset：传空串 = 清除 preset（不留 preset:"" 半状态）', async (t) => {
+  const h = setup(t)
+  const bot = await seed(h.roster, h.ws, { name: 'preset-clear', preset: 'dev-steward' })
+  const r = h.roster.setPreset({
+    id: bot.id, preset: '', expectedRev: bot.rev, byId: 'ui',
+  })
+  assert.equal(r.preset, undefined, '空串必须清成 undefined，不能留空字符串')
+})
+
+test('setPreset：设成与当前相同 ⇒ ROSTER_NOTHING_TO_SET_PRESET（不写无意义事件）', async (t) => {
+  const h = setup(t)
+  const bot = await seed(h.roster, h.ws, { name: 'preset-same', preset: 'dev-steward' })
+  assert.throws(
+    () => h.roster.setPreset({ id: bot.id, preset: 'dev-steward', expectedRev: bot.rev, byId: 'ui' }),
+    (e) => e instanceof RosterError && e.code === 'ROSTER_NOTHING_TO_SET_PRESET',
+  )
+})
+
+test('setPreset：已退役 Bot 不可改（与 rename/setCwd 同口径）', async (t) => {
+  const h = setup(t)
+  const bot = await seed(h.roster, h.ws, { name: 'preset-retired' })
+  h.roster.retire({ id: bot.id, byId: 'ui' })
+  const cur = h.roster.get(bot.id)
+  assert.throws(
+    () => h.roster.setPreset({ id: bot.id, preset: 'dev-steward', expectedRev: cur.rev, byId: 'ui' }),
+    // 错误码沿用 assertNotRetired 的 ROSTER_RETIRED（与 rename/setCwd 同口径）
+    (e) => e instanceof RosterError && e.code === 'ROSTER_RETIRED',
+  )
+})

@@ -336,6 +336,8 @@ export function createDispatcher(ctx, config = {}) {
       result,
       // ── 平台扩展字段（§3.5 未列，但对「可读原因」与可审计是必需的）──
       text: draft.text,
+      // t-39 第2批 D：唤醒成本可见。无团队归属时是 null（不猜）。
+      teamId: draft.teamId ?? null,
       updatedAt: at,
       seq: takeSeq(),
     }
@@ -457,7 +459,7 @@ export function createDispatcher(ctx, config = {}) {
    */
   function notify(request = {}) {
     const at = now()
-    const { target, reason, dedupKey, text, delayMs } = request
+    const { target, reason, dedupKey, text, delayMs, teamId } = request
     const wakeText = text ?? `[cs-bots 唤醒] ${REASON_TEXT[reason] ?? String(reason)}`
 
     // 每调用一次 = 一次决策，先计数（恒等式 total === sent + skipped + failed + pending 由此成立）。
@@ -470,7 +472,7 @@ export function createDispatcher(ctx, config = {}) {
     }
     if (!WAKE_REASONS.includes(reason)) {
       counters.failed += 1
-      const draft = draftWake({ target, reason: String(reason), dedupKey, text: wakeText, at })
+      const draft = draftWake({ target, reason: String(reason), dedupKey, text: wakeText, at, teamId })
       const { wake, durable } = commit(draft, 'failed', { at, detail: `invalid-reason:${reason}` })
       return { ok: false, result: 'failed', wakeId: wake.id, reason: 'invalid-reason', durable }
     }
@@ -482,7 +484,7 @@ export function createDispatcher(ctx, config = {}) {
       let wakeId
       let durable = probe.writable
       if (last === undefined || at - last >= SKIP_RECORD_INTERVAL_MS) {
-        const draft = draftWake({ target, reason, dedupKey, text: wakeText, at })
+        const draft = draftWake({ target, reason, dedupKey, text: wakeText, at, teamId })
         const committed = commit(draft, 'skipped', { at })
         wakeId = committed.wake.id
         durable = committed.durable
@@ -498,7 +500,7 @@ export function createDispatcher(ctx, config = {}) {
     if (queue.sizeOf(target) >= maxPerTarget) {
       counters.backpressured += 1
       counters.failed += 1
-      const draft = draftWake({ target, reason, dedupKey, text: wakeText, at })
+      const draft = draftWake({ target, reason, dedupKey, text: wakeText, at, teamId })
       // 请求被**拒绝**（而非「受理后没送成」）⇒ 该 dedupKey 尚未被消费，释放它，
       // 队列疏通后上游仍可用同一个 dedupKey 重发。
       if (dedupKey) dedup.keys.delete(dedupKey)
@@ -524,7 +526,7 @@ export function createDispatcher(ctx, config = {}) {
       deferred = notBefore > at
     }
 
-    const draft = draftWake({ target, reason, dedupKey, text: wakeText, at })
+    const draft = draftWake({ target, reason, dedupKey, text: wakeText, at, teamId })
     const entry = { draft, notBefore, keyHeld: Boolean(dedupKey) }
     queue.add(entry)
     if (deferred) counters.deferred += 1
@@ -622,18 +624,66 @@ export function createDispatcher(ctx, config = {}) {
   /**
    * 从 `wakes.jsonl` 读唤醒记录（**读盘，不是读内存** —— 进程重启后仍可审计）。
    *
-   * @param {{ target?: string, limit?: number }} [options]
+   * @param {{ target?: string, teamId?: string, limit?: number }} [options]
+   *        `teamId` 是 t-39 第2批 D 加的：唤醒成本可见（按团队过滤）。
    * @returns {object[]} 终态 Wake 记录（落盘顺序；有 `limit` 时取**最后** limit 条）
    */
   function list(options = {}) {
-    const { target, limit } = options
-    // 先按 limit 取尾，再按 target 过滤 —— 语义是「最近 limit 条里属于该 target 的」。
+    const { target, teamId, limit } = options
+    // 先按 limit 取尾，再按 target / teamId 过滤 —— 语义是「最近 limit 条里属于该 target/team 的」。
     const { rows, bad, total } = readJsonl(wakesFile, limit ? { limit } : {})
-    const filtered = target ? rows.filter((row) => row?.target === target) : rows
+    let filtered = rows
+    if (target) filtered = filtered.filter((row) => row?.target === target)
+    if (teamId) filtered = filtered.filter((row) => row?.teamId === teamId)
     // 坏行**不静默**：作为非枚举属性挂上，调用方可用 `Object.keys` 忽略、也可显式读取。
     Object.defineProperty(filtered, 'bad', { value: bad, enumerable: false })
     Object.defineProperty(filtered, 'total', { value: total, enumerable: false })
     return filtered
+  }
+
+  /**
+   * 按团队聚合唤醒成本（t-39 第2批 D）。
+   *
+   * 为什么需要：Boss 要看「哪个团队在消耗唤醒配额」。单看 target 看不出团队归属
+   * （target 是会话 id，团队归属在 `teamId` 上）。
+   *
+   * 只聚合**真正有 teamId 的记录**；`teamId === null` 的（任务派活、房间广播等
+   * 与团队无关的唤醒）单独归入 `teamId: null` 桶，不混进任何团队数字里。
+   *
+   * @param {{ since?: number }} [options] `since` = epoch ms，只统计该时刻之后的记录
+   * @returns {{ since?: number, teams: object[], unassigned: object, total: number }}
+   */
+  function byTeam(options = {}) {
+    const { since } = options
+    const { rows } = readJsonl(wakesFile, { limit: 100_000 })
+    const buckets = new Map()
+    let total = 0
+    for (const row of rows) {
+      const at = row?.scheduledAt ?? row?.at
+      if (since !== undefined && Number.isFinite(since) && Number.isFinite(at) && at < since) continue
+      total += 1
+      const key = row?.teamId ?? null
+      if (!buckets.has(key)) {
+        buckets.set(key, { teamId: key, count: 0, sent: 0, skipped: 0, failed: 0, pending: 0, targets: new Set() })
+      }
+      const b = buckets.get(key)
+      b.count += 1
+      const r = row?.result
+      if (r === 'sent') b.sent += 1
+      else if (r === 'skipped') b.skipped += 1
+      else if (r === 'failed') b.failed += 1
+      else if (r === 'pending') b.pending += 1
+      if (row?.target) b.targets.add(row.target)
+    }
+    const teams = [...buckets.entries()]
+      .filter(([key]) => key !== null)
+      .map(([, b]) => ({ ...b, targets: b.targets.size, targetsList: [...b.targets] }))
+      .sort((a, b) => b.count - a.count)
+    const unassignedEntry = buckets.get(null)
+    const unassigned = unassignedEntry
+      ? { teamId: null, count: unassignedEntry.count, sent: unassignedEntry.sent, skipped: unassignedEntry.skipped, failed: unassignedEntry.failed, pending: unassignedEntry.pending, targets: unassignedEntry.targets.size, targetsList: [...unassignedEntry.targets] }
+      : { teamId: null, count: 0, sent: 0, skipped: 0, failed: 0, pending: 0, targets: 0, targetsList: [] }
+    return { since: since ?? null, teams, unassigned, total }
   }
 
   return {
@@ -641,6 +691,7 @@ export function createDispatcher(ctx, config = {}) {
     flush,
     stats,
     list,
+    byTeam,
     /** 只读诊断：状态目录 / 文件路径 / 是否可写。 */
     paths: { stateDir: stateDirectory, wakesFile },
     /** 状态目录可否持久化；`false` ⇒ 所有返回值都会带 `durable:false`。 */

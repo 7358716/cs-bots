@@ -2675,7 +2675,30 @@ export function installApi(ctx, { warn } = {}) {
           }
         }
 
-        sendJson(response, 200, { ok: true, message, wakes: toWake.length, revives, fanout })
+        // ── t-39 第2批 C：发言同步给 DSH 原生 team 的 Lead（Boss 体验 item 5）──
+        //
+        // Boss 在 cs-bots 议事厅说话时，原生 team 的 Lead 感知不到 —— 两套团队模型
+        // 是分离的。这一步把消息也投递给绑定的原生 Lead（root session 路径，合法）。
+        //
+        // 诚实原则：同步失败**不报** ok:false（房间消息本身成功了），而是
+        // `leadSync.synced:false` + `reason`，页面据此显示「同步失败：<原因>」。
+        // 绝不装成功 —— 那比不显示更糟。
+        let leadSync
+        try {
+          leadSync = await withService(services, 'teams', (t) =>
+            t.syncToNativeLead({
+              roomId: message.roomId,
+              messageId: message.id,
+              text: message.text,
+              by: body.from ?? 'ui',
+              dispatcher: services.dispatcher,
+            }))
+        } catch (error) {
+          // 同步是附加动作：异常也必须变成可见的 synced:false，而不是 500
+          leadSync = { ok: true, synced: false, reason: 'SYNC_ERROR', detail: String(error?.message ?? error) }
+        }
+
+        sendJson(response, 200, { ok: true, message, wakes: toWake.length, revives, fanout, leadSync })
         return
       }
 
@@ -5000,6 +5023,82 @@ export function installApi(ctx, { warn } = {}) {
         sendJson(response, 200, { ok: true, team: out })
         return
       }
+      // ── 跨团队路由（t-39 第2批 A · HTTP 出口）───────────────────────────
+      //
+      // 为什么必须有这一条：页面上的「📤 发协作请求」按钮（client.js）就是打这个
+      // 路径的。只有 MCP 工具 `bot_team_route` 而没有 HTTP 出口 ⇒ Boss 点按钮 404。
+      //
+      // 复用 `teams.deliverRoute()` —— 与工具层**同一套序列编排**（决定 → 投递 →
+      // 留痕）。绝不在这里重写一遍，否则两条路的行为会漂。
+      if (request.method === 'POST' && path === '/teams/route') {
+        const body = (await readBody(request)) ?? {}
+        const out = await withService(services, 'teams', (t) =>
+          t.deliverRoute({
+            ...body,
+            by: body.by ?? OWNER,
+            // dispatcher 从装配层取出后注入：TeamsService 不反向依赖 dispatcher
+            dispatcher: services.dispatcher,
+          })).catch(markTeamError)
+        // refused 是**正常的业务结论**，不是服务器错误 ⇒ 200 带 decision:'refused'。
+        // 用 4xx 会让前端把它当异常处理，丢掉 reason 的可读性（DecisionKind 语义）。
+        sendJson(response, 200, out)
+        return
+      }
+
+      // ── 团队唤醒成本统计（t-39 第2批 D · HTTP 出口）─────────────────────
+      //
+      // 页面团队卡片要显示「今日唤醒 N 次」。数据源是 dispatcher 的 wakes.jsonl
+      // 按 teamId 聚合（`byTeam`）。不传 id ⇒ 返回全部团队的横向对比。
+      //
+      // `today` = 今日 0 点（本地时区）之后；`total` = 该团队历史累计。
+      if (request.method === 'GET' && path === '/teams/wake-stats') {
+        const id = qp(url, 'id')
+        const dispatcher = services.dispatcher
+        if (!dispatcher || typeof dispatcher.byTeam !== 'function') {
+          sendJson(response, 503, { ok: false, reason: 'DISPATCHER_UNAVAILABLE' })
+          return
+        }
+        const since = qn(url, 'since')
+        const nowMs = Date.now()
+        const midnight = since ?? new Date(nowMs).setHours(0, 0, 0, 0)
+        const todayAgg = dispatcher.byTeam({ since: midnight })
+        const allAgg = dispatcher.byTeam({})
+
+        const pick = (agg) => {
+          if (!id) {
+            return {
+              teams: agg.teams,
+              unassigned: agg.unassigned,
+              total: agg.total,
+            }
+          }
+          const hit = agg.teams.find((t) => t.teamId === id)
+          return hit ?? { teamId: id, count: 0, sent: 0, skipped: 0, failed: 0, pending: 0, targets: 0, targetsList: [] }
+        }
+        const today = pick(todayAgg)
+        const all = pick(allAgg)
+        if (id) {
+          sendJson(response, 200, {
+            ok: true,
+            id,
+            today: today.count ?? 0,
+            total: all.count ?? 0,
+            byResult: {
+              sent: today.sent ?? 0, skipped: today.skipped ?? 0,
+              failed: today.failed ?? 0, pending: today.pending ?? 0,
+            },
+            byResultAllTime: {
+              sent: all.sent ?? 0, skipped: all.skipped ?? 0,
+              failed: all.failed ?? 0, pending: all.pending ?? 0,
+            },
+            since: midnight,
+          })
+          return
+        }
+        sendJson(response, 200, { ok: true, since: midnight, today, all })
+        return
+      }
+
       // 管理策略（2026-11-09「管理员权限边界从页面控制」）：CAS 改团队的 adminPolicy。
       if (request.method === 'POST' && path === '/teams/policy') {
         const body = (await readBody(request)) ?? {}

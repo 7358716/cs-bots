@@ -5687,6 +5687,9 @@ window.__ModuleLoader__.load({
           const r = await act('/teams/route', {
             fromTeam: routeOpen,
             toTeam: routeTarget,
+            // taskId：服务层 `bot_team_route` 用它做环路去重键（`route:<from>:<to>:<taskId>`）。
+            // 页面上的「发协作请求」不强制挂任务，所以这里不带 taskId，
+            // 由服务层生成一个会话级临时 id（不挂具体任务 = 每一轮都是独立请求，不会被误去重）。
             text: routeText.trim(),
             hop: 1,
             by: 'ui',

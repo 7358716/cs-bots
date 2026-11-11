@@ -48,11 +48,17 @@ function harness(overrides = {}) {
       delivered.push(message)
     },
   }
+  // `anyAgent:true` 时任何 target 都投递成功（byTeam 等聚合测试要多个 target 都 sent）；
+  // 缺省仍只认 T，保持既有测试的失败路径语义不变。
+  const { anyAgent = false } = overrides
   const ctx = withAgent
     ? {
         get: (key) =>
           key === 'agents'
-            ? { get: (id) => (id === T ? fakeAgent : undefined), list: () => [fakeAgent] }
+            ? {
+                get: (id) => (anyAgent || id === T ? fakeAgent : undefined),
+                list: () => [fakeAgent],
+              }
             : undefined,
       }
     : {}
@@ -404,6 +410,96 @@ test('dispose() 可安全重复调用，且不投递', () => {
     h.dispatcher.dispose()
     h.dispatcher.dispose()
     assert.equal(h.dispatcher.stats().pending, 1, 'dispose 不应丢队列（也不应代投）')
+  } finally {
+    h.cleanup()
+  }
+})
+
+// ══ t-39 第2批 D：唤醒成本可见（teamId 落盘 + 按团队聚合）══════════════════════
+
+test('wakes.jsonl：teamId 传入即落盘（用于按团队统计唤醒成本）', () => {
+  const h = harness({ withAgent: true })
+  try {
+    h.dispatcher.notify({ target: T, reason: 'room-message', dedupKey: 'D1', text: 'x', teamId: 'team-7' })
+    const row = h.readWakes().find((w) => w.dedupKey === 'D1')
+    assert.ok(row, '应有 D1 记录')
+    assert.equal(row.teamId, 'team-7')
+  } finally {
+    h.cleanup()
+  }
+})
+
+test('wakes.jsonl：没传 teamId ⇒ 写 null，绝不瞎猜一个团队塞进去', () => {
+  const h = harness({ withAgent: true })
+  try {
+    h.dispatcher.notify({ target: T, reason: 'task-assigned', dedupKey: 'D2', text: 'x' })
+    const row = h.readWakes().find((w) => w.dedupKey === 'D2')
+    assert.ok(row, '应有 D2 记录')
+    assert.equal(row.teamId, null, '与团队无关的唤醒必须是 null，不能凭空归到某个团队')
+  } finally {
+    h.cleanup()
+  }
+})
+
+test('list({ teamId }) 只返回该团队的唤醒记录', () => {
+  const h = harness({ withAgent: true, anyAgent: true })
+  try {
+    // 用不同 target + 拉时间，避开 throttle（同 target 连发会被推迟，记录尚未落盘）
+    h.dispatcher.notify({ target: 's-1', reason: 'room-message', dedupKey: 'T1', teamId: 'team-1' })
+    h.tick(10_000)
+    h.dispatcher.notify({ target: 's-2', reason: 'room-message', dedupKey: 'T2', teamId: 'team-2' })
+    h.tick(10_000)
+    h.dispatcher.notify({ target: 's-3', reason: 'timer', dedupKey: 'T3' })
+    h.tick(10_000)
+    assert.equal(h.dispatcher.list({ teamId: 'team-1' }).length, 1)
+    assert.equal(h.dispatcher.list({ teamId: 'team-2' }).length, 1)
+    assert.equal(h.dispatcher.list({}).length, 3)
+  } finally {
+    h.cleanup()
+  }
+})
+
+test('byTeam()：按团队聚合次数/结果分布，null 桶单独归（不混进任何团队）', () => {
+  const h = harness({ withAgent: true, anyAgent: true })
+  try {
+    // 每发一条都推进时钟 —— 同 target 连发会被 throttle 推迟，记录还没到终态
+    for (const [target, teamId, key] of [['s-1','team-A','B1'],['s-2','team-A','B2'],['s-3','team-B','B3'],['s-4',undefined,'B4']]) {
+      h.dispatcher.notify({ target, reason: 'room-message', dedupKey: key, ...(teamId ? { teamId } : {}) })
+      h.tick(10_000)
+    }
+
+    const agg = h.dispatcher.byTeam()
+    assert.equal(agg.total, 4)
+    assert.equal(agg.teams.length, 2, '两个真实团队')
+    const a = agg.teams.find((x) => x.teamId === 'team-A')
+    assert.equal(a.count, 2)
+    assert.equal(a.sent, 2)
+    assert.equal(a.targetsList.length, 2, 'team-A 有 2 个不同 target')
+    assert.equal(a.sent, 2, '两条都真的投递成功')
+    const b = agg.teams.find((x) => x.teamId === 'team-B')
+    assert.equal(b.count, 1)
+    // 无团队的那次必须落在 unassigned，且**不**算进 team-A/team-B
+    assert.equal(agg.unassigned.teamId, null)
+    assert.equal(agg.unassigned.count, 1)
+    assert.equal(a.count + b.count + agg.unassigned.count, agg.total, '三个桶加起来必须等于总数')
+  } finally {
+    h.cleanup()
+  }
+})
+
+test('byTeam({since})：只统计该时刻之后的记录', () => {
+  const h = harness({ withAgent: true, anyAgent: true })
+  try {
+    h.dispatcher.notify({ target: 's-1', reason: 'room-message', dedupKey: 'S1', teamId: 'team-A' })
+    h.tick(10_000)
+    const cutoff = 1_000_000 + 5_000 // 落在第一条(scheduledAt=1_000_000)与第二条(scheduledAt=1_010_000)之间
+    h.dispatcher.notify({ target: 's-2', reason: 'room-message', dedupKey: 'S2', teamId: 'team-A' })
+    h.tick(10_000)
+
+    const all = h.dispatcher.byTeam()
+    assert.equal(all.teams.find((x) => x.teamId === 'team-A').count, 2)
+    const recent = h.dispatcher.byTeam({ since: cutoff })
+    assert.equal(recent.teams.find((x) => x.teamId === 'team-A').count, 1, 'since 之后只剩 1 条')
   } finally {
     h.cleanup()
   }

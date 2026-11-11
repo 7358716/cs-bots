@@ -1247,78 +1247,26 @@ const DEFS = [
         fromTeam: { type: 'string', description: '发送方团队 id（可选；缺省按执行者会话 id 推导）' },
         toTeam: { type: 'string', description: '目标团队 id' },
         toBot: { type: 'string', description: '目标 Bot 的会话 id（toTeam 与 toBot 二选一）' },
-        taskId: { type: 'string', description: '关联任务 id（必填；用于环路检测与去重）' },
+        taskId: {
+          type: 'string',
+          description: '关联任务 id（可选；缺省自动生成 route-<时间戳>——页面「发协作请求」不一定挂任务）。'
+            + '同一轮重发请复用同一 taskId，否则会被当成新路由（去重键含 taskId）',
+        },
         text: { type: 'string', description: '要投递的正文内容' },
         hop: { type: 'number', description: '当前跳数（>3 拒绝；缺省 0）' },
       },
-      required: ['taskId'],
       additionalProperties: false,
     },
     run: (s, a, exec) => {
       if (!s.teams) return failure('teams-unavailable')
-      // ── 步骤 1：解析并校验路由目标（只决定，不投递）──
-      const decision = s.teams.resolveRoute({ ...a, by: callerOf(exec) })
-      if (!decision.ok) {
-        // 被拒：返回 DecisionKind 语义的 refused，不抛裸错
-        return { ok: false, decision: 'refused', reason: decision.reason, to: decision.to, hop: decision.hop }
-      }
-
-      // ── 步骤 2：先落 route 事件（intent-first），再投递 ──
-      // 顺序不可颠倒：`记了没投` 可见可重试；`投了没记` 绕过限额/审计。
-      if (!s.dispatcher) {
-        return {
-          ok: false, decision: 'refused', reason: 'ROUTE_NO_DISPATCHER',
-          to: decision.to, hop: decision.hop,
-        }
-      }
-
-      // 步骤 3：用 dispatcher 投递（只唤 leadId，去重键复用 dispatcher 的机制）
-      const wakeText = a.text ?? `[cs-bots 跨团队路由] ${decision.fromTeam} → ${decision.to.id}（lead=${decision.to.leadId}, hop=${decision.hop}, task=${a.taskId}）`
-      const wake = s.dispatcher.notify({
-        target: decision.to.leadId,
-        reason: 'room-message',
-        dedupKey: decision.dedupKey,
-        text: wakeText,
-        taskId: a.taskId,
+      // 唯一的序列编排在 `teams.deliverRoute()`（决定 → 投递 → 留痕）。
+      // 工具层与 `POST /teams/route` 共用它 —— 两路各写一遍行为就会漂
+      // （一边去重了、一边没去重；一边先投后记、一边先记后投）。
+      return s.teams.deliverRoute({
+        ...a,
+        by: callerOf(exec),
+        dispatcher: s.dispatcher,
       })
-
-      // 步骤 4：把 route 事件 + 投递结果一起落盘
-      try {
-        s.teams.recordRoute({
-          to: decision.to,
-          fromTeam: decision.fromTeam,
-          taskId: a.taskId,
-          text: a.text,
-          hop: decision.hop,
-          by: callerOf(exec),
-          wake,
-        })
-      } catch (recordError) {
-        return {
-          ok: false, decision: 'refused', reason: 'ROUTE_RECORD_FAILED',
-          message: recordError?.message ?? String(recordError),
-          to: decision.to, hop: decision.hop, wake,
-        }
-      }
-
-      // ── 返回 DecisionKind 语义的最终结果 ──
-      if (wake?.ok === true && wake?.result === 'sent') {
-        return {
-          ok: true,
-          decision: 'delivered',
-          to: decision.to,
-          hop: decision.hop,
-          wake,
-        }
-      }
-      // 被去重或投递失败：仍算 delivered（路由决策已做出并留痕），但 wake 里可见原因
-      return {
-        ok: true,
-        decision: 'delivered',
-        to: decision.to,
-        hop: decision.hop,
-        wake,
-      }
     },
   },
 ]

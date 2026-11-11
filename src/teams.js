@@ -291,7 +291,7 @@ export function createTeams(ctx, config = {}) {
    */
   function create(input = {}) {
     assertAlive('create')
-    const { name, type, purpose, memberIds, leadId, adminPolicy, by, now, kind } = input ?? {}
+    const { name, type, purpose, memberIds, leadId, adminPolicy, by, now, kind, nativeTeamId } = input ?? {}
     const nameNorm = requireString(name, 'name', 'create')
     if (nameNorm.length > 120) throw new TeamError(`teams.create：name ≤120 字符（收到 ${nameNorm.length}）`, 'TEAM_BAD_FIELD', { field: 'name' })
     const teamType = type ?? 'big'
@@ -329,6 +329,15 @@ export function createTeams(ctx, config = {}) {
     const rec = {
       id, rev: 1, name: nameNorm, type: teamType, kind: teamKind, purpose: purpose ?? '',
       leadId: lead, members,
+      // ── t-39 第2批 C：绑定 DSH 原生 team ──
+      // cs-bots 团队（teams.jsonl）与 DSH 原生 team（agentTeams）是**两套人模型**，
+      // 没有任何自动交集（原生 TeamId = root session id，跟我们的 team-N 毫无关系）
+      // ⇒ 必须显式绑定。这个字段是「Boss 在这个 cs-bots 房间发言时，该同步给哪个
+      // 原生团队」的唯一依据。
+      //
+      // 为什么从 cs-bots 侧配：原生侧**没有**「列出所有原生 team」的接口，
+      // 只有 `tryMembership(agent)`（从某个成员反查它所属团队）⇒ 反向枚举不可行。
+      nativeTeamId: typeof nativeTeamId === 'string' && nativeTeamId.length > 0 ? nativeTeamId : null,
       adminPolicy: policy,
       status: 'open',
       createdAt: at, createdBy: author, updatedAt: at, updatedBy: author,
@@ -621,6 +630,67 @@ export function createTeams(ctx, config = {}) {
   }
 
   /**
+   * **一条龙路由**：决定 → 投递 → 留痕。工具层（`bot_team_route`）与 HTTP 层
+   * （`POST /teams/route`）**共用这一个方法**。
+   *
+   * 为什么必须共用：两条路各写一遍，行为就会漂 —— 工具层去重了、HTTP 层没去重，
+   * 或者一边先投后记、一边先记后投。契约要求「跨团队路由」只有一套语义，
+   * 所以序列编排只能有一处。
+   *
+   * 依赖注入：`dispatcher` 由调用方传入（TeamsService 不反向依赖 dispatcher，
+   * 否则两个域服务互指，装配顺序变成硬约束）。
+   *
+   * @param {{ fromTeam?: string, toTeam?: string, toBot?: string, taskId?: string,
+   *           text?: string, hop?: number, by: string, now?: number,
+   *           dispatcher: object }} input
+   * @returns {object} `{ok, decision, to, hop, wake, reason?, taskId}` —— DecisionKind 语义
+   */
+  function deliverRoute(input = {}) {
+    assertAlive('deliverRoute')
+    const { dispatcher, taskId: rawTaskId, by, now, text, hop } = input ?? {}
+    const author = requireString(by, 'by', 'deliverRoute')
+
+    // taskId 缺省生成：页面上的「发协作请求」不一定挂任务（Boss 只是想跨团队喊一句）。
+    // 每轮生成独立 id ⇒ 不会被 dispatcher 误判重（同一轮重发才判重，由调用方复用同一 id）。
+    const taskId = typeof rawTaskId === 'string' && rawTaskId.trim() !== ''
+      ? rawTaskId.trim()
+      : `route-${normalizeNow(now, 'deliverRoute')}`
+
+    const decision = resolveRoute({ ...input, taskId, by: author })
+    if (!decision.ok) return { ...decision, taskId }
+
+    if (!dispatcher || typeof dispatcher.notify !== 'function') {
+      return { ok: false, decision: 'refused', reason: 'ROUTE_NO_DISPATCHER', to: decision.to, hop: decision.hop, taskId }
+    }
+
+    // 投递：只唤对方 leadId；dedupKey 交给 dispatcher（不自己造去重）；
+    // teamId 让 byTeam() 能按团队聚合唤醒成本。
+    const wakeText = text ?? `[cs-bots 跨团队路由] ${decision.fromTeam} → ${decision.to.id}`
+      + `（lead=${decision.to.leadId}, hop=${decision.hop}, task=${taskId}）`
+    const wake = dispatcher.notify({
+      target: decision.to.leadId,
+      reason: 'room-message',
+      dedupKey: decision.dedupKey,
+      text: wakeText,
+      teamId: decision.to.id,
+    })
+
+    // 留痕在投递之后（投递已有 dedupKey 记在 wakes.jsonl；这里记的是「路由决策」本身）。
+    // 落盘失败**必须显式报错**，不能吞 —— 「投了没记」会让环路统计漏跳。
+    try {
+      recordRoute({ to: decision.to, fromTeam: decision.fromTeam, taskId, text, hop: decision.hop, by: author, now, wake })
+    } catch (recordError) {
+      return {
+        ok: false, decision: 'refused', reason: 'ROUTE_RECORD_FAILED',
+        message: recordError?.message ?? String(recordError),
+        to: decision.to, hop: decision.hop, wake, taskId,
+      }
+    }
+
+    return { ok: true, decision: 'delivered', to: decision.to, hop: decision.hop, wake, taskId }
+  }
+
+  /**
    * 把已经做出的路由决定**落盘留痕**（intent-first：先记后投）。
    *
    * 顺序不可颠倒：`记了没投` 是可见可重试的；`投了没记` 则绕过限额/审计，
@@ -677,6 +747,113 @@ export function createTeams(ctx, config = {}) {
     return clone(rows.map((r) => (r.adminPolicy ? r : { ...r, adminPolicy: DEFAULT_TEAM_ADMIN_POLICY })))
   }
 
+  /**
+   * 按房间 id 反查绑定它的团队（t-39 第2批 C）。
+   *
+   * 用途：Boss 在 cs-bots 团队的议事厅发言 ⇒ 知道该同步给哪个原生 team。
+   * 一个房间只可能被一个团队绑定（`attachRoom` 是 CAS 单值覆盖）。
+   *
+   * @param {string} roomId
+   * @returns {object|null} 团队记录（含 `nativeTeamId`），没绑定 ⇒ null
+   */
+  function findByRoom(roomId) {
+    assertAlive('findByRoom')
+    if (typeof roomId !== 'string' || roomId.length === 0) return null
+    for (const t of entries.values()) {
+      if (t.roomId === roomId) return get(t.id)
+    }
+    return null
+  }
+
+  /**
+   * **发言同步给 DSH 原生 team 的 Lead**（t-39 第2批 C · Boss 体验 item 5）。
+   *
+   * ### 为什么要这个
+   * Boss 在 cs-bots 团队的议事厅发言，原生 team 的 Lead 感知不到 —— 因为两套
+   * 团队模型是**分离的**（cs-bots `teams.jsonl` vs DSH `agentTeam`），消息不会自动
+   * 跨过去。这个方法负责把这条链补上。
+   *
+   * ### 链路（lead 批准的实现方向，2026-11-11）
+   *   Boss 在 cs-bots 房间发言 → `findByRoom(roomId)` 反查绑定团队
+   *   → 取该团队的 `nativeTeamId` → 投递给原生 team 的 Lead。
+   *
+   * **为什么投递 target = nativeTeamId 就是投递给 Lead**：
+   * DSH 原生 `TeamId` 就是 root session id（`TeamId(id: SessionId|string)`，
+   * 且 `tryMembership(agent).root.id === membership.id`）。所以原生 team 的 Lead
+   * 会话 id 就等于这个 TeamId。投递 root = 投递 Lead，走的是 root 路径，**合法**。
+   *
+   * ### 为什么用 dispatcher 而不是 agentTeams.sendMessage
+   * 官方 `sendMessage(caller, ...)` 需要 Lead 身份的 `Agent` 作为凭证，且校验
+   * Lead→child 边 —— 队友不能给 Lead 发消息。cs-bots 是 root session，用
+   * `dispatcher.followup(root)` 投递是 root 路径，不冒充任何人。
+   *
+   * ### 诚实原则（硬要求）
+   * 同步失败**绝不**返回 `ok:false`，也**绝不**假装成功：
+   * `{ ok: true, synced: false, reason }` —— 房间消息本身已经成功落盘，
+   * 同步是附加动作，失败必须可见但不影响消息。
+   *
+   * reason 取值（给前端 A 的确定形状）：
+   *   - `NATIVE_TEAM_NOT_FOUND`  房间没绑任何 cs-bots 团队
+   *   - `NATIVE_TEAM_NOT_BOUND`  团队存在但 `nativeTeamId` 为 null（要先配置绑定）
+   *   - `SYNC_DISPATCHER_UNAVAILABLE`  装配层没注入 dispatcher
+   *   - `SYNC_DEDUP_HIT`  这条消息之前已同步过（幂等，不算新同步也不算失败）
+   *   - `SYNC_DELIVERY_FAILED`  投递失败（dispatcher 返回 failed）
+   *   - `SYNCED`  同步成功
+   *
+   * @param {{ roomId: string, messageId?: string, text?: string, by: string,
+   *           dispatcher: object }} input
+   * @returns {{ ok: true, synced: boolean, reason: string,
+   *            teamId?: string, nativeTeamId?: string, leadId?: string, wake?: object }}
+   */
+  function syncToNativeLead(input = {}) {
+    assertAlive('syncToNativeLead')
+    const { roomId, messageId, text, by, dispatcher } = input ?? {}
+    requireString(by, 'by', 'syncToNativeLead')
+
+    // ① 反查房间属于哪个 cs-bots 团队（一个房间只可能被一个团队绑定）
+    const team = findByRoom(roomId)
+    if (!team) {
+      return { ok: true, synced: false, reason: 'NATIVE_TEAM_NOT_FOUND', detail: '房间未绑定任何 cs-bots 团队' }
+    }
+
+    // ② 团队有没有绑定 DSH 原生 team —— 这是同步的唯一依据
+    if (!team.nativeTeamId) {
+      return {
+        ok: true, synced: false, reason: 'NATIVE_TEAM_NOT_BOUND',
+        teamId: team.id, detail: '团队未绑定 DSH 原生 team，请先在团队详情里配置 nativeTeamId',
+      }
+    }
+
+    // ③ dispatcher 在不在（缺失 ⇒ 无法投递，但不是消息本身的错）
+    if (!dispatcher || typeof dispatcher.notify !== 'function') {
+      return {
+        ok: true, synced: false, reason: 'SYNC_DISPATCHER_UNAVAILABLE',
+        teamId: team.id, nativeTeamId: team.nativeTeamId,
+      }
+    }
+
+    // ④ 投递给原生 team 的 Lead（root session id == nativeTeamId）
+    //    dedupKey 用消息 id —— 同一消息重复 post 不会重复同步（幂等）。
+    const dedupKey = `lead-sync:${messageId ?? roomId}:${team.id}`
+    const wake = dispatcher.notify({
+      target: team.nativeTeamId,
+      reason: 'room-message',
+      dedupKey,
+      text: `[cs-bots 团队发言同步] 「${team.name}」房间新消息：${String(text ?? '').slice(0, 200)}`,
+      teamId: team.id,
+    })
+
+    // ⑤ 诚实汇报：只有真的发出去才算 synced:true
+    const leadId = team.nativeTeamId
+    if (wake?.ok === true && wake?.result === 'sent') {
+      return { ok: true, synced: true, reason: 'SYNCED', teamId: team.id, nativeTeamId: leadId, leadId, wake }
+    }
+    if (wake?.ok === true && wake?.result === 'skipped') {
+      return { ok: true, synced: false, reason: 'SYNC_DEDUP_HIT', teamId: team.id, nativeTeamId: leadId, leadId, wake }
+    }
+    return { ok: true, synced: false, reason: 'SYNC_DELIVERY_FAILED', teamId: team.id, nativeTeamId: leadId, leadId, wake }
+  }
+
   function get(id) {
     assertAlive('get')
     const t = entries.get(id)
@@ -716,8 +893,12 @@ export function createTeams(ctx, config = {}) {
     resolveRoute,
     recordRoute,
     listRoutes,
+    // 一条龙：工具层与 HTTP 层共用的唯一序列编排
+    deliverRoute,
     list,
     get,
+    findByRoom,
+    syncToNativeLead,
     stats,
     replay,
     diagnostics: () => clone(diagnostics),

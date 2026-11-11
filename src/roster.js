@@ -832,6 +832,59 @@ export function createRoster(ctx, config = {}) {
   }
 
   /**
+   * 改预制体（preset）—— 2026-11-11 bots04 补的能力缺口。
+   *
+   * ## 为什么需要它
+   *
+   * `preset` 此前**只能**在 `create()` 时设置，之后没有任何接口能改。
+   * 实测后果：`myfree调研员`（t-36 挂 `agent-not-live` 的那个）preset 为空，
+   * 而空 preset = 走宿主默认预设 = **工具面没有保证**（连 `bot_*` 工具都不一定有）。
+   * 想修只能删掉重建 —— 那会丢掉 sessionId 与全部历史关联，代价过高。
+   *
+   * ## 语义边界
+   *
+   *   - **只改 preset，不重建会话**：已经起来的会话不会被换预设。
+   *     这是诚实的边界 —— 换预设真正生效要等该会话下次启动。
+   *     调用方要能看见这一点，所以返回值里带 `appliesOnNextSession: true`。
+   *   - 退役 Bot 不可改（与 `rename`/`setCwd` 同口径）。
+   *   - CAS：必须带 `expectedRev`。
+   *   - 空串 / null ⇒ 清除 preset（回到宿主默认）。这与 `create` 里
+   *     「不传/空串则不写 preset 字段」是同一口径，避免出现 `preset: ''` 这种半状态。
+   *
+   * @param {{ id: string, preset: string|null, byId: string, expectedRev: number, now?: number }} input
+   * @returns {object} Bot（含 `appliesOnNextSession`）
+   * @throws {RosterError} 不存在 / 已退役 / 缺字段 / rev 不匹配
+   */
+  function setPreset(input = {}) {
+    const { preset, byId, now } = input ?? {}
+    const current = loadForCas(input, 'setPreset')
+    const by = requireString(byId, 'byId', 'setPreset')
+    assertNotRetired(current, 'setPreset', '换预制体')
+
+    const raw = preset === undefined || preset === null ? '' : String(preset).trim()
+    const nextPreset = raw === '' ? undefined : raw
+    if ((current.preset ?? undefined) === nextPreset) {
+      throw new RosterError(
+        `roster.setPreset：Bot ${current.id} 的 preset 已是 ${JSON.stringify(nextPreset ?? null)}——无需变更`,
+        'ROSTER_NOTHING_TO_SET_PRESET',
+        { id: current.id, preset: nextPreset ?? null },
+      )
+    }
+
+    const at = normalizeNow(now, 'setPreset')
+    const before = clone(current)
+    const next = clone(current)
+    next.rev = current.rev + 1
+    if (nextPreset === undefined) delete next.preset
+    else next.preset = nextPreset
+    next.presetUpdatedAt = at
+    next.presetUpdatedBy = by
+    const committed = commit(current.id, 'setPreset', by, at, before, next)
+    // 诚实告知：换 preset 不会立刻影响已存在的会话
+    return { ...committed, appliesOnNextSession: true }
+  }
+
+  /**
    * 退役 → **终态，但释放名额**（名字可复用、cwd 可回收；§3.1 "关键" 段）。
    *
    * 语义边界（写清楚，避免误用）：
@@ -1408,6 +1461,7 @@ export function createRoster(ctx, config = {}) {
     hasSession,
     rename,
     retire,
+    setPreset,
     setCwd,
     setPrepareCommand,
     getProfile,
