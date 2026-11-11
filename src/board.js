@@ -415,6 +415,30 @@ function normalizeProgress(value, where) {
   return value
 }
 
+/**
+ * 旧数据兼容读（契约 §9）：补齐/抹平**新字段**，让老街机数据也能安全被读。
+ *
+ * 硬要求：**缺字段一律给默认值，绝不抛**。升级不丢任何既有任务/证据/历史，
+ * 所以这里只做「无副作用的正规化」，不猜测、不伪造来源（旧数据没有
+ * `progressBy` 就是「不知道谁设的」，不补一个假的 —— UI 会显示成总进度）。
+ *
+ * @param {object} t 从事件流/快照来的 Task（就地修改）
+ * @returns {object} 同一个 t
+ */
+function normalizeLegacyTask(t) {
+  if (!Array.isArray(t.blockedBy)) t.blockedBy = []
+  if (!Array.isArray(t.writeScopes)) t.writeScopes = []
+  if (!Array.isArray(t.labels)) t.labels = []
+  if (t.triaged !== true && t.triaged !== false) t.triaged = false
+  if (typeof t.progress !== 'number' || !Number.isFinite(t.progress)) t.progress = 0
+  // `progressBy`/`progressAt`（契约 §6 新增）：旧数据没有 ⇒ 直接不设（视为 undefined）。
+  // 注意：**不给默认值**是对的 —— 给了就会把「旧任务」伪造成「某人设过进度」。
+  // 只在字段存在但类型坏了时才抹掉，避免 UI/导出拿到脏值。
+  if (t.progressBy !== undefined && typeof t.progressBy !== 'string') delete t.progressBy
+  if (t.progressAt !== undefined && !Number.isFinite(t.progressAt)) delete t.progressAt
+  return t
+}
+
 /** triaged 归一：严格布尔。 */
 function normalizeTriaged(value, where) {
   if (value === undefined || value === null) return undefined
@@ -748,11 +772,7 @@ export function createBoard(ctx, config = {}) {
         for (const raw of snapTasks) {
           if (!raw || typeof raw.id !== 'string') continue
           const t = clone(raw)
-          if (!Array.isArray(t.blockedBy)) t.blockedBy = []
-          if (!Array.isArray(t.writeScopes)) t.writeScopes = []
-          if (!Array.isArray(t.labels)) t.labels = []
-          if (t.triaged !== true && t.triaged !== false) t.triaged = false
-          if (typeof t.progress !== 'number' || !Number.isFinite(t.progress)) t.progress = 0
+          normalizeLegacyTask(t)
           tasks.set(t.id, t)
           idCounter = Math.max(idCounter, idNumber(t.id))
           if (t.sourceSeq) sourceSeqIndex.set(t.sourceSeq, t.id)
@@ -798,11 +818,7 @@ export function createBoard(ctx, config = {}) {
         continue
       }
       const t = clone(ev.after)
-      if (!Array.isArray(t.blockedBy)) t.blockedBy = []
-      if (!Array.isArray(t.writeScopes)) t.writeScopes = []
-      if (!Array.isArray(t.labels)) t.labels = []
-      if (t.triaged !== true && t.triaged !== false) t.triaged = false
-      if (typeof t.progress !== 'number' || !Number.isFinite(t.progress)) t.progress = 0
+      normalizeLegacyTask(t)
       tasks.set(ev.taskId, t)
       events.push(clone(ev))
       idCounter = Math.max(idCounter, idNumber(ev.taskId))
@@ -1196,7 +1212,23 @@ export function createBoard(ctx, config = {}) {
       if (src.estimate !== undefined) setOrDelete('estimate', normalizeEstimate(src.estimate, where))
       if (src.assignee !== undefined) setOrDelete('assignee', normalizeOptionalString(src.assignee, 'assignee', where))
       if (src.reviewer !== undefined) setOrDelete('reviewer', normalizeOptionalString(src.reviewer, 'reviewer', where))
-      if (src.progress !== undefined) setOrDelete('progress', normalizeProgress(src.progress, where))
+      if (src.progress !== undefined) {
+        const progressNorm = normalizeProgress(src.progress, where)
+        if (progressNorm === undefined) {
+          // `null` = 清除进度 ⇒ 来源字段一并清掉（没有进度就谈不上「谁设的」）
+          delete nextTask.progress
+          delete nextTask.progressBy
+          delete nextTask.progressAt
+        } else {
+          nextTask.progress = progressNorm
+          // 契约 §6：进度来源是**派生字段** —— 调用方不许传（不在 PATCH_FIELDS /
+          // NEW_FIELD_NAMES 白名单里，传了会被拒成「未知字段」），由这里自动同写。
+          // 为什么必须留痕：UI 要能说清「当前 40%（队长估算）」还是「（Boss 设定）」，
+          // 而 `progress` 单一个数字根本分不出是谁定的。
+          nextTask.progressBy = by
+          nextTask.progressAt = at
+        }
+      }
       if (src.triaged !== undefined) setOrDelete('triaged', normalizeTriaged(src.triaged, where))
       if (src.startedAt !== undefined) setOrDelete('startedAt', optionalNumber(src.startedAt, 'startedAt', where))
       if (src.completedAt !== undefined) setOrDelete('completedAt', optionalNumber(src.completedAt, 'completedAt', where))

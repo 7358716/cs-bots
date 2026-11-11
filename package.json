@@ -1,8 +1,8 @@
 {
   "name": "cs-bots",
-  "version": "0.7.5",
+  "version": "0.8.0",
   "type": "module",
-  "description": "多智能体协作：任务板、房间、分层记忆、Bot 注册。",
+  "description": "Boss 体验 + 任务管控 + 升级可回滚。",
   "main": "src/index.js",
   "exports": {
     ".": "./src/index.js",

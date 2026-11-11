@@ -16,8 +16,8 @@ import { resolve, sep, isAbsolute, join } from 'node:path'
 
 /** 设置项定义：默认值 + 校验。 */
 export const SETTING_SPECS = Object.freeze({
-  /** 任务默认租约时长（ms）：owner claim 后多久未心跳即视为失联。 */
-  defaultLeaseMs: { def: 5 * 60_000, min: 10_000, max: 24 * 60 * 60_000, label: '任务租约默认时长（ms）' },
+  /** 任务默认占用时长（ms）：owner claim 后多久未心跳即视为失联。 */
+  defaultLeaseMs: { def: 5 * 60_000, min: 10_000, max: 24 * 60 * 60_000, label: '任务占用默认时长（ms）' },
   /** 唤醒节流窗口（ms）：同一目标在窗内最多唤醒一次。 */
   throttleMs: { def: 5_000, min: 0, max: 60 * 60_000, label: '唤醒节流窗口（ms）' },
   /** 每目标唤醒队列上限（背压阈值）。 */

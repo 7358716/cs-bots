@@ -31,8 +31,14 @@ test('J2 打不开要报真原因，不许谎称「宿主不支持」', () => {
   assert.match(SOURCE, /打开会话失败：/, '失败必须把宿主的真实错误带出来')
 })
 
-test('J3 团队卡片「看房间」带 sub:rooms（否则落到 Bot 档案）', () => {
-  assert.match(SOURCE, /onGoto\?\.\('team', \{ sub: 'rooms', filter: t\.name \}\)/, '团队卡片跳房间必须带 sub')
+test('J3 团队卡片「去房间」带 sub:rooms（否则落到 Bot 档案）', () => {
+  // 契约 §3(UI)：按钮文案是「去房间」，且必须带 sub:'rooms'。
+  // 有 roomId ⇒ 精确选中该房间；没有 ⇒ 退回按团队名筛（不能不带 sub，否则落到 Bot 档案）。
+  assert.match(SOURCE, /'💬 去房间'/, '团队卡片按钮文案应为「去房间」')
+  assert.match(SOURCE, /\{ sub: 'rooms', roomId: t\.roomId \}/, '有房间时必须按 roomId 精确选中')
+  assert.match(SOURCE, /\{ sub: 'rooms', filter: t\.name \}/, '没有房间时退回按团队名筛（仍带 sub）')
+  // 反证：团队卡片不得再出现不带 sub 的跳转
+  assert.doesNotMatch(SOURCE, /onGoto\?\.\('team', \{ filter: t\.name \}\)/, '不得再出现不带 sub 的旧写法')
 })
 
 test('J4 来源跳转（回到消息出处）带 sub:rooms', () => {

@@ -123,7 +123,7 @@ test('C1 Bot 页新增「派任务」「发消息」按钮与弹窗文案', () =
   assert.match(SOURCE, /派任务给「/, '应有「派任务给 <Bot>」弹窗')
   assert.match(SOURCE, /给「[^」]*」发消息/, '应有「给 <Bot> 发消息」弹窗')
   assert.match(SOURCE, /'创建并派活'/, '派任务弹窗应有「创建并派活」')
-  assert.match(SOURCE, /等价于你在这个 Bot 的会话里发一条消息/, '发消息弹窗应解释语义')
+  assert.match(SOURCE, /等价于 Boss 在这个 Bot 的会话里发一条消息/, '发消息弹窗应解释语义')
 })
 
 test('C2 TaskDrawer 新增目标锚 / 补充说明 / 补充历史 / 去对话 / 复制派发文案', () => {
@@ -246,7 +246,7 @@ test('C9 BotAssignModal / BotMessageModal 首渲染不抛且文案正确', () =>
   assert.ok(msgTree && typeof msgTree === 'object', 'BotMessageModal 首渲染应返回元素树')
   const msgText = allText(msgTree)
   assert.match(msgText, /给「后端」发消息/)
-  assert.match(msgText, /等价于你在这个 Bot 的会话里发一条消息/)
+  assert.match(msgText, /等价于 Boss 在这个 Bot 的会话里发一条消息/)
 })
 
 test('C10 RoomTaskCreateModal 首渲染不抛：subject=首行截 80、description=全文+出处', () => {
@@ -1029,7 +1029,11 @@ test('N3 团队页（需求3）：只显示用户团队、负责人有标识、�
   // 可跳房间（用户补充：穿透房间看子团队工作内容）
   // 修正（2026-11-09）：`onGoto('rooms')` 会被 safeGoTab 映射成 'team' 并按
   // **首个子视图**渲染 ⇒ 实际落到「Bot 档案」。必须显式带 sub:'rooms'。
-  assert.match(SOURCE, /onGoto\?\.\('team', \{ sub: 'rooms', filter: t\.name \}\)/, '团队卡片应能跳转房间（落到 rooms 子页签）')
+  // 契约 §3(UI)：有 roomId 就精确选中该房间，没有才退回按团队名筛。
+  assert.match(SOURCE, /\{ sub: 'rooms', roomId: t\.roomId \}/, '有房间时按 roomId 精确选中')
+  assert.match(SOURCE, /\{ sub: 'rooms', filter: t\.name \}/, '没有房间时按团队名筛（仍带 sub）')
+  // 契约 §3(UI)：卡片必须显示房间名
+  assert.match(SOURCE, /🏛 房间：/, '团队卡片必须显示「房间：<名>」')
 })
 
 // ── N4 PDCA 周期分层（需求4）：人跟长任务 + 智能体归纳 ───────────────────────
@@ -1063,13 +1067,15 @@ test('N4 周期页（需求4）：人类周期五步不可跳，智能体周期�
 
 // ── N5 房间页支持定向筛选（需求3 补充：穿透房间看子团队）────────────────────
 
-test('N5 房间页（需求3 补充）：支持「看房间」带 filter，且是前端定向过滤', () => {
+test('N5 房间页（需求3 补充）：支持带 filter 定向过滤，且是前端定向过滤', () => {
   assert.match(SOURCE, /const roomFilter = \(locate\?\.filter \?\? ''\)\.toString\(\)\.trim\(\)/, 'RoomsTab 必须读 locate.filter')
   assert.match(SOURCE, /rooms\.filter\(\(r\) => \(r\.name \?\? ''\)\.toLowerCase\(\)\.includes\(roomFilter\.toLowerCase\(\)\)\)/, '房间列表按名字过滤')
   assert.match(SOURCE, /setLocate\(null\)/, '必须有清掉筛选的入口')
   assert.match(SOURCE, /筛选房间：包含/, '过滤结果要向人说明（不然用户不知道在筛什么）')
   // 修正（2026-11-09）：必须带 sub:'rooms'，否则会被 safeGoTab 落到首个子视图
-  assert.match(SOURCE, /onGoto\?\.\('team', \{ sub: 'rooms', filter: t\.name \}\)/, '团队卡片必须带团队名做筛选，且落到 rooms 子页签')
+  // 契约 §3(UI)：有 roomId ⇒ 精确选中该房间；否则退回按团队名筛（两者都带 sub）。
+  assert.match(SOURCE, /\{ sub: 'rooms', roomId: t\.roomId \}/, '团队卡片有房间时按 roomId 精确选中')
+  assert.match(SOURCE, /\{ sub: 'rooms', filter: t\.name \}/, '团队卡片没有房间时按团队名筛（仍带 sub）')
 })
 
 // ── N6 任务对话面板（需求2）：运行时真的请求 /tasks/conversation 并渲染对话 ──────

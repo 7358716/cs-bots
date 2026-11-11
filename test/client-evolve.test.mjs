@@ -303,8 +303,8 @@ test('E5 EvolveHistory：逐条 [时间] 动作 — 说明（by），并显示�
   const text = allText(tree)
   assert.match(text, /上一轮交付物：a\.md、b\.md（已存档，重开不会丢证据）/)
   assert.match(text, /变更历史（3 条/)
-  assert.match(text, /\] 重开 — 第 3 条标准未满足（ui）/, '格式必须是 [时间] 动作 — 说明（by）')
-  assert.match(text, /\] 派生优化单 — 补接口限流（bot-a）/)
+  assert.match(text, /\] 重开 — 第 3 条标准未满足（Boss）/, '契约 §0：`（ui）` 面向 Boss 要显示 Boss')
+  assert.match(text, /\] 派生优化单 — 补接口限流（bot-a）/, '非 Boss 机器身份保持原文，不美化')
   assert.match(text, /\] 存档上一轮状态 — 上一轮交付物 2 项/, '快照没有 note 时不能空动作')
   assert.match(text, /长任务阶段：1\. 范围与验收标准确认；2\. 执行与自测；3\. 交付与复盘/)
 
@@ -325,7 +325,13 @@ test('E6 evolveActionLabel / evolveChangeText 单位断言', () => {
   assert.equal(exports.evolveActionLabel('weird'), 'weird', '未知 kind 保持原文，不猜')
   assert.match(
     exports.evolveChangeText({ kind: 'reopen', at: 1762000001000, note: '第 3 条标准未满足', by: 'ui' }),
-    /^\[.+\] 重开 — 第 3 条标准未满足（ui）$/,
+    /^\[.+\] 重开 — 第 3 条标准未满足（Boss）$/,
+    '契约 §0：by=ui 面向 Boss 要显示 Boss，不是机器标识 ui',
+  )
+  assert.match(
+    exports.evolveChangeText({ kind: 'reopen', at: 1762000001000, note: '第 3 条标准未满足', by: 'bot-a' }),
+    /^\[.+\] 重开 — 第 3 条标准未满足（bot-a）$/,
+    '非 Boss 机器身份保持原文，不美化',
   )
   assert.match(
     exports.evolveChangeText({ kind: 'reassign', at: 1762000001000, from: 'bot-a', to: 'bot-b' }),

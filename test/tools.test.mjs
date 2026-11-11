@@ -77,7 +77,8 @@ test('工具全部注册成功，且数量与 TOOL_NAMES 一致', () => {
     )
     // PDCA 建设：cycle 4 + metrics 2 + verify 1 + teams 3 = 10 个（28 → 38）；
 // 改造07：subscription 3 个（task_subscribe / unsubscribe / subscriptions）→ 41
-    assert.equal(TOOL_NAMES.length, 41, `工具总数应为 41，实际 ${TOOL_NAMES.length}`)
+// 升级09（契约 §2.4）：阶段产出物 bot_task_phase（纯增量新工具）→ 42
+    assert.equal(TOOL_NAMES.length, 42, `工具总数应为 42，实际 ${TOOL_NAMES.length}`)
   } finally {
     h.cleanup()
   }
@@ -190,6 +191,131 @@ test('未知工具名调用：byName 返回 undefined（测试辅助自身可信
   const h = boot()
   try {
     assert.equal(h.byName('bot_not_a_tool'), undefined)
+  } finally {
+    h.cleanup()
+  }
+})
+
+// ── 阶段产出物（契约 §2.4，纯增量新工具）─────────────────────────────────────
+
+test('bot_task_phase：注入可用时把 patch 交给 phaseWrite 并透传结果', async () => {
+  const h = boot()
+  try {
+    let seen = null
+    // B 侧 installApi 会把 phaseWrite 挂到 services 上；测试直接模拟这个注入点
+    getServices(h.ctx).phaseWrite = (taskId, patch) => {
+      seen = { taskId, patch }
+      return { ok: true, taskId, phases: [] }
+    }
+    const res = await h.call('bot_task_phase', {
+      id: 't-1',
+      index: 0,
+      state: 'done',
+      artifacts: ['docs/a.md'],
+      note: '确认完毕',
+    })
+    assert.equal(res.ok, true, JSON.stringify(res))
+    assert.equal(seen.taskId, 't-1')
+    assert.equal(seen.patch.index, 0)
+    assert.equal(seen.patch.state, 'done')
+    assert.deepEqual(seen.patch.artifacts, ['docs/a.md'])
+    assert.equal(seen.patch.note, '确认完毕')
+    // `by` 是事实留痕：取调用者身份，不猜
+    assert.equal(seen.patch.by, 'probe-session')
+  } finally {
+    h.cleanup()
+  }
+})
+
+test('bot_task_phase：state 缺省为 done；给了 expectedRev 就透传做 CAS', async () => {
+  const h = boot()
+  try {
+    let seen = null
+    getServices(h.ctx).phaseWrite = (taskId, patch) => { seen = patch; return { ok: true } }
+    const res = await h.call('bot_task_phase', { id: 't-9', index: 2, expectedRev: 7 })
+    assert.equal(res.ok, true, JSON.stringify(res))
+    assert.equal(seen.state, 'done', 'state 缺省必须是 done')
+    assert.equal(seen.expectedRev, 7, 'expectedRev 应透传给后端做 CAS')
+    assert.equal(seen.index, 2)
+  } finally {
+    h.cleanup()
+  }
+})
+
+test('bot_task_phase：注入缺失时返回 failure("phase-unavailable")，绝不静默成功', async () => {
+  const h = boot()
+  try {
+    // ⚠️ 为什么必须**显式构造**「注入缺失」，不能指望 boot() 天然没有：
+    //   `boot()` 走的是完整 `apply()`，而 B 侧 `installApi` 会在模块级就把
+    //   `services.phaseWrite` 挂上（src/api.js 的 mountPhaseWrite）。
+    //   于是「ctx 里没有 phaseWrite」这个前提**已经不成立**了 —— 旧写法看起来在
+    //   测降级路径，实际跑的是真实写入路径（t-1 不存在 ⇒ PHASE_TASK_NOT_FOUND）。
+    //   那是「套件假装覆盖了却没覆盖」的典型：测试绿着，降级分支一次没跑。
+    //   ⇒ 这里先断言前提确实存在过，再显式删掉，把 services 还原成
+    //   「后端未就绪」的真状态，让 tools.js 的 `typeof w !== 'function'` 分支真的被执行。
+    const services = getServices(h.ctx)
+    assert.equal(typeof services.phaseWrite, 'function', '前提：installApi 应先挂上 phaseWrite')
+    delete services.phaseWrite
+    assert.equal(typeof services.phaseWrite, 'undefined', '前置：注入必须已被移除，否则本用例无意义')
+
+    const res = await h.call('bot_task_phase', { id: 't-1', index: 0 })
+    assert.equal(res.ok, false, '后端未注入时必须失败，不能静默成功')
+    assert.equal(res.reason, 'phase-unavailable')
+    assert.ok(res.hint && String(res.hint).length > 0, '失败必须带可读 hint')
+  } finally {
+    h.cleanup()
+  }
+})
+
+test('bot_task_phase：注入存在但任务不存在 ⇒ PHASE_TASK_NOT_FOUND（与降级是两回事）', async () => {
+  const h = boot()
+  try {
+    // 这一条走**真实** phaseWrite（installApi 已挂），验证后端业务失败原样透出。
+    // 与上一条的区别：这里是「后端就绪、但这条活不存在」；上一条是「后端根本没就绪」。
+    // 两者都必须是可读失败，但错误码语义不同 —— 不许混成一个断言。
+    const res = await h.call('bot_task_phase', { id: 't-not-exist', index: 0 })
+    assert.equal(res.ok, false, '任务不存在时必须失败')
+    assert.notEqual(res.reason, 'phase-unavailable', '这不是降级路径，后端是就绪的')
+    assert.equal(res.reason, 'PHASE_TASK_NOT_FOUND')
+    assert.ok(res.message && String(res.message).length > 0, '失败必须带可读原因')
+  } finally {
+    h.cleanup()
+  }
+})
+
+test('bot_task_phase：phaseWrite 抛错时返回可读失败（不吞证据）', async () => {
+  const h = boot()
+  try {
+    getServices(h.ctx).phaseWrite = () => {
+      const error = new Error('task-meta 落盘失败')
+      error.code = 'PHASE_WRITE_FAILED'
+      throw error
+    }
+    const res = await h.call('bot_task_phase', { id: 't-1', index: 0 })
+    assert.equal(res.ok, false)
+    assert.equal(res.reason, 'PHASE_WRITE_FAILED')
+    assert.ok(res.message && res.message.includes('task-meta'), '必须带真实错误信息')
+  } finally {
+    h.cleanup()
+  }
+})
+
+test('bot_task_phase：缺 id / index 非法时返回可读失败', async () => {
+  const h = boot()
+  try {
+    getServices(h.ctx).phaseWrite = () => { throw new Error('不该被调用') }
+    const noId = await h.call('bot_task_phase', { index: 0 })
+    assert.equal(noId.ok, false)
+    assert.equal(noId.reason, 'bad-argument')
+    assert.equal(noId.field, 'id')
+
+    const badIndex = await h.call('bot_task_phase', { id: 't-1', index: -1 })
+    assert.equal(badIndex.ok, false)
+    assert.equal(badIndex.field, 'index')
+
+    const badState = await h.call('bot_task_phase', { id: 't-1', index: 0, state: 'done-ish' })
+    assert.equal(badState.ok, false)
+    assert.equal(badState.field, 'state')
   } finally {
     h.cleanup()
   }

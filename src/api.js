@@ -12,15 +12,15 @@
  *   - **前缀路由**：`/cs-bots/api`（与包名一致，避免和其他插件撞路径）。
  */
 
-import { readFileSync, readdirSync, statSync, existsSync } from 'node:fs'
+import { readFileSync, readdirSync, statSync, existsSync, writeFileSync, renameSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { join, resolve, sep as pathSep } from 'node:path'
-import { registerRoute, listPresets, defaultPreset, getAgent, resumeSession, readSessionMessages, attachToWorkspace, readSessionWatermark } from './kernel.js'
+import { registerRoute, listPresets, defaultPreset, getAgent, resumeSession, readSessionMessages, attachToWorkspace, readSessionWatermark, sessionMeta } from './kernel.js'
 import { createLibrary } from './library.js'
 import { createDirBrowser } from './dirbrowse.js'
 import { getServices } from './registry.js'
 import { createFence } from './fence.js'
-import { appendJsonl, readJsonl, statePath } from './store.js'
+import { appendJsonl, readJsonl, statePath, backupState, migrate, readSchemaVersion, writeSchemaVersion } from './store.js'
 import { deriveStage, attachStages, stageSummary } from './stage.js'
 import { CMD_WHITELIST } from './verify.js'
 import { execFile } from 'node:child_process'
@@ -474,6 +474,229 @@ function normalizePhases(raw, code = 'EVOLVE_BAD_PHASES') {
   })
 }
 
+// ══════════════════════════════════════════════════════════════════════════
+// 升级09 · 阶段产出物（契约 §2.2 / §2.3 / §4.2）
+//
+// 一句话：长任务的阶段清单存在 `kind:'longrun'` 行里，执行者每交一个阶段的
+// 产出物就追加一条 `kind:'phase'` 行。清单与产物**分开存**是刻意的——
+// Boss 改阶段清单（§4.2）不该动已经交出来的证据。
+// ══════════════════════════════════════════════════════════════════════════
+
+/** 阶段状态（写入端合法值；读取端另有 `pending` = 「未开始」，见 buildPhaseView）。 */
+const PHASE_STATES = ['doing', 'done', 'blocked']
+/** 单阶段产出物条数上限 / 单项长度上限（契约 §2.3）。 */
+const PHASE_ARTIFACTS_MAX = 50
+const PHASE_ARTIFACT_MAX = 2000
+/** 阶段说明长度上限（契约未写死，取与产出物同档的保守值）。 */
+const PHASE_NOTE_MAX = 2000
+
+/**
+ * 构造一个带 HTTP 状态码的错误（HTTP 与工具面共用同一份，**不写两套判定**）。
+ * @param {string} message @param {number} status @param {string} code
+ */
+function phaseError(message, status, code) {
+  const error = new Error(message)
+  error.status = status
+  error.code = code
+  return error
+}
+
+/**
+ * 归一化单阶段的产出物清单（契约 §2.3）。
+ *
+ * 规则：去空、去重、最多 50 项、每项 ≤ 2000 字。
+ * **超限选择报错而不是静默截断**：产出物是证据，悄悄丢掉一条比拒绝写入更糟。
+ * @param {unknown} list
+ * @returns {string[]}
+ */
+function normalizePhaseArtifacts(list) {
+  if (list === undefined || list === null) return []
+  if (!Array.isArray(list)) {
+    throw phaseError('artifacts 必须是字符串数组（也可以不传）', 400, 'PHASE_BAD_ARTIFACTS')
+  }
+  const items = normalizeArtifactItems(list)
+    .map((item) => item.trim())
+    .filter((item) => item !== '')
+  if (items.length > PHASE_ARTIFACTS_MAX) {
+    throw phaseError(
+      `artifacts 最多 ${PHASE_ARTIFACTS_MAX} 项（收到 ${items.length} 项）——请合并或分批汇报`,
+      400,
+      'PHASE_BAD_ARTIFACTS',
+    )
+  }
+  const seen = new Set()
+  const out = []
+  for (const item of items) {
+    if (Array.from(item).length > PHASE_ARTIFACT_MAX) {
+      throw phaseError(
+        `artifacts 单项最多 ${PHASE_ARTIFACT_MAX} 字（收到 ${Array.from(item).length} 字）——请放路径/链接，不要塞整篇内容`,
+        400,
+        'PHASE_BAD_ARTIFACTS',
+      )
+    }
+    if (seen.has(item)) continue
+    seen.add(item)
+    out.push(item)
+  }
+  return out
+}
+
+/** 读某任务的阶段产出物行（按 `at` 升序；同 index 后写的胜出）。 */
+function readPhaseRows(services, taskId) {
+  const rows = readTaskMeta(services, taskId).filter(
+    (row) => row.kind === 'phase'
+      && Number.isInteger(row.index)
+      && row.index >= 0,
+  )
+  const byIndex = new Map()
+  for (const row of rows) byIndex.set(row.index, row) // 顺序已按 at 升序 ⇒ 后写覆盖前写
+  return byIndex
+}
+
+/**
+ * 拼出契约 §2.2 的完整视图（HTTP 读端点与写端点的回填共用同一份）。
+ *
+ * @param {object} services
+ * @param {object} task board 任务快照
+ * @returns {{ taskId: string, phases: object[], currentIndex: number,
+ *             totalArtifacts: number, isLongrun: boolean, note: string }}
+ */
+function buildPhaseView(services, task) {
+  const longrun = readLongrunMeta(services, task.id)
+  const titles = longrunPhaseList(longrun)
+  const isLongrun = Boolean(longrun)
+  if (!isLongrun) {
+    return {
+      taskId: task.id,
+      phases: [],
+      currentIndex: 0,
+      totalArtifacts: 0,
+      isLongrun: false,
+      note: '这不是长任务，没有分阶段产物；总产出物见下方',
+    }
+  }
+  const byIndex = readPhaseRows(services, task.id)
+  // 只剩「清单里还存在的下标」：Boss 把清单改短后，越界的旧产物行**保留但不展示**
+  // （契约 §4.2 —— 不删证据，只是不再显示）。
+  const phases = titles.map((title, index) => {
+    const row = byIndex.get(index)
+    return {
+      index,
+      title,
+      // 没汇报过的阶段给 `pending`（UI 徽标「未开始」）—— 不伪造成 doing/done
+      state: PHASE_STATES.includes(row?.state) ? row.state : 'pending',
+      artifacts: Array.isArray(row?.artifacts) ? [...row.artifacts] : [],
+      note: typeof row?.note === 'string' ? row.note : '',
+      by: typeof row?.by === 'string' ? row.by : null,
+      at: Number.isFinite(Number(row?.at)) ? Number(row.at) : null,
+    }
+  })
+  const firstUnfinished = phases.findIndex((phase) => phase.state !== 'done')
+  const totalArtifacts = phases.reduce((sum, phase) => sum + phase.artifacts.length, 0)
+  const doneCount = phases.filter((phase) => phase.state === 'done').length
+  return {
+    taskId: task.id,
+    phases,
+    currentIndex: firstUnfinished === -1 ? phases.length : firstUnfinished,
+    totalArtifacts,
+    isLongrun: true,
+    note: `长任务共 ${phases.length} 个阶段，已完成 ${doneCount} 个；共 ${totalArtifacts} 个阶段产出物`,
+  }
+}
+
+/**
+ * 写一条阶段产出物（契约 §2.3）。
+ *
+ * **单一实现**：HTTP `POST /tasks/phase` 与工具 `bot_task_phase`（C 的 tools.js）
+ * 都走这里 —— 两处各写一遍，早晚漂移成「页面能写、Bot 写不进」这种鬼故事。
+ *
+ * @param {object} services 域服务集合（需 board）
+ * @param {string} taskId
+ * @param {{ index: number, state?: string, artifacts?: string[], note?: string,
+ *           by?: string, expectedRev?: number }} patch
+ * @returns {{ ok: true, taskId: string, phase: object, phases: object[],
+ *             currentIndex: number, totalArtifacts: number, isLongrun: boolean }}
+ */
+function writePhaseRow(services, taskId, patch = {}) {
+  if (typeof taskId !== 'string' || taskId.trim() === '') {
+    throw phaseError('id 必填（任务 id，如 t-36）', 400, 'PHASE_MISSING_ID')
+  }
+  const id = taskId.trim()
+  const board = services?.board
+  if (!board || typeof board.get !== 'function') {
+    throw phaseError('board 服务未装配（无法校验任务与阶段清单）', 503, 'BOARD_UNAVAILABLE')
+  }
+  const task = board.get(id)
+  if (!task) throw phaseError(`任务 ${id} 不存在`, 404, 'PHASE_TASK_NOT_FOUND')
+
+  const longrun = readLongrunMeta(services, id)
+  const titles = longrunPhaseList(longrun)
+  if (!longrun || titles.length === 0) {
+    throw phaseError(
+      `任务 ${id} 不是长任务（没有阶段清单）——请先在「转长任务」里定阶段，或用「编辑阶段清单」设置`,
+      400,
+      'PHASE_NOT_LONGRUN',
+    )
+  }
+
+  // ── CAS（可选）：给了 expectedRev 就必须对得上，不匹配绝不静默覆盖 ──
+  if (patch.expectedRev !== undefined && patch.expectedRev !== null) {
+    if (!Number.isInteger(patch.expectedRev)) {
+      throw phaseError(`expectedRev 必须是整数（当前 rev=${task.rev}）`, 400, 'PHASE_BAD_FIELD')
+    }
+    if (patch.expectedRev !== task.rev) {
+      throw phaseError(
+        `CAS 冲突：任务 ${id} 期望 rev=${patch.expectedRev}，实际 rev=${task.rev} —— 拒绝静默覆盖，请刷新后重试`,
+        409,
+        'PHASE_REV_CONFLICT',
+      )
+    }
+  }
+
+  const index = patch.index
+  if (!Number.isInteger(index)) {
+    throw phaseError(`index 必须是整数（当前合法范围 0..${titles.length - 1}）`, 400, 'PHASE_BAD_INDEX')
+  }
+  if (index < 0 || index > titles.length - 1) {
+    throw phaseError(
+      `index=${index} 越界：合法范围是 0..${titles.length - 1}`
+        + `（当前阶段清单共 ${titles.length} 个阶段：${titles.map((t, i) => `${i}=${t}`).join('；')}）`,
+      400,
+      'PHASE_BAD_INDEX',
+    )
+  }
+
+  const state = patch.state === undefined || patch.state === null ? 'done' : patch.state
+  if (!PHASE_STATES.includes(state)) {
+    throw phaseError(
+      `state=${JSON.stringify(patch.state)} 非法（合法：${PHASE_STATES.join(' | ')}）`,
+      400,
+      'PHASE_BAD_STATE',
+    )
+  }
+
+  const artifacts = normalizePhaseArtifacts(patch.artifacts)
+  let note = ''
+  if (patch.note !== undefined && patch.note !== null) {
+    if (typeof patch.note !== 'string') {
+      throw phaseError('note 必须是字符串（也可以不传）', 400, 'PHASE_BAD_NOTE')
+    }
+    note = patch.note.trim()
+    if (Array.from(note).length > PHASE_NOTE_MAX) {
+      throw phaseError(`note 最多 ${PHASE_NOTE_MAX} 字（收到 ${Array.from(note).length} 字）`, 400, 'PHASE_BAD_NOTE')
+    }
+  }
+  const by = typeof patch.by === 'string' && patch.by.trim() ? patch.by.trim() : 'ui'
+  const at = Date.now()
+
+  // 落盘失败 ⇒ appendTaskMeta 抛 503（**绝不静默丢证据**）
+  appendTaskMeta(services, { kind: 'phase', taskId: id, index, state, artifacts, note, by, at })
+
+  const view = buildPhaseView(services, task)
+  return { ok: true, taskId: id, phase: view.phases[index], phases: view.phases,
+    currentIndex: view.currentIndex, totalArtifacts: view.totalArtifacts, isLongrun: view.isLongrun }
+}
+
 /** 变更**前**的任务快照（契约 §2.2 reopen 步骤 1）。 */
 function buildTaskSnapshot(task) {
   return {
@@ -907,6 +1130,620 @@ function buildExecutorStatus(ctx, services, task) {
  * @param {string} by 谁触发的（用于留痕）
  * @returns {Promise<{ team?: object, created?: boolean, reason?: string } | undefined>}
  */
+// ════════════════════════════════════════════════════════════════════════════
+// 升级接续（契约 §8.2）：预检 / 迁移
+// ════════════════════════════════════════════════════════════════════════════
+
+/** 升级 09 落地的 schema 版本（0 = 升级前，2 = 本版）。 */
+const UPGRADE_SCHEMA_TO = 2
+/**
+ * 「Boss 本人」的身份集合。
+ * `user` 是 api.js 的 OWNER，`ui` 是页面层，`person` 是 board 里的人口径 ——
+ * 三者在旧数据里都代表「Boss 亲手做的」，判定必须一起认，否则迁移会漏。
+ */
+const BOSS_IDS = new Set(['ui', 'user', 'person'])
+/** 契约 §8.2 强制的回填备注原文（一个字都不能改，验收要 grep）。 */
+const UPGRADE_PHASE_NOTE = '升级迁移：按总产出物回填'
+
+/** 某身份是不是 Boss。 */
+function isBossId(id) {
+  return typeof id === 'string' && BOSS_IDS.has(id)
+}
+
+/**
+ * 读迁移要用到的全部原始事实（**只读**，绝不写盘）。
+ *
+ * ## 为什么单独抽出来
+ *   `preflight`（只读体检）与 `migrate`（真写）必须基于**同一份判定**，
+ *   否则「预检说会补 3 条、迁移后补了 5 条」这种前后不一致会直接毁掉 Boss 的信任。
+ */
+function collectUpgradeFacts(services) {
+  const dir = anchorStateDir(services) ?? null
+  const facts = {
+    stateDir: dir,
+    boardFile: dir ? statePath(dir, 'board.jsonl') : null,
+    metaFile: dir ? statePath(dir, TASK_META_FILE) : null,
+    notesFile: dir ? statePath(dir, TASK_NOTES_FILE) : null,
+    wakesFile: dir ? statePath(dir, 'wakes.jsonl') : null,
+    boardEvents: [],
+    boardBad: 0,
+    metaRows: [],
+    metaBad: 0,
+    notes: 0,
+    wakes: 0,
+    tasks: [],
+    tasksSource: 'memory',
+  }
+  if (!dir) return facts
+
+  // 事件流（真相源）。坏行**不静默**：交给 store.migrate 去拒绝不完整数据。
+  if (facts.boardFile && existsSync(facts.boardFile)) {
+    const parsed = readJsonl(facts.boardFile)
+    facts.boardEvents = parsed.rows
+    facts.boardBad = parsed.bad ?? 0
+  }
+  if (facts.metaFile && existsSync(facts.metaFile)) {
+    const parsed = readJsonl(facts.metaFile)
+    facts.metaRows = parsed.rows
+    facts.metaBad = parsed.bad ?? 0
+  }
+  if (facts.notesFile && existsSync(facts.notesFile)) {
+    facts.notes = readJsonl(facts.notesFile).rows.length
+  }
+  if (facts.wakesFile && existsSync(facts.wakesFile)) {
+    facts.wakes = readJsonl(facts.wakesFile).rows.length
+  }
+
+  // 任务态：优先用内存（已 hydrate 的最新态）；事件流存在但内存为空 ⇒ 退回落盘推演。
+  try {
+    const live = services?.board?.list?.({}) ?? []
+    if (Array.isArray(live) && live.length > 0) facts.tasks = live
+  } catch { /* 落到下面的推演 */ }
+  if (facts.tasks.length === 0 && facts.boardEvents.length > 0) {
+    facts.tasksSource = 'jsonl'
+    const byId = new Map()
+    for (const ev of facts.boardEvents) {
+      if (ev && typeof ev.taskId === 'string' && ev.after && typeof ev.after.id === 'string') {
+        byId.set(ev.taskId, ev.after)
+      }
+    }
+    facts.tasks = [...byId.values()]
+  }
+  return facts
+}
+
+/** 某任务是否「Boss 碰过」—— 契约 §8.2：`createdBy` / `mandate.sender` / 历史 `byId`。 */
+function bossTouchedOf(facts, services, task) {
+  if (isBossId(task?.createdBy)) return true
+  if (isBossId(task?.mandate?.sender)) return true
+  // 历史（内存里有 history 就查内存，否则查事件流）
+  if (typeof services?.board?.history === 'function') {
+    try {
+      const rows = services.board.history(task.id)
+      if (Array.isArray(rows) && rows.some((e) => isBossId(e?.byId))) return true
+    } catch { /* 落到事件流 */ }
+  }
+  return facts.boardEvents.some((e) => e?.taskId === task.id && isBossId(e?.byId))
+}
+
+/** 任务详情里「旧数据没有」的字段（契约 §8.1 的兼容读清单）。 */
+const LEGACY_CANDIDATES = Object.freeze([
+  'bossTouched', 'progress', 'labels', 'writeScopes', 'triaged', 'blockedBy', 'progressBy',
+])
+
+/** 汇总「哪些旧字段缺、缺多少条」—— 这是 preflight 里 Boss 最需要看的那一段。 */
+function legacyFieldReport(tasks) {
+  const out = []
+  for (const field of LEGACY_CANDIDATES) {
+    let missing = 0
+    for (const task of tasks) if (task?.[field] === undefined) missing += 1
+    if (missing > 0) out.push({ field, missing, total: tasks.length })
+  }
+  return out
+}
+
+/**
+ * 升级预检（契约 §8.2 `GET /upgrade/preflight`）—— **只读，一个字节都不写**。
+ *
+ * 回答 Boss 三个问题：现在有多少数据？升级会动什么？有什么风险？
+ */
+function upgradePreflight(services) {
+  const facts = collectUpgradeFacts(services)
+  const tasks = facts.tasks
+
+  let needBoss = 0
+  for (const task of tasks) {
+    if (task?.bossTouched !== true && bossTouchedOf(facts, services, task)) needBoss += 1
+  }
+
+  // 「已完成的长任务但没有阶段行」= 契约 §8.2 第 2 条要回填的那批
+  const longrunTasks = tasks.filter((t) => t && readLongrunMeta(services, t.id))
+  const phaseRowsByTask = new Map()
+  for (const row of facts.metaRows) {
+    if (row?.kind !== 'phase' || typeof row.taskId !== 'string') continue
+    phaseRowsByTask.set(row.taskId, (phaseRowsByTask.get(row.taskId) ?? 0) + 1)
+  }
+  const needPhase = longrunTasks.filter(
+    (t) => t.status === 'completed' && (phaseRowsByTask.get(t.id) ?? 0) === 0,
+  ).length
+
+  const willDo = []
+  if (needBoss > 0) willDo.push(`为 ${needBoss} 个任务补 bossTouched`)
+  if (needPhase > 0) willDo.push(`为 ${needPhase} 个已完成长任务按总产出物回填阶段产物`)
+  if (tasks.length > 0) willDo.push(`把 board 事件流 schema 版本记到 ${UPGRADE_SCHEMA_TO}（现有任务 rev/id/字段原样保留）`)
+  if (willDo.length === 0) willDo.push('无需迁移：数据已是新版形态')
+
+  // 风险：只说真的会挡路的那几条，不凑数
+  const risks = []
+  if (facts.boardBad > 0) {
+    risks.push(`board.jsonl 有 ${facts.boardBad} 行无法解析（撕裂写/损坏）——迁移会拒绝在不完整数据上动手，请先修文件`)
+  }
+  if (facts.metaBad > 0) {
+    risks.push(`task-meta.jsonl 有 ${facts.metaBad} 行无法解析——阶段产物回填可能漏读，建议先备份核对`)
+  }
+  if (!facts.stateDir) risks.push('状态目录不可用：既不能预检也不能迁移')
+  if (facts.tasksSource === 'jsonl') risks.push('内存里没有任务（板尚未 hydrate）——本报告由事件流推演，迁移前建议先重启一次让板加载完整')
+  if (risks.length === 0) risks.push('无阻塞风险（迁移前仍会自动整目录备份）')
+
+  return {
+    ok: true,
+    stateDir: facts.stateDir,
+    schemaVersion: facts.stateDir ? readSchemaVersion(facts.stateDir, 'board') : 0,
+    targetVersion: UPGRADE_SCHEMA_TO,
+    counts: {
+      tasks: tasks.length,
+      longrun: longrunTasks.length,
+      phaseRows: facts.metaRows.filter((r) => r?.kind === 'phase').length,
+      notes: facts.notes,
+      wakes: facts.wakes,
+      boardEvents: facts.boardEvents.length,
+      bossTouched: tasks.filter((t) => t?.bossTouched === true).length,
+    },
+    legacy: legacyFieldReport(tasks),
+    willDo,
+    risks,
+    backupHint: facts.stateDir
+      ? `迁移前会自动整目录备份到 ${facts.stateDir}.bak-<时间>-upgrade09；要手动回滚就 restoreState(stateDir, 备份路径, { confirm: true })`
+      : '状态目录不可用，无法备份',
+  }
+}
+
+/**
+ * 升级迁移（契约 §8.2 `POST /upgrade/migrate`）—— 幂等、先备份、**保留 rev/id/字段**。
+ *
+ * ## 为什么不能「重写整个 board 文件」
+ *   `board.jsonl` 是 CAS 幂等键与 rev 语义的真相源。若整体覆盖重写，
+ *   稍有字段遗漏就会让任务的 `rev` 与前端拿到的对不上 —— Boss 需求 9
+ *   「任务原样存活」当场破功。所以这里**逐条合并**：只往事件里补缺失字段，
+ *   `rev` / `id` / 其余字段**一个字不动**，然后用 `store.migrate` 原子写回。
+ *
+ * ## 幂等
+ *   schema 版本已是目标值 ⇒ `store.migrate` 返回 `migrated:false`，不重写文件；
+ *   阶段回填按「该任务是否已有 phase 行」判定，第二次跑必然是 0 条。
+ *
+ * ## 失败
+ *   先 `backupState()`。任何一步失败都返回明确理由 + 备份路径，
+ *   让 Boss 能一键回滚，而不是卡在「写了一半」的状态。
+ *
+ * @returns {Promise<object>}
+ */
+async function upgradeMigrate(services, by) {
+  const facts = collectUpgradeFacts(services)
+  if (!facts.stateDir) {
+    const error = new Error('状态目录不可用：无法备份，拒绝迁移')
+    error.status = 500
+    error.code = 'UPGRADE_NO_STATE_DIR'
+    throw error
+  }
+
+  // ① 先备份（契约硬要求）。备份失败 ⇒ 一个字节都不动。
+  //
+  // ⚠️ label 带上次幂等迁移的计数：`store.backupState` 的目标路径只精确到**秒**
+  //（`<dir>.bak-YYYYMMDD-HHmmss-<label>`），同一秒内跑两次迁移会**覆盖同一份备份** ——
+  //   第二次就把「升级前的原始状态」盖成「升级后的状态」，回滚点当场消失。
+  //   所以这里按「本次真正要动的任务数 + 当前毫秒」做标签，保证两次备份路径必不相同。
+  const backupTag = `upgrade09-${facts.tasks.length}-${Date.now()}`
+  const backup = backupState(facts.stateDir, backupTag)
+  if (!backup?.ok) {
+    const error = new Error(`迁移中止：备份失败（${backup?.reason ?? '未知原因'}）——未写入任何改动`)
+    error.status = 500
+    error.code = 'UPGRADE_BACKUP_FAILED'
+    throw error
+  }
+
+  const report = {
+    ok: true,
+    backupPath: backup.path,
+    bossTouched: { updated: 0, skipped: 0 },
+    phases: { backfilled: 0, tasks: [] },
+    schema: null,
+    replayed: null,
+  }
+
+    // ② bossTouched 回填：逐条合并进**每个任务的最后一条事件**的 `after`，
+  //    rev/id/其它字段原样保留（这是「不破坏 rev 语义」的关键）。
+  const needBoss = new Map()
+  for (const task of facts.tasks) {
+    if (!task || typeof task.id !== 'string') continue
+    if (task.bossTouched === true) { report.bossTouched.skipped += 1; continue }
+    const touched = bossTouchedOf(facts, services, task)
+    if (touched) needBoss.set(task.id, true)
+    else needBoss.set(task.id, false)
+  }
+
+  // 只对「确实要补 true」的任务动手；判 false 的不写（少改动 = 少风险）
+  const targets = new Set([...needBoss.entries()].filter(([, v]) => v === true).map(([k]) => k))
+
+  if (facts.boardEvents.length === 0) {
+    // 快照-only 的状态目录（没有 board.jsonl）：**不建空 jsonl**。
+    // `store.migrate` 会写出一个空的真相源文件，虽然 hydrate 仍会回落到快照，
+    // 但「空 jsonl + 有快照」是后续所有操作的雷区（任何一次 jsonl 写入都会以
+    // 「空板」为基线）。这里直接记 schema 版本，并把这件事报给 Boss。
+    const ver = facts.stateDir ? writeSchemaVersion(facts.stateDir, 'board', UPGRADE_SCHEMA_TO) : false
+    report.schema = { ok: true, migrated: false, version: ver ? UPGRADE_SCHEMA_TO : readSchemaVersion(facts.stateDir, 'board'), skipped: '无 board.jsonl（快照-only），仅记录 schema 版本' }
+    if (targets.size > 0) report.bossTouched.pending = targets.size
+  } else {
+    // 把「每个任务的最后一条事件」的行号先算出来（只认字段齐全的事件）
+    const lastIndex = new Map()
+    facts.boardEvents.forEach((ev, index) => {
+      if (ev && typeof ev.taskId === 'string' && ev.after && typeof ev.after.id === 'string') {
+        lastIndex.set(ev.taskId, index)
+      }
+    })
+    const currentVersion = readSchemaVersion(facts.stateDir, 'board')
+
+    if (targets.size > 0) {
+      // ⚠️ 为什么这里可能**不能**直接走 store.migrate：它是版本门控的 ——
+      //   当前版本已等于 to 时它直接 `migrated:false` 且**完全不调 migrateFn**。
+      //   首次迁移跑完后 schema 已是 v2，此时若**又新增**了 Boss 建的任务
+      //   （新任务没有 bossTouched），再跑迁移就会被版本门挡掉 ⇒ 永远补不上。
+      //   所以：版本还没到 v2 时走 store.migrate（复用它的原子写 + 坏行保护）；
+      //   版本已到 v2 但仍有要补的任务 ⇒ 必须绕过门控自己写，否则静默漏补。
+      const merge = (rows) => {
+        for (let i = 0; i < rows.length; i += 1) {
+          const ev = rows[i]
+          if (!ev || !targets.has(ev.taskId)) continue
+          if (lastIndex.get(ev.taskId) !== i) continue
+          if (!ev.after || typeof ev.after !== 'object') continue
+          if (ev.after.bossTouched === true) continue
+          // ⚠️ 只加一个字段；rev / id / 其余字段**一律不动**
+          ev.after.bossTouched = true
+          report.bossTouched.updated += 1
+        }
+        return rows
+      }
+
+      if (currentVersion === UPGRADE_SCHEMA_TO) {
+        // ⚠️ 绕门控前必须自查坏行（等价于 store.migrate 内部那道抛错保护）。
+        //    原因：`facts.boardEvents` 来自 `readJsonl()`，它**会跳过解析不了的坏行**
+        //    只把条数记进 `facts.boardBad`。下面是把整份事件流在内存里改完再整体重写，
+        //    一旦文件里真有坏行，坏行会被**永久抹掉** —— 而这条分支恰恰是最常走的
+        //    （schema 已 v2 之后每次迁移都走它）。宁可拒绝，也不静默丢证据。
+        if (facts.boardBad > 0) {
+          const error = new Error(
+            `迁移中止：board.jsonl 有 ${facts.boardBad} 行无法解析——`
+            + '拒绝在不完整数据上重写（否则坏行会被永久抹掉）。'
+            + `请先修文件，或从备份 ${backup.path} 恢复。未写入任何改动。`,
+          )
+          error.status = 500
+          error.code = 'UPGRADE_BAD_ROWS'
+          throw error
+        }
+        // 绕门控：按 store.migrate 的同一套原子写形态（tmp → rename）改回去
+        const jsonlPath = statePath(facts.stateDir, 'board.jsonl')
+        const nextRows = merge(facts.boardEvents.slice())
+        const tmp = `${jsonlPath}.tmp-upgrade09`
+        writeFileSync(tmp, nextRows.map((r) => JSON.stringify(r)).join('\n') + (nextRows.length ? '\n' : ''), 'utf8')
+        renameSync(tmp, jsonlPath)
+        report.schema = { ok: true, migrated: true, version: UPGRADE_SCHEMA_TO, bypassedVersionGate: true }
+        report.bossTouched.bypassedGate = true
+      } else {
+        report.schema = migrate(facts.stateDir, {
+          name: 'board',
+          to: UPGRADE_SCHEMA_TO,
+          migrateFn: merge,
+        })
+      }
+    } else {
+      // 没有要补的任务，但仍要把 schema 版本记上（幂等：已是最新则不改文件）
+      report.schema = migrate(facts.stateDir, {
+        name: 'board', to: UPGRADE_SCHEMA_TO, migrateFn: (rows) => rows,
+      })
+    }
+  }
+
+  // ③ 已完成长任务 + 没有任何 phase 行 ⇒ 按 task.artifacts 回填一条末阶段产物
+  const phaseRowsByTask = new Map()
+  for (const row of facts.metaRows) {
+    if (row?.kind !== 'phase' || typeof row.taskId !== 'string') continue
+    phaseRowsByTask.set(row.taskId, (phaseRowsByTask.get(row.taskId) ?? 0) + 1)
+  }
+  for (const task of facts.tasks) {
+    if (!task || task.status !== 'completed') continue
+    if ((phaseRowsByTask.get(task.id) ?? 0) > 0) continue   // 契约：已有 phase 行不动
+    const longrun = readLongrunMeta(services, task.id)
+    const titles = longrunPhaseList(longrun)
+    if (titles.length === 0) continue
+    const artifacts = Array.isArray(task.artifacts) ? task.artifacts.filter(
+      (a) => typeof a === 'string' && a.trim() !== '',
+    ) : []
+    const record = {
+      kind: 'phase',
+      taskId: task.id,
+      index: titles.length - 1,
+      state: 'done',
+      artifacts,
+      note: UPGRADE_PHASE_NOTE,
+      by: by,
+      at: Date.now(),
+    }
+    if (!appendJsonl(facts.metaFile, record)) {
+      const error = new Error(
+        `迁移中止：阶段产物回填落盘失败（${facts.metaFile}）——`
+        + `已备份在 ${backup.path}，可用 restoreState 回滚`,
+      )
+      error.status = 500
+      error.code = 'UPGRADE_PHASE_APPEND_FAILED'
+      throw error
+    }
+    report.phases.backfilled += 1
+    report.phases.tasks.push(task.id)
+  }
+
+  // ④ 内存态跟磁盘对齐：迁移改了事件流，板必须重放，否则后续快照会用旧内存覆盖认知
+  try {
+    if (typeof services?.board?.replay === 'function') report.replayed = services.board.replay()
+  } catch (error) {
+    report.replayError = `迁移已落盘，但内存重放失败：${error?.message ?? error}——建议重启以加载完整状态`
+  }
+
+  return report
+}
+
+/**
+ * 给团队自动配一个「议事厅」（契约 §3）。
+ *
+ * ## 为什么
+ *   建了团队却没人知道去哪儿说话 —— 团队页只是名单，真正的协作发生在房间。
+ *   所以建团队时顺手把房间建好、把人拉全、把关联记到团队上。
+ *
+ * ## 失败不阻断
+ *   房间服务未装配、房间重名、房间目录不可写……都只回 `roomError` 一句人话。
+ *   **团队已经建成了**，因为「房间没配上」就回滚团队，等于用次要功能否掉主要功能。
+ *
+ * ## mode 必须是 admin
+ *   `room.js` 只在 `mode:'admin'` 下接受 `adminId`（`everyone` 里传会直接
+ *   `ROOM_ADMIN_ID_NOT_APPLICABLE`）。契约要求 `adminId = leadId`，
+ *   所以这里固定用 admin 模式 —— 议事厅由负责人主持，语义也对。
+ *
+ * @param {object} services
+ * @param {object} team teams.create 的返回值（含 id / name / leadId / members）
+ * @param {string} by
+ * @returns {{ room?: object, roomError?: string, attached?: boolean }}
+ */
+async function ensureTeamRoom(services, team, by) {
+  if (!team || typeof team.id !== 'string') return {}
+  const roomSvc = services?.room
+  if (!roomSvc || typeof roomSvc.create !== 'function') {
+    return { roomError: '房间服务未装配（services.room 缺失）——团队已建好，可稍后在房间页手动建' }
+  }
+
+  // 幂等：团队已有关联房间 ⇒ 不重复建（重复调 /teams 保存不该刷出一串议事厅）
+  if (typeof team.roomId === 'string' && team.roomId) {
+    try {
+      const existing = await roomSvc.get(team.roomId)
+      if (existing) return { room: { id: existing.id, name: existing.name }, attached: false }
+    } catch { /* 房间没了就往下重建 */ }
+  }
+
+  const lead = team.leadId
+  const roomName = `${team.name} · 议事厅`
+  // 负责人必须在成员里（admin 模式下 he 是唯一能发言的人；不在成员表里就等于没人能说话）
+  const members = [...new Set([...(lead ? [lead] : []), ...(Array.isArray(team.members) ? team.members : [])])]
+
+  try {
+    const room = await roomSvc.create({
+      name: roomName,
+      members,
+      mode: 'admin',
+      ...(lead ? { adminId: lead } : {}),
+      purpose: `团队「${team.name}」的自动议事厅：负责人主持，成员在此对齐`,
+      byId: by,
+    })
+    // 关联落库（失败只告警：房间已经能用，关联丢了顶多下次再建一间）
+    let attachError
+    if (services.teams && typeof services.teams.attachRoom === 'function') {
+      try {
+        await services.teams.attachRoom({ id: team.id, roomId: room.id, by })
+      } catch (error) {
+        attachError = `议事厅已建好（${room.id}）但未能记到团队上：${error?.message ?? error}`
+      }
+    }
+    return {
+      room: { id: room.id, name: room.name },
+      attached: !attachError,
+      ...(attachError ? { roomError: attachError } : {}),
+    }
+  } catch (error) {
+    return {
+      roomError: `自动建议事厅失败：${error?.message ?? error}`
+        + '——团队已建好，去「房间」页手动建一个并在团队页关联即可',
+    }
+  }
+}
+
+/**
+ * 发消息/唤醒时的「自动激活」（契约 §7.2）。
+ *
+ * ## 现场
+ *   Boss 给一个停在 pending 的任务发补充说明，说明存下来了、也唤醒了执行者，
+ *   但任务状态还是 pending —— 因为**没人接活**，执行者收到消息也没活可干；
+ *   已经 in_progress 的任务则因为租约到期被系统收回，Boss 一发消息就发现
+ *   「怎么又变回待领了」。两件事的共同点是：**人发了消息，机器没有跟着动**。
+ *
+ * ## 做法
+ *   - `in_progress` + 有负责人 ⇒ 自动续租（心跳）。失败**不回滚**刚存的补充说明
+ *     （说明是人的话，不能因为续租失败就丢掉），只把原因回给页面。
+ *   - `pending` + 有负责人 ⇒ 自动接活（claim），成功后由调用方继续唤醒。
+ *   - `blocked` ⇒ **不自动解除**（解除阻塞是人的判断，不是机器的），
+ *     只回一句「需要先解除阻塞」。
+ *
+ * 租约本身保留（不引入新状态），只是页面不再把它当回事。
+ *
+ * @param {object} services
+ * @param {object} task board 任务快照
+ * @param {string} by 操作者
+ * @returns {Promise<{ claimed?: object, heartbeat?: object, reason?: string }>}
+ */
+async function autoActivate(services, task, by) {
+  const out = {}
+  if (!task || typeof task.id !== 'string') return out
+  const board = services?.board
+  if (!board || typeof board.update !== 'function') {
+    return { reason: 'board 服务未装配，无法自动激活' }
+  }
+  const ownerId = task.ownerId ?? task.assignee ?? null
+  if (!ownerId) {
+    return { reason: '任务还没有负责人，先指派给一个 Bot 才能自动激活' }
+  }
+
+  // blocked：**绝不自动解除** —— 解除阻塞是人的判断
+  if (task.status === 'blocked') {
+    return { reason: '任务处于阻塞状态，需要先解除阻塞：点「解除阻塞」，再发消息' }
+  }
+  if (task.status === 'completed' || task.status === 'deleted') {
+    return { reason: `任务已${task.status === 'completed' ? '完成' : '删除'}，无需激活` }
+  }
+
+  // ① 已在进行中：续租（心跳）。失败不改变任何已落盘的事实。
+  if (task.status === 'in_progress' && task.lease) {
+    try {
+      await board.update({ id: task.id, expectedRev: task.rev, action: 'heartbeat', byId: ownerId })
+      return { heartbeat: { ownerId, ok: true } }
+    } catch (error) {
+      return {
+        heartbeat: { ownerId, ok: false },
+        reason: `续租失败：${error?.message ?? error}`
+          + '（补充说明已保存，任务状态未改）',
+      }
+    }
+  }
+
+  // ② 待领 / 在进行中但租约已丢：替他接活
+  if (task.status === 'pending' || task.status === 'in_progress') {
+    try {
+      await board.update({ id: task.id, expectedRev: task.rev, action: 'claim', byId: ownerId })
+      return { claimed: { ownerId, ok: true } }
+    } catch (error) {
+      return { reason: `自动接活失败：${error?.message ?? error}` }
+    }
+  }
+
+  return out
+}
+
+/**
+ * 任务诊断（契约 §5）：把「为什么这个任务没产出」翻译成一句人话 + 一个下一步按钮。
+ *
+ * ## 现场
+ *   Boss 报：「调研专家《调研专家测试001》已多次指派，subagent 持续失败，无产出。」
+ *   查 `wakes.jsonl` 全是 `result:'failed' / detail:'agent-not-live'` ——
+ *   也就是**执行者会话根本不在**，于是唤醒全部失败、任务永远停在 pending、
+ *   页面上什么都看不见（静默失败）。
+ *
+ * ## 做法
+ *   不猜。逐项读真实服务：roster（Bot 是谁）、getAgent（会话在不在）、
+ *   `agent.model.current()`（有没有模型路由）、dispatcher.list（唤醒有没有失败）。
+ *   每一项的失败都映射成中文理由 + 下一步。输出 `verdict`：
+ *   `ok` = 可以干活；`blocked` = 有明确的卡点（点建议里的按钮就能解）。
+ *
+ * @param {object} ctx @param {object} services @param {object} task
+ */
+async function diagnoseTask(ctx, services, task) {
+  const taskId = task?.id ?? task?.taskId ?? '(未知)'
+  const ownerId = task?.ownerId ?? task?.assignee ?? null
+
+  // ── 1) 执行者是谁（roster）──────────────────────────────────────────
+  let botName = ownerId ? String(ownerId).slice(-8) : ''
+  let rosterPreset
+  try {
+    const bots = services?.roster?.list?.() ?? []
+    const hit = bots.find((b) => b?.sessionId === ownerId)
+    if (hit?.name) botName = hit.name
+    if (hit?.preset) rosterPreset = String(hit.preset)
+  } catch { /* roster 不在就继续，名字退化成 id 缩写 */ }
+
+  // ── 2) 会话在不在（getAgent 是真查，不判 roster.state 这种缓存）──────
+  let live = false
+  try { live = Boolean(getAgent(ctx, ownerId)) } catch { live = false }
+
+  // ── 3) 模型路由（assertDeliverable 同一套判定 —— 不写两遍）─────────
+  const deliverable = live ? assertDeliverable(ctx, ownerId) : { ok: true, reason: '（会话不在线，先恢复会话再判定模型路由）' }
+
+  // ── 4) preset 是否真的能解析（老数据可能存了个已删的 preset id）─────
+  let presetResolved = true
+  try {
+    const session = sessionMeta(ctx, ownerId)
+    const wanted = rosterPreset ?? (typeof session?.agentPreset === 'string' ? session.agentPreset : undefined)
+    if (wanted) {
+      const known = await listPresets(ctx)
+      presetResolved = Array.isArray(known) && known.some((p) => p && (p.id === wanted || p.name === wanted))
+    }
+  } catch { presetResolved = rosterPreset !== undefined }
+  const hasModelRoute = Boolean(deliverable?.ok)
+
+  // ── 5) 唤醒记录（真实落盘的 wakes.jsonl）───────────────────────────
+  const wakes = readTaskWakes(services, taskId)
+    .slice(-10)
+    .map((row) => {
+      const at = row?.updatedAt ?? row?.sentAt ?? row?.scheduledAt ?? null
+      return {
+        at: Number.isFinite(Number(at)) ? Number(at) : null,
+        result: row?.result ?? 'unknown',
+        reason: row?.detail ?? row?.reason ?? null,
+      }
+    })
+
+  // ── 6) verdict + advice（两句：一句说清，一句说下一步点哪）─────────
+  const blockers = []
+  if (!live) blockers.push('agent-not-live')
+  if (deliverable && deliverable.ok === false) blockers.push('undeliverable')
+  if (!presetResolved) blockers.push('preset-unresolved')
+  if (wakes.some((w) => w.result === 'failed')) blockers.push('wake-failed')
+
+  const verdict = blockers.length ? 'blocked' : 'ok'
+  let advice
+  if (!live) {
+    advice = `执行者「${botName}」的会话当前不在线，唤醒消息投不出去 —— 点「重新派活」重新拉起会话；若连续失败，去「Bot 注册表」看它是否已退役或被回收。`
+  } else if (deliverable && deliverable.ok === false) {
+    advice = `「${botName}」没有模型路由，唤醒后第一轮必败 —— 去「Bot 档案」给它选一个模型，保存后再点「重新派活」。`
+  } else if (!presetResolved) {
+    advice = `「${botName}」用的预制体（preset）已不存在 —— 去「Bot 档案」换一个预制体，否则模型不会加载。`
+  } else if (wakes.some((w) => w.result === 'failed')) {
+    advice = `最近有唤醒失败记录 —— 先点「重新派活」重发，再点「刷新」确认状态；若仍然失败，看下面「唤醒记录」里的 reason 逐条排查。`
+  } else {
+    advice = `执行者「${botName}」已在线且模型路由正常 —— 直接点「唤醒」重发任务即可。`
+  }
+
+  return {
+    ok: true,
+    taskId,
+    ownerId,
+    bot: {
+      name: botName,
+      hasSession: live,
+      preset: rosterPreset ?? null,
+      presetResolved,
+      hasModelRoute,
+    },
+    live: { ok: live, reason: live ? '会话在线' : '会话不在线（agent-not-live）' },
+    deliverable,
+    wakes,
+    verdict,
+    advice,
+  }
+}
+
 async function ensureTeamForBot(services, botSessionId, by) {
   const teams = services.teams
   if (!teams || typeof teams.create !== 'function' || typeof botSessionId !== 'string' || !botSessionId) {
@@ -1349,8 +2186,22 @@ export function installApi(ctx, { warn } = {}) {
   //   现在所有请求先过 fence.judgeHttp：宿主不认证就一律 403。
   const fence = createFence({ ctx, warn })
 
+  // ── 升级09 §2.3：把「写阶段产出物」挂到 services 上 ─────────────────────
+  // `src/tools.js` 的 `bot_task_phase`（C 交付）读的是 `services.phaseWrite`；
+  // HTTP `POST /tasks/phase` 与它调用**同一份** writePhaseRow，
+  // 不写两套校验 —— 否则「页面能写、Bot 写不进」这种漂移必现。
+  // 注入放在这里（而不是 index.js）是因为写入逻辑属于 API 层，
+  // 且必须复用 api.js 内那份 appendTaskMeta 实现。
+  const mountPhaseWrite = (services) => {
+    if (!services || typeof services !== 'object') return
+    services.phaseWrite = (taskId, patch) => writePhaseRow(services, taskId, patch)
+  }
+  mountPhaseWrite(getServices(ctx))
+
   const handler = async (request, response) => {
     const services = getServices(ctx)
+    // 幂等重挂：services 若在 installApi 之后才注册，这里补上（写同一个 key）
+    mountPhaseWrite(services)
     // 鉴权先于一切业务逻辑（连 URL 解析都不做，避免攻击面）
     const verdict = fence.judgeHttp(request)
     if (!verdict.ok) {
@@ -1369,6 +2220,18 @@ export function installApi(ctx, { warn } = {}) {
 
     try {
       // ── 读：状态总览 ──────────────────────────────────────────────────────
+      // ── 升级接续（契约 §8.2）：先看后动，动前先备份 ──────────────────────
+      if (request.method === 'GET' && path === '/upgrade/preflight') {
+        sendJson(response, 200, upgradePreflight(services))
+        return
+      }
+      if (request.method === 'POST' && path === '/upgrade/migrate') {
+        const body = (await readBody(request)) ?? {}
+        const by = typeof body.by === 'string' && body.by.trim() ? body.by.trim() : OWNER
+        sendJson(response, 200, await upgradeMigrate(services, by))
+        return
+      }
+
       if (request.method === 'GET' && path === '/status') {
         const out = { ok: true, services: {}, compat: services.compat ?? null }
         // 状态面要覆盖**全部**域服务：新增模块若不上报，页面「系统体检」就会
@@ -2197,6 +3060,95 @@ export function installApi(ctx, { warn } = {}) {
         return
       }
 
+      // ── 阶段产出物（契约 §2.2 / §2.3 / §4.2）────────────────────────────
+      if (request.method === 'GET' && path === '/tasks/phases') {
+        const id = qp(url, 'id')
+        if (!id) {
+          sendJson(response, 400, { ok: false, reason: 'id 必填' })
+          return
+        }
+        const task = await withService(services, 'board', (b) => b.get(id))
+        if (!task) {
+          sendJson(response, 404, { ok: false, reason: `任务 ${id} 不存在` })
+          return
+        }
+        sendJson(response, 200, { ok: true, ...buildPhaseView(services, task) })
+        return
+      }
+
+      if (request.method === 'POST' && path === '/tasks/phase') {
+        const body = (await readBody(request)) ?? {}
+        const out = writePhaseRow(services, body.id, {
+          index: Number.isInteger(body.index) ? body.index : Number(body.index),
+          state: body.state,
+          artifacts: body.artifacts,
+          note: body.note,
+          by: body.by ?? OWNER,
+          ...(body.expectedRev === undefined ? {} : { expectedRev: body.expectedRev }),
+        })
+        sendJson(response, 200, out)
+        return
+      }
+
+      if (request.method === 'POST' && path === '/tasks/phases') {
+        const body = (await readBody(request)) ?? {}
+        const id = typeof body.id === 'string' ? body.id.trim() : ''
+        if (!id) {
+          sendJson(response, 400, { ok: false, reason: 'id 必填' })
+          return
+        }
+        const task = await withService(services, 'board', (b) => b.get(id))
+        if (!task) {
+          sendJson(response, 404, { ok: false, reason: `任务 ${id} 不存在` })
+          return
+        }
+        if (body.expectedRev !== undefined && body.expectedRev !== null) {
+          if (!Number.isInteger(body.expectedRev)) {
+            sendJson(response, 400, { ok: false, reason: `expectedRev 必须是整数（当前 rev=${task.rev}）` })
+            return
+          }
+          if (body.expectedRev !== task.rev) {
+            sendJson(response, 409, {
+              ok: false,
+              reason: `CAS 冲突：任务 ${id} 期望 rev=${body.expectedRev}，实际 rev=${task.rev} —— 请刷新后重试`,
+            })
+            return
+          }
+        }
+        const phases = normalizePhases(body.phases, 'TASK_BAD_PHASES')
+        const by = typeof body.by === 'string' && body.by.trim() ? body.by.trim() : OWNER
+        let note = 'Boss 调整阶段清单'
+        if (body.note !== undefined && body.note !== null) {
+          if (typeof body.note !== 'string') {
+            sendJson(response, 400, { ok: false, reason: 'note 必须是字符串（也可以不传）' })
+            return
+          }
+          const text = body.note.trim()
+          if (Array.from(text).length > LONGRUN_PHASE_MAX) {
+            sendJson(response, 400, {
+              ok: false,
+              reason: `note 最多 ${LONGRUN_PHASE_MAX} 字（收到 ${Array.from(text).length} 字）`,
+            })
+            return
+          }
+          if (text) note = text
+        }
+        // 只追加一条 `kind:'longrun'` 行 —— `kind:'phase'` 行**一根都不动**（契约 §4.2）：
+        // Boss 改的是计划，已交的证据不因此消失；清单变短时越界产物只是不再展示。
+        appendTaskMeta(services, { kind: 'longrun', taskId: id, phases, note, by, at: Date.now() })
+        const view = buildPhaseView(services, { ...task, id })
+        sendJson(response, 200, {
+          ok: true,
+          taskId: id,
+          phases: view.phases,
+          currentIndex: view.currentIndex,
+          totalArtifacts: view.totalArtifacts,
+          isLongrun: view.isLongrun,
+          note,
+        })
+        return
+      }
+
       // ── 任务：详情穿透 / 指派 / 终止 / 编辑 ──────────────────────────────
       if (request.method === 'GET' && path === '/tasks/detail') {
         const id = qp(url, 'id')
@@ -2218,6 +3170,21 @@ export function installApi(ctx, { warn } = {}) {
           stageInfo: deriveStage(detail.task),
           ...detail,
         })
+        return
+      }
+
+      if (request.method === 'GET' && path === '/tasks/diagnose') {
+        const id = qp(url, 'id')
+        if (!id) {
+          sendJson(response, 400, { ok: false, reason: 'id 必填' })
+          return
+        }
+        const task = await withService(services, 'board', (b) => b.get(id))
+        if (!task) {
+          sendJson(response, 404, { ok: false, reason: `任务 ${id} 不存在` })
+          return
+        }
+        sendJson(response, 200, await diagnoseTask(ctx, services, task))
         return
       }
 
@@ -2431,6 +3398,8 @@ export function installApi(ctx, { warn } = {}) {
 
         let wake = null
         let revive
+        // 契约 §7.2：人发了话，机器要跟着动（详见 autoActivate 注释）
+        const activated = await autoActivate(services, task, note.by)
         if (shouldWake) {
           // 契约 bots05 §2.3：投递前先确保 owner 会话 live（失败不阻断，wake 会如实报错）。
           revive = await ensureLive(ctx, task.ownerId)
@@ -2447,7 +3416,7 @@ export function installApi(ctx, { warn } = {}) {
           })
           armDeliveryWatch(services, task.id, task.ownerId, noteBaseline, wake)
         }
-        sendJson(response, 200, { ok: true, note, wake, ...reviveFields(revive) })
+        sendJson(response, 200, { ok: true, note, wake, activated, ...reviveFields(revive) })
         return
       }
 
@@ -2588,10 +3557,16 @@ export function installApi(ctx, { warn } = {}) {
         // dispatcher 缺失 → 503（先于复活副作用，避免「复活了却没地方投递」）。
         const dispatcher = await withService(services, 'dispatcher', (d) => d)
         const revive = await ensureLive(ctx, task.ownerId)
+        // 契约 §7.2：唤醒前顺手把租约续上（进行中 ⇒ 心跳；待领 ⇒ 自动接活）。
+        // ⚠️ 顺序很重要（回归 R15）：**先算 dedupKey，再 autoActivate**。
+        // autoActivate 会 bump rev（心跳/认领都写事件），若先激活再算键，
+        // `force:false` 的幂等键 `task-wake:<id>:<rev>` 就会跟着漂，
+        // 契约 §8「同一任务同一 rev 的重试只唤醒一次」被破坏。
         const force = body.force !== false
         const dedupKey = typeof body.dedupKey === 'string' && body.dedupKey.trim()
           ? body.dedupKey.trim()
           : (force ? `task-wake:${task.id}:${Date.now()}` : `task-wake:${task.id}:${task.rev}`)
+        const activated = await autoActivate(services, task, task.ownerId)
         // 2026-11-09：同一道投递能力预检（手动重试也不该往死会话里投）。
         const deliverable = assertDeliverable(ctx, task.ownerId)
         if (!deliverable.ok) {
@@ -2602,6 +3577,7 @@ export function installApi(ctx, { warn } = {}) {
             ownerId: task.ownerId,
             live: revive.live,
             revived: revive.revived,
+            activated,
             marked,
             wake: { result: 'failed', reason: `undeliverable:${deliverable.reason}`, target: task.ownerId },
           })
@@ -2630,6 +3606,7 @@ export function installApi(ctx, { warn } = {}) {
           ownerId: task.ownerId,
           live: revive.live,
           revived: revive.revived,
+          activated,
           ...(revive.live ? {} : { reviveReason: revive.reason ?? 'revive-failed' }),
           wake,
         })
@@ -3964,14 +4941,35 @@ export function installApi(ctx, { warn } = {}) {
         const body = (await readBody(request)) ?? {}
         const out = await withService(services, 'teams', (t) =>
           t.create({ ...body, by: body.by ?? OWNER })).catch(markTeamError)
-        sendJson(response, 200, { ok: true, team: out })
+        // 契约 §3：建团队就配议事厅。失败不阻断团队创建，只回一句 roomError。
+        const roomOut = await ensureTeamRoom(services, out, body.by ?? OWNER)
+        sendJson(response, 200, {
+          ok: true, team: out,
+          ...(roomOut.room ? { room: roomOut.room } : {}),
+          ...(roomOut.roomError ? { roomError: roomOut.roomError } : {}),
+        })
         return
       }
       if (request.method === 'POST' && path === '/teams/add') {
         const body = (await readBody(request)) ?? {}
+        const by = body.by ?? OWNER
         const out = await withService(services, 'teams', (t) =>
-          t.addMember({ ...body, by: body.by ?? OWNER })).catch(markTeamError)
-        sendJson(response, 200, { ok: true, team: out })
+          t.addMember({ ...body, by })).catch(markTeamError)
+        if (out?.ok === false) {
+          sendJson(response, out.status ?? 400, out)
+          return
+        }
+        // 契约 §3：新成员也要进议事厅（否则加了人、人却不在那个房间）
+        let roomError
+        if (typeof out?.roomId === 'string' && out.roomId && body.memberId) {
+          try {
+            await withService(services, 'room', (r) =>
+              r.join({ roomId: out.roomId, sessionId: body.memberId, byId: by }))
+          } catch (error) {
+            roomError = `成员已加入团队，但未能拉进议事厅（${out.roomId}）：${error?.message ?? error}`
+          }
+        }
+        sendJson(response, 200, { ok: true, team: out, ...(roomError ? { roomError } : {}) })
         return
       }
       if (request.method === 'POST' && path === '/teams/remove') {

@@ -493,14 +493,14 @@ window.__ModuleLoader__.load({
      */
     const ERROR_MAP = {
       BOARD_WIP_EXCEEDED: {
-        actionLabel: `查看${HUMAN_LABEL}的任务`,
-        text: '你已经在管 N 个任务了（上限 M），先完成或释放一些再接新的',
+        actionLabel: '查看任务栏',
+        text: `${HUMAN_LABEL}已经在管 N 个任务了（上限 M），先完成或释放一些再接新的`,
         hint: 'WIP 超限：同一 Bot 名下进行中的任务数达到上限',
       },
       BOARD_LEASE_HELD: {
         actionLabel: '查看持有者',
-        text: '这个任务正由另一个 Bot 在做，等它完成或租约过期',
-        hint: '租约被占用：任务上有未过期的租约，持有者不是当前操作者',
+        text: '这个任务正被另一个 Bot 占着，等它完成或把任务放回待办',
+        hint: '任务上有未过期的占用（这是防抢机制，不在页面展示），持有者不是当前操作者',
       },
       BOARD_NOT_READY: {
         actionLabel: '查看前置任务',
@@ -519,12 +519,12 @@ window.__ModuleLoader__.load({
       },
       BOARD_REV_CONFLICT: {
         actionLabel: '刷新',
-        text: '这个任务刚被别人改过，刷新一下再操作',
+        text: '这个任务刚被别的 Bot 改过，刷新一下再操作',
         hint: 'rev 不匹配：expectedRev 与当前 rev 不一致（CAS 拒绝静默覆盖）',
       },
       CAS_MISMATCH: {
         actionLabel: '刷新',
-        text: '这个任务刚被别人改过，刷新一下再操作',
+        text: '这个任务刚被别的 Bot 改过，刷新一下再操作',
         hint: 'rev 不匹配：expectedRev 与当前 rev 不一致（CAS 拒绝静默覆盖）',
       },
       BOARD_TASK_DELETED: {
@@ -543,7 +543,7 @@ window.__ModuleLoader__.load({
      * 错误可读映射：后端 code → 人话 + 下一步建议。
      *
      * 为什么：后端 message 只描述「发生了什么」（还夹着 id/rev），
-     * 用户看完仍然不知道**接下来该做什么**。高频冲突（WIP 超限、租约占用、
+     * 用户看完仍然不知道**接下来该做什么**。高频冲突（WIP 超限、占用冲突、
      * rev 冲突）恰恰是最需要下一步的，所以按 code 映射。
      *
      * 后端 message 仍保留在 hint 里 —— 定位信息（哪个任务 / 哪个 Bot）不能丢。
@@ -958,6 +958,12 @@ window.__ModuleLoader__.load({
       const [graphError, setGraphError] = useState(null)
       // 交付物文件预览弹窗
       const [previewPath, setPreviewPath] = useState(null)
+      // 换负责人弹窗（契约 §4.3(c)：Boss 直接换负责人 / 重新派发）
+      const [reassignOpen, setReassignOpen] = useState(false)
+      // 契约 §5.3：投递失败展示 + 「诊断这个任务」一次性排查（需求6）
+      const [diagnose, setDiagnose] = useState(null)
+      const [diagnoseLoading, setDiagnoseLoading] = useState(false)
+      const [diagnoseErr, setDiagnoseErr] = useState(null)
       // 预览内容在这里统一取（需求3）：弹窗只是壳，由父组件拉数据，
       // 否则弹窗自己的 effect 只在真实渲染器挂载子组件时才跑，测试桩与边缘场景都取不到内容。
       const [preview, setPreview] = useState(null)
@@ -1009,6 +1015,13 @@ window.__ModuleLoader__.load({
           .finally(() => { if (alive) setGraphLoading(false) })
         return () => { alive = false }
       }, [task?.id])
+
+      // 进度来源（契约 §6）：board 侧新增只读派生字段 progressBy/progressAt。
+      // `progressBy === 'ui'` ⇒ 最后一次写进度的是 Boss（前端提交）；
+      // 旧数据没有这个字段 ⇒ 视为「队长估算」（Boss 从没写过 progress）。
+      // ⚠️ 必须在组件体顶层用 `task?.` 取值：首渲染时 `data` 还没到（loading），
+      //    `task` 是 undefined —— 写 `task.progressBy` 会让整个抽屉白屏（已实测复现）。
+      const progressSource = task?.progressBy === 'ui' ? `${HUMAN_LABEL}设定` : '队长估算'
 
       const saveProgress = async () => {
         const v = Number(progressVal)
@@ -1074,7 +1087,7 @@ window.__ModuleLoader__.load({
                   h('span', { key: 'se', className: 'csb-k' }, '执行阶段'),
                   h('span', { key: 'sv', className: 'csb-v' },
                     h('span', { className: stageBadgeCls(data.stageInfo.group), title: data.stageInfo.reason }, data.stageInfo.label),
-                    data.stageInfo.needsPerson ? h('span', { className: 'csb-b csb-b-run', style: { marginLeft: 8 } }, '需要你处理') : null),
+                    data.stageInfo.needsPerson ? h('span', { className: 'csb-b csb-b-run', style: { marginLeft: 8 } }, '需要 Boss 处理') : null),
                 ]
               : null,
             h('span', { className: 'csb-k' }, '任务编号'), h('span', { className: 'csb-v csb-mono' }, task.id),
@@ -1084,7 +1097,7 @@ window.__ModuleLoader__.load({
             // 人会在「等你回答」里看到一句「端口被占用」而不知道该回什么。
             data?.stageInfo?.stage === 'person/answer' && task.latestReport?.attention?.question
               ? [
-                  h('span', { key: 'ae', className: 'csb-k' }, '要你回答'),
+                  h('span', { key: 'ae', className: 'csb-k' }, '要 Boss 回答'),
                   h('span', { key: 'av', className: 'csb-v', style: { color: 'var(--dsw-alias-text-warn, #b45309)', fontWeight: 600 } },
                     h(CollapsibleText, { text: String(task.latestReport.attention.question), limit: 300 })),
                 ]
@@ -1111,7 +1124,7 @@ window.__ModuleLoader__.load({
               : '可以做什么',
             desc: task.status === 'completed'
               ? '已完成不是终点：下面的「变更」区可以重开接着做 / 派生优化单 / 转成长任务。'
-              : '指派、完成、验收是 Bot 的职责，不由你操作。这里只有需要你拍板的动作。',
+              : '下面这些动作 Boss 可以直接做：改优先级/截止/复杂度/付费、改目标与边界、换负责人、阻塞与解阻塞、编辑长任务的阶段清单。每个操作都会如实提示结果。',
           }),
           h('div', { className: 'csb-bar', style: { marginTop: 10 } },
             task.status === 'pending'
@@ -1125,16 +1138,97 @@ window.__ModuleLoader__.load({
           // 改造06（CONTRACT-bots06 §3.1 / §3.3）：变更中心 —— 放在「可以做什么」之后
           h(TaskEvolvePanel, { taskId: task.id, task, onChange }),
 
-          // 高级：租约（原「续租」按钮，普通人看不懂，收进折叠并解释）
-          h(Section, { title: '高级：租约', desc: '租约是「我先占着，别人别抢」的凭据。领取任务默认占 5 分钟，长任务需要隔一会儿点一次「延长」，否则会被自动释放回待办。' }),
-          task.status === 'in_progress'
-            ? h('div', { className: 'csb-bar', style: { marginTop: 10 } },
-                h('span', { className: 'csb-set-d' }, task.lease ? `当前占用到 ${fmt(task.lease.expiresAt)}` : '当前没有租约'),
-                h('button', { className: 'csb-btn csb-btn-s', onClick: () => act(() => upd('heartbeat'), '延长') }, '延长 5 分钟'))
-            : h('div', { className: 'csb-set-d', style: { marginTop: 10 } }, '任务不在进行中，没有租约。'),
+          // 契约 §4.3：Boss 直接动手（改排期/路由、改目标与边界、换负责人、
+          // 阻塞/解除阻塞/归档、编辑长任务阶段清单）——全部内联，不跳页、不靠 prompt。
+          h(TaskBossActions, {
+            task,
+            bots,
+            onChange,
+            onReassign: () => setReassignOpen(true),
+          }),
+
+          // 需求2：任务对话（进度 + 对话内容 + 去对话跳转），直接放在产出物之前
+          h(TaskConversationPanel, { taskId: task.id, task, bots, onGotoSource }),
+
+          // 契约 §2.5（需求3）：阶段产出物 —— 必须在总产出物证据之前，
+          // 让 Boss 「点击去看产出物」时先看到过程产物，不用去翻对话。
+          h(TaskPhasePanel, { taskId: task.id, onPreview: (p) => setPreviewPath(p) }),
+
+          // ── 契约 §5（需求6）：投递失败必须可见，且能一键诊断 ────────────────
+          // 「armDeliveryWatch 超时未兑现」的落点就在 `task.delivery.error`，
+          // 后端把它留在任务上（一直显示到被解决），前端必须把它显示出来 ——
+          // 否则 Boss 看到的是「任务一直没动静」，没有一句人话告诉他卡在哪。
+          task.delivery?.error
+            ? h('div', { className: 'csb-err', style: { marginTop: 12 } },
+                `投递失败：${task.delivery.error}`
+                + (task.delivery.at ? `（${fmt(task.delivery.at)}）` : '')
+                + ' —— 先点「诊断这个任务」看执行者能不能干活，再决定重试还是换人。')
+            : null,
+          h('div', { className: 'csb-bar', style: { marginTop: 10, gap: 6 } },
+            h('button', {
+              className: 'csb-btn', disabled: diagnoseLoading,
+              onClick: async () => {
+                setDiagnoseLoading(true)
+                setDiagnoseErr(null)
+                setDiagnose(null)
+                try {
+                  const d = await call(`/tasks/diagnose?id=${encodeURIComponent(task.id)}`, { method: 'GET' })
+                  setDiagnose(d)
+                } catch (e) {
+                  setDiagnoseErr(humanizeError(e, {}, '诊断失败：'))
+                } finally {
+                  setDiagnoseLoading(false)
+                }
+              },
+            }, diagnoseLoading ? '诊断中…' : '诊断这个任务')),
+          // 诊断结果：一段人话结论 + 各项状态（Boss 不用自己翻日志）
+          diagnoseErr
+            ? h('div', { className: 'csb-err' }, diagnoseErr.text)
+            : null,
+          diagnose
+            ? h('div', { className: 'csb-card', style: { marginTop: 10, padding: '10px 12px' } },
+                h('div', { className: 'csb-card-main' },
+                  h('div', { className: 'csb-card-t' },
+                    diagnose.verdict === 'blocked'
+                      ? '执行者暂时不能干活'
+                      : diagnose.verdict === 'ok'
+                        ? '执行者可以干活'
+                        : '诊断结果'),
+                  diagnose.advice
+                    ? h('div', { className: 'csb-card-m', style: { marginTop: 6 } }, diagnose.advice)
+                    : null,
+                  // 每一项状态都显示（ok / 被谁卡住），不用猜
+                  h('div', { className: 'csb-card-m', style: { marginTop: 6, flexWrap: 'wrap' } },
+                    h('span', { className: 'csb-b' }, `执行者：${diagnose.bot?.name ?? '(未知)'}`),
+                    h('span', { className: 'csb-b' },
+                      diagnose.bot?.hasSession ? '会话在线' : '会话不在线'),
+                    diagnose.bot?.preset
+                      ? h('span', { className: 'csb-b' }, `预制体：${diagnose.bot.preset}`)
+                      : null,
+                    diagnose.live
+                      ? h('span', { className: 'csb-b' }, diagnose.live.ok ? '能拉起' : `拉不起来：${diagnose.live.reason ?? '未知'}`)
+                      : null),
+                  (diagnose.wakes ?? []).length > 0
+                    ? h('div', { className: 'csb-card-m', style: { marginTop: 6, flexWrap: 'wrap' } },
+                        '最近唤醒：',
+                        diagnose.wakes.slice(0, 5).map((w, i) =>
+                          h('span', { key: i, className: 'csb-b csb-b-err' },
+                            `${w.result ?? '未知'}${w.reason ? `（${w.reason}）` : ''}`)))
+                    : null))
+            : null,
 
           // 进度编辑
-          h(Section, { title: '更新进度', desc: `当前 ${task.progress ?? 0}%。填入 0-100 的数字并保存（走 CAS，别人刚改过会提示刷新）。` }),
+          // 契约 §6：`estimate`（预估工作量，队长承诺的投入）与 `progress`（实际完成度）
+          // 是**两个不同的数**，必须分两行显示 —— 混成一个数会让人以为「估 8 小时、做了 8」
+          // 就是「100% 做完」。
+          h(Section, {
+            title: '进度',
+            desc: `当前完成度 ${task.progress ?? 0}%（${progressSource}）。`
+              + (task.estimate !== undefined && task.estimate !== null
+                ? `预估工作量 ${task.estimate}（队长估的投入，跟完成度不是一回事）。`
+                : '')
+              + '填入 0-100 的数字并保存（保存走 CAS，任务刚被改过会提示刷新）。',
+          }),
           h('div', { className: 'csb-bar', style: { marginTop: 10 } },
             h('input', {
               className: 'csb-in', style: { width: 100 }, type: 'number', min: 0, max: 100,
@@ -1223,7 +1317,11 @@ window.__ModuleLoader__.load({
           error: preview?.error ?? null,
           data: preview?.data ?? null,
           onClose: () => setPreviewPath(null),
-        }) : null)
+        }) : null,
+        // 契约 §4.3(c)：Boss 直接换负责人 / 重新派发（内联弹窗）
+        reassignOpen
+          ? h(TaskReassignModal, { task, bots, onClose: () => setReassignOpen(false), onChange })
+          : null)
     }
 
     /**
@@ -1511,7 +1609,7 @@ window.__ModuleLoader__.load({
      * 把任务的「负责人相关字段」解析成一个真正可跳转的 Bot。
      *
      * 为什么需要它（2026-11-06 用户实测报错「该负责人不是本平台的 Bot，无法跳转…定位 ui」）：
-     *   - `ownerId` 是**租约持有者**：人会自己 claim（`ui`），或验收时被覆盖；
+     *   - `ownerId` 是**占用持有者**：Boss 会自己 claim（`ui`），或验收时被覆盖；
      *   - `assignee` 才是「这活原本派给谁」；
      *   - 任务可能没有 owner 但创建时填了 assignee。
      * 所以按 **assignee → ownerId → task.ownerId** 顺序找，命中即用；
@@ -1602,7 +1700,7 @@ window.__ModuleLoader__.load({
        * 去对话：把「负责人」解析成真正的 Bot 会话，再调宿主 openSession。
        *
        * 为什么不能只看 ownerId（2026-11-06 用户实测报错）：
-       *   `ownerId` 是**租约持有者**，人会自己 claim（`ui`）或验收时被覆盖；
+       *   `ownerId` 是**占用持有者**，Boss 会自己 claim（`ui`）或验收时被覆盖；
        *   而「这活原本派给谁」记在 `assignee` 上。只看 ownerId 就会出现
        *   「任务明明派给了 bot-xxx，点去对话却说『该负责人不是本平台的 Bot』，定位 ui」。
        * ⇒ 按 **assignee → ownerId → anchor.ownerId** 顺序逐个尝试，
@@ -1620,7 +1718,7 @@ window.__ModuleLoader__.load({
           setJump({
             id: candidates[0],
             hint: onlyPlatform
-              ? '这个任务的负责人是平台操作者（你），没有可跳转的 Bot 会话。'
+              ? '这个任务的负责人是平台自身的 Boss 身份，没有可跳转的 Bot 会话。'
                 + '如果它是派给某个 Bot 的，请确认「负责人」字段填的是 Bot 的会话 ID（可在 Bot 页复制）。'
               : '这个任务的负责人不是本平台注册的 Bot（可能已被退役，或是外部会话），无法自动跳转。'
                 + '可以复制 ID 到左侧会话列表里手动定位。',
@@ -1804,7 +1902,7 @@ window.__ModuleLoader__.load({
                   h('div', { style: { fontSize: 12.5, lineHeight: 1.7, whiteSpace: 'pre-wrap', wordBreak: 'break-word' } },
                     h('span', { className: 'csb-mono', style: { marginRight: 6 } }, `[${fmt(n.at)}]`),
                     n.text ?? '',
-                    h('span', { className: 'csb-set-d' }, `（${n.by ?? 'ui'}）`)))))),
+                    h('span', { className: 'csb-set-d' }, `（${humanizeBy(n.by)}）`)))))),
 
         // 改造06：换负责人弹窗（Bot 下拉 → POST /tasks/reassign）
         reassignOpen
@@ -1909,7 +2007,7 @@ window.__ModuleLoader__.load({
                 h('span', { className: 'csb-v' },
                   h('span', { className: stageBadgeCls(si.group), title: si.reason }, si.label),
                   si.needsPerson
-                    ? h('span', { className: 'csb-b csb-b-run', style: { marginLeft: 8 } }, '需要你处理')
+                    ? h('span', { className: 'csb-b csb-b-run', style: { marginLeft: 8 } }, '需要 Boss 处理')
                     : null)))
             }
             // ── 执行者状态（2026-11-09：「显示正在执行中，但我看不到过程」）────
@@ -1971,6 +2069,327 @@ window.__ModuleLoader__.load({
               desc: '从唤醒记录与任务笔记提炼。队长可在任务笔记里补充「下一步」以指导后续方向。',
             }, ...progressItems)
           })())
+    }
+
+    /**
+     * 任务详情 ·「Boss 直接动手」区块（契约 §4.3，需求5）。
+     *
+     * Boss 原话：「我要能直接动手，不要只给我看」。五类动作全部做成**内联表单**，
+     * 不跳页、不弹浏览器 prompt；每个写操作都 toast 出真实结果（成功 / 失败理由），
+     * 绝不允许「点了没反应」。
+     *
+     * 五条路径（契约 §4.1 的端点，A 直接用）：
+     *   (a) 改优先级 / 截止 / 复杂度档位 T0–T3 / 是否付费 → `POST /tasks/update` action:'edit'
+     *   (b) 改目标 / 边界（description、writeScopes）      → 同上
+     *   (c) 换负责人 / 收回 / 重新派发                      → `POST /tasks/reassign` / action:'release'
+     *   (d) 阻塞 / 解除阻塞 / 关闭归档                      → action:'block'/'unblock'/'delete'
+     *   (e) 编辑长任务阶段清单                              → `POST /tasks/phases`
+     *
+     * CAS：所有写都带 `expectedRev: task.rev`；冲突时后端 409，这里显示人话并给刷新入口。
+     */
+    function TaskBossActions({ task, bots, onChange, onReassign }) {
+      // 当前展开的表单（同时只开一个，避免整页都是输入框）
+      const [form, setForm] = useState(null) // 'basic' | 'scope' | 'block' | 'phases'
+      const [busy, setBusy] = useState(null)
+      const [err, setErr] = useState(null)
+      const [done, setDone] = useState(null)
+
+      // (a) 排期/路由字段
+      const [priority, setPriority] = useState(task?.priority !== undefined ? String(task.priority) : '')
+      const [dueAt, setDueAt] = useState(task?.dueAt ? toDateInput(task.dueAt) : '')
+      const [complexity, setComplexity] = useState(task?.expectedComplexity ?? '')
+      const [paid, setPaid] = useState(task?.requiresPaid === true ? 'yes' : task?.requiresPaid === false ? 'no' : '')
+      // (b) 目标与边界
+      const [subject, setSubject] = useState(task?.subject ?? '')
+      const [description, setDescription] = useState(task?.description ?? '')
+      const [scopes, setScopes] = useState((task?.writeScopes ?? []).join('\n'))
+      // (d) 阻塞理由
+      const [blockReason, setBlockReason] = useState(task?.blockedReason ?? '')
+      // (e) 阶段清单
+      const [phaseText, setPhaseText] = useState((task?.longrun?.phases ?? []).join('\n'))
+
+      if (!task) return null
+
+      const run = async (label, fn) => {
+        setBusy(label)
+        setErr(null)
+        setDone(null)
+        try {
+          const d = await fn()
+          setDone(d?.note ?? `${label}成功`)
+          setForm(null)
+          onChange?.()
+        } catch (e) {
+          setErr(humanizeError(e, {}, `${label}失败：`))
+        } finally {
+          setBusy(null)
+        }
+      }
+      const edit = (body) => call('/tasks/update', {
+        method: 'POST',
+        body: { id: task.id, expectedRev: task.rev, action: 'edit', ...body },
+      })
+
+      const saveBasic = () => run('保存', () => edit({
+        // 空字符串 ⇒ 不传（不改）；优先级用 null 表示清除
+        ...(priority === '' ? {} : { priority: Number(priority) }),
+        ...(dueAt === '' ? { dueAt: null } : { dueAt: dateInputToMs(dueAt) }),
+        ...(complexity === '' ? { expectedComplexity: null } : { expectedComplexity: complexity }),
+        ...(paid === '' ? { requiresPaid: null } : { requiresPaid: paid === 'yes' }),
+      }))
+      const saveScope = () => run('保存目标与边界', () => edit({
+        ...(subject.trim() ? { subject: subject.trim() } : {}),
+        description,
+        writeScopes: scopes.split('\n').map((s) => s.trim()).filter(Boolean),
+      }))
+      const savePhases = () => run('保存阶段清单', () => call('/tasks/phases', {
+        method: 'POST',
+        body: {
+          id: task.id,
+          expectedRev: task.rev,
+          phases: phaseText.split('\n').map((s) => s.trim()).filter(Boolean),
+        },
+      }))
+      const doBlock = () => run('阻塞', () => call('/tasks/update', {
+        method: 'POST',
+        body: { id: task.id, expectedRev: task.rev, action: 'block', reason: blockReason.trim() || 'Boss 阻塞' },
+      }))
+      const doUnblock = () => run('解除阻塞', () => call('/tasks/update', {
+        method: 'POST', body: { id: task.id, expectedRev: task.rev, action: 'unblock' },
+      }))
+      const doRelease = () => run('收回', () => call('/tasks/update', {
+        method: 'POST', body: { id: task.id, expectedRev: task.rev, action: 'release' },
+      }))
+      const doArchive = () => run('归档', () => call('/tasks/update', {
+        method: 'POST', body: { id: task.id, expectedRev: task.rev, action: 'delete' },
+      }))
+
+      const toggle = (name) => setForm((v) => (v === name ? null : name))
+      const btn = (label, name, extra) => h('button', {
+        className: `csb-btn${name === form ? ' csb-btn-p' : ''}`,
+        onClick: () => toggle(name), ...(extra ?? {}),
+      }, label)
+
+      return h('div', { style: { marginTop: 10 } },
+        h('div', { className: 'csb-bar', style: { flexWrap: 'wrap', gap: 6 } },
+          btn('改优先级 / 截止 / 复杂度 / 付费', 'basic'),
+          btn('改目标与边界', 'scope'),
+          h('button', { className: 'csb-btn', disabled: Boolean(busy), onClick: () => onReassign?.() },
+            busy === '换负责人' ? '换负责人中…' : '换负责人 / 重新派发'),
+          h('button', { className: 'csb-btn', disabled: Boolean(busy), onClick: doRelease }, busy === '收回' ? '收回中…' : '收回任务'),
+          btn(task.status === 'blocked' ? '解除阻塞' : '阻塞任务', 'block'),
+          h('button', { className: 'csb-btn csb-btn-d', disabled: Boolean(busy), onClick: doArchive, title: '归档＝从任务栏移除（可恢复）' }, '归档'),
+          btn('编辑长任务阶段清单', 'phases')),
+
+        err ? h('div', { className: 'csb-err' }, err.text) : null,
+        done ? h(Notice, { kind: 'ok', onClose: () => setDone(null) }, done) : null,
+
+        // (a) 排期与路由
+        form === 'basic'
+          ? h('div', { className: 'csb-fld', style: { marginTop: 10 } },
+              h('div', { className: 'csb-bar', style: { gap: 10, flexWrap: 'wrap' } },
+                h('label', null, '优先级',
+                  h('input', {
+                    className: 'csb-in', type: 'number', min: 1, max: 10, style: { width: 80, marginLeft: 6 },
+                    value: priority, onChange: (e) => setPriority(e.target.value),
+                  })),
+                h('label', null, '截止',
+                  h('input', {
+                    className: 'csb-in', type: 'date', style: { marginLeft: 6 },
+                    value: dueAt, onChange: (e) => setDueAt(e.target.value),
+                  })),
+                h('label', null, '复杂度',
+                  h('select', {
+                    className: 'csb-in', style: { marginLeft: 6 },
+                    value: complexity, onChange: (e) => setComplexity(e.target.value),
+                  },
+                    h('option', { value: '' }, '不设'),
+                    ['T0', 'T1', 'T2', 'T3'].map((t) => h('option', { key: t, value: t }, t)))),
+                h('label', null, '付费渠道',
+                  h('select', {
+                    className: 'csb-in', style: { marginLeft: 6 },
+                    value: paid, onChange: (e) => setPaid(e.target.value),
+                  },
+                    h('option', { value: '' }, '不设'),
+                    h('option', { value: 'no' }, '不用（免费）'),
+                    h('option', { value: 'yes' }, '用（花 Boss 的钱）')))),
+              h('div', { className: 'csb-fld-h' },
+                '优先级 1-10（≥8 算紧急）；截止留空＝清除；复杂度 T0 简单 / T1 常规 / T2 较难 / T3 很难；付费勾了就走付费渠道。'),
+              h('button', {
+                className: 'csb-btn csb-btn-p', disabled: Boolean(busy), onClick: saveBasic,
+              }, busy === '保存' ? '保存中…' : '保存'))
+          : null,
+
+        // (b) 目标与边界
+        form === 'scope'
+          ? h('div', { className: 'csb-fld', style: { marginTop: 10 } },
+              h('label', null, '任务标题'),
+              h('input', { className: 'csb-in', value: subject, onChange: (e) => setSubject(e.target.value) }),
+              h('label', null, '目标与细节'),
+              h('textarea', {
+                className: 'csb-ta', value: description,
+                onChange: (e) => setDescription(e.target.value),
+                placeholder: '写清做完是什么样、验收口径是什么',
+              }),
+              h('label', null, '写入边界（每行一个）'),
+              h('textarea', {
+                className: 'csb-ta', value: scopes,
+                onChange: (e) => setScopes(e.target.value),
+                placeholder: 'src/api.js\nsrc/client.js',
+              }),
+              h('div', { className: 'csb-fld-h' },
+                '写入边界＝这个任务允许改的文件前缀，每行一个。留空＝不限。'),
+              h('button', {
+                className: 'csb-btn csb-btn-p', disabled: Boolean(busy), onClick: saveScope,
+              }, busy === '保存目标与边界' ? '保存中…' : '保存'))
+          : null,
+
+        // (d) 阻塞
+        form === 'block'
+          ? h('div', { className: 'csb-fld', style: { marginTop: 10 } },
+              task.status === 'blocked'
+                ? h('div', null,
+                    h('div', { className: 'csb-fld-h' }, '这个任务现在是阻塞状态。解除后执行者可以继续做。'),
+                    h('button', { className: 'csb-btn csb-btn-p', disabled: Boolean(busy), onClick: doUnblock },
+                      busy === '解除阻塞' ? '处理中…' : '解除阻塞'))
+                : h('div', null,
+                    h('label', null, '阻塞原因'),
+                    h('input', {
+                      className: 'csb-in', value: blockReason,
+                      onChange: (e) => setBlockReason(e.target.value),
+                      placeholder: '例如：等 Boss 确认接口口径',
+                    }),
+                    h('div', { className: 'csb-fld-h' }, '阻塞后会记下原因，解阻塞时执行者能看到。'),
+                    h('button', { className: 'csb-btn csb-btn-d', disabled: Boolean(busy), onClick: doBlock },
+                      busy === '阻塞' ? '处理中…' : '确认阻塞')))
+          : null,
+
+        // (e) 阶段清单
+        form === 'phases'
+          ? h('div', { className: 'csb-fld', style: { marginTop: 10 } },
+              h('label', null, '阶段清单（每行一个阶段，最多 12 项）'),
+              h('textarea', {
+                className: 'csb-ta', value: phaseText,
+                onChange: (e) => setPhaseText(e.target.value),
+                placeholder: '范围与验收标准确认\n执行与自测\n交付与复盘',
+              }),
+              h('div', { className: 'csb-fld-h' },
+                '已经汇报过的阶段产物不会丢；清单变短时旧产物保留但不再展示。'),
+              h('button', {
+                className: 'csb-btn csb-btn-p', disabled: Boolean(busy), onClick: savePhases,
+              }, busy === '保存阶段清单' ? '保存中…' : '保存阶段清单'))
+          : null)
+    }
+
+    /** epoch ms → `YYYY-MM-DD`（`<input type=date>` 的取值格式，本地时区）。 */
+    function toDateInput(ms) {
+      if (!ms) return ''
+      const d = new Date(ms)
+      if (Number.isNaN(d.getTime())) return ''
+      const p = (n) => String(n).padStart(2, '0')
+      return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`
+    }
+
+    /** `YYYY-MM-DD` → epoch ms（当天 23:59:59 本地时区：截止＝那天结束前都算没超）。 */
+    function dateInputToMs(text) {
+      if (!text) return null
+      const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(text).trim())
+      if (!m) return null
+      const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), 23, 59, 59, 999)
+      return Number.isNaN(d.getTime()) ? null : d.getTime()
+    }
+
+    /**
+     * 任务详情 ·「阶段产出物」区块（契约 §2.5，需求3）。
+     *
+     * Boss 的原话：「点击去看产出物，看不到过程产物」⇒ 必须能按阶段看到每阶段交了
+     * 什么东西，**不需要去翻对话**。
+     *
+     * 数据来自 `GET /tasks/phases?id=`；后端未就绪 / 读取失败都要降级成**人话提示**
+     * （带重试），不许白屏、不许静默。非长任务是**正常空态**，不是错误。
+     *
+     * 产出物复用「产出物证据」那套渲染：路径可预览（`onPreview`）→ `FilePreviewModal`，
+     * URL 走 `window.open`。
+     */
+    function TaskPhasePanel({ taskId, onPreview }) {
+      const phasesQ = useApi(taskId ? `/tasks/phases?id=${encodeURIComponent(taskId)}` : null, [taskId])
+      const data = phasesQ.data
+      const phases = Array.isArray(data?.phases) ? data.phases : []
+      const isLongrun = data?.isLongrun === true
+      const phaseLabel = (st) => (st === 'done' ? '已完成' : st === 'blocked' ? '卡住' : st === 'doing' ? '进行中' : '未开始')
+      const phaseBadgeCls = (st) => (st === 'done' ? 'csb-b csb-b-ok' : st === 'blocked' ? 'csb-b csb-b-err'
+        : st === 'doing' ? 'csb-b csb-b-run' : 'csb-b csb-b-idle')
+      const ordinal = (i) => '\u2460\u2461\u2462\u2463\u2464\u2465\u2466\u2467\u2468\u2469\u246a\u246b'[i] ?? `${i + 1}.`
+
+      // 非长任务：契约 §2.5 明说这不是错误 —— 空态 + 一句人话指向总产出物。
+      if (!phasesQ.loading && !phasesQ.error && data && !isLongrun) {
+        return h(Section, { title: '阶段产出物' },
+          h(Empty, {
+            icon: '\u25dc',
+            title: '这不是长任务，没有分阶段产物',
+            hint: '总产出物见下方「产出物证据」。',
+          }))
+      }
+
+      // 每阶段的产出物行：路径可预览、URL 可打开，绝不给不可点的死文本。
+      const artifactRow = (a, key) => h('div', { key, className: 'csb-bar', style: { gap: 6, alignItems: 'center' } },
+        h('span', { className: 'csb-card-t csb-mono', style: { fontSize: 12 } },
+          typeof a === 'string' ? a : JSON.stringify(a)),
+        isUrl(a)
+          ? h('button', {
+              className: 'csb-btn csb-btn-s', style: { height: 22, fontSize: 11 },
+              onClick: () => window.open(a, '_blank', 'noopener'),
+            }, '打开链接')
+          : h('button', {
+              className: 'csb-btn csb-btn-s', style: { height: 22, fontSize: 11 },
+              onClick: () => onPreview?.(a),
+            }, '预览文件'))
+
+      const phaseCard = (p, i) => {
+        const idx = p.index ?? i
+        const arts = p.artifacts ?? []
+        return h('div', { key: idx, className: 'csb-card', style: { padding: '9px 12px' } },
+          h('div', { className: 'csb-card-main' },
+            h('div', { className: 'csb-bar', style: { gap: 8 } },
+              h('span', { className: 'csb-card-t' }, `${ordinal(idx)} ${p.title ?? `阶段 ${idx + 1}`}`),
+              h('span', {
+                className: phaseBadgeCls(p.state),
+                title: p.state === 'blocked' ? '执行者报告这一阶段卡住了' : '',
+              }, phaseLabel(p.state))),
+            p.note ? h('div', { className: 'csb-card-m' }, p.note) : null,
+            arts.length === 0
+              ? h('div', { className: 'csb-set-d' }, '这一阶段没交产出物。')
+              : h('div', { className: 'csb-card-m' }, arts.map((a, j) => artifactRow(a, j))),
+            p.by ? h('div', { className: 'csb-set-d' }, `汇报人：${humanizeBy(p.by)}`) : null))
+      }
+
+      return h('div', null,
+        h(Section, {
+          title: '阶段产出物',
+          desc: isLongrun
+            ? `共 ${phases.length} 个阶段。每阶段交了什么直接在这里看，不用去翻对话。`
+            : '执行者按阶段汇报产出物，交一次记一次；没有阶段记录时这里显示空态。',
+        }),
+        // 后端未就绪 / 读取失败：可读提示 + 重试（绝不静默）
+        phasesQ.error
+          ? h('div', { className: 'csb-note' },
+              `阶段产出物读不到：${phasesQ.error}`,
+              h('button', {
+                className: 'csb-btn csb-btn-s', style: { marginLeft: 8 },
+                onClick: () => phasesQ.reload(),
+              }, '重试'))
+          : null,
+        phasesQ.loading ? h(Skeleton, { n: 1 }) : null,
+        (!phasesQ.loading && !phasesQ.error && phases.length === 0)
+          ? h(Empty, {
+              icon: '\u25dc',
+              title: '执行者还没汇报这一阶段。',
+              hint: '执行者每完成一个阶段会汇报一次产出物；目前还没有任何阶段记录。',
+            })
+          : null,
+        phases.length > 0
+          ? h('div', { className: 'csb-list', style: { marginTop: 10 } }, phases.map(phaseCard))
+          : null)
     }
 
     /**
@@ -2124,6 +2543,19 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * 机器标识 → 面向 Boss 的展示文案（契约 §0）。
+     *
+     * `（ui）` / `by: 'ui'` 这类机器标识可以留在技术字段里，但**面向 Boss 的展示文案**
+     * 要写 `Boss`（例：补充说明历史里的 `（ui）` → `（Boss）`）。
+     * 非 Boss 机器身份（Bot / 其他会话）保持原文 —— 不猜、不美化。
+     */
+    function humanizeBy(raw) {
+      const v = raw ?? 'ui'
+      if (v === 'ui' || v === 'user' || v === 'human' || v === 'boss' || v === 'anyone') return HUMAN_LABEL
+      return String(v)
+    }
+
+    /**
      * 一条变更记录 → `[时间] 动作 — 说明（by）`（契约 §3.1）。
      * 快照记录没有 note：用「上一轮交付物 N 项」兜底，避免历史里出现空动作。
      */
@@ -2135,8 +2567,7 @@ window.__ModuleLoader__.load({
         note = `上一轮交付物 ${arts.length} 项`
       }
       if (!note && ch?.kind === 'reassign') note = `${ch?.from ?? '?'} → ${ch?.to ?? '?'}`
-      const by = ch?.by ?? ch?.byId ?? 'ui'
-      return `[${fmt(ch?.at)}] ${label}${note ? ` — ${note}` : ''}（${by}）`
+      return `[${fmt(ch?.at)}] ${label}${note ? ` — ${note}` : ''}（${humanizeBy(ch?.by ?? ch?.byId)}）`
     }
 
     /** `POST /tasks/evolve`：三种 mode 的唯一入口（note 必填，前端先拦一次）。 */
@@ -2400,7 +2831,7 @@ window.__ModuleLoader__.load({
                 liveBots.map((b) => h('option', { key: b.id ?? b.sessionId, value: b.sessionId ?? b.id },
                   `${b.name ?? '(无名)'}${b.state ? ` · ${b.state}` : ''}`))),
           h('div', { className: 'csb-fld-h' },
-            '换人会先把原负责人的租约交还，再以新负责人身份领取，并唤醒新负责人。'
+            '换人会先把原负责人的占用交还，再以新负责人身份领取，并唤醒新负责人。'
             + '已完成的任务会被拦 —— 先重开或派生优化单。')),
         err ? h('div', { className: 'csb-err', style: { marginTop: 10 } }, err) : null,
         done ? h(Notice, { kind: 'ok' }, done) : null)
@@ -2570,7 +3001,7 @@ window.__ModuleLoader__.load({
             value: text, onChange: (e) => setText(e.target.value),
           }),
           h('div', { className: 'csb-fld-h' },
-            `等价于你在这个 Bot 的会话里发一条消息（会话 ${short(bot?.sessionId ?? '—', 18)}）。`)),
+            `等价于 Boss 在这个 Bot 的会话里发一条消息（会话 ${short(bot?.sessionId ?? '—', 18)}）。`)),
         err ? h('div', { className: 'csb-err' }, err) : null,
         done && !done.wake
           ? h('div', { className: 'csb-ok' }, `已送达（会话 ${short(done.sessionId ?? '—', 18)}）`)
@@ -2704,8 +3135,7 @@ window.__ModuleLoader__.load({
       const [err, setErr] = useState(null)
       // 创建/派活的成功提示（改造04：创建时填了负责人 = 一步派活，wake 结果要 toast 出来）
       const [ok, setOk] = useState(null)
-      // 默认只看「需要我管的」；点「看全部」才显示 AI 派发的和已完成的
-      const [attentionOnly, setAttentionOnly] = useState(true)
+      // 契约 §1：任务栏默认全量 —— 不再区分「需要管 / 全部」，也不带 attention 过滤。
       // 双视图：看板 / 列表
       const [view, setView] = useState('list')
       // 本地过滤：负责人 / 关键词（不改后端 query）
@@ -2714,11 +3144,11 @@ window.__ModuleLoader__.load({
       const subjectRef = useRef(null)
       const q = new URLSearchParams()
       if (filter) q.set('status', filter)
-      if (attentionOnly && sourceFilter === 'human') q.set('attention', '1')
-      // 需求1：按来源分离——human=用户自建，ai=智能体自建/分发
-      q.set('source', sourceFilter)
+      // 契约 §1：任务栏默认全量 ⇒ 不带 attention、不带 source；
+      // 只有「智能体任务」子页签显式要求 source=ai。
+      if (sourceFilter === 'ai') q.set('source', 'ai')
       const qs = q.toString()
-      const { data, loading, error, reload } = useApi(`/tasks${qs ? `?${qs}` : ''}`, [filter, attentionOnly, sourceFilter])
+      const { data, loading, error, reload } = useApi(`/tasks${qs ? `?${qs}` : ''}`, [filter, sourceFilter])
       const { data: rosterData } = useApi('/roster')
       const { data: wfData } = useApi('/library/workflows')
       const bots = rosterData?.bots ?? []
@@ -2738,7 +3168,7 @@ window.__ModuleLoader__.load({
 
       // 「下一步」按钮的落点（spec §8）：按错误码给可执行动作
       const errActions = {
-        BOARD_WIP_EXCEEDED: () => { setFilter(''); setAttentionOnly(true) },
+        BOARD_WIP_EXCEEDED: () => { setFilter(''); setOwnerFilter(''); setKeyword('') },
         BOARD_REV_CONFLICT: reload,
         CAS_MISMATCH: reload,
         // 查看持有者 / 前置任务 / 依赖图 → 打开任务详情抽屉
@@ -2840,18 +3270,12 @@ window.__ModuleLoader__.load({
       const isAi = sourceFilter === 'ai'
       return h('div', { className: 'csb-wrap' },
         h(Section, {
-          // 需求1：按来源给不同标题与说明——人只看自己建的，AI 的任务走独立子页签
-          title: isAi ? '智能体任务' : `${HUMAN_LABEL}的任务`,
+          // 契约 §1：顶层保留两个子页签（任务栏 / 智能体任务），页内不再有「看全部 / 只看需要管」切换。
+          title: isAi ? '智能体任务' : '任务栏',
           desc: isAi
-            ? `Bot 自行创建或分发的任务，按状态分类。这些是执行细节，平时不用盯；出问题（受阻/失败）时会出现在「${HUMAN_LABEL}的任务」的待处理里。`
-            : (attentionOnly
-              ? '只看需要你管的（卡住 / 高优先 / 逾期 / 待验收）。智能体自己派发的任务在「智能体任务」子页签。'
-              : '全部你建的任务。点下方回到「只看需要我管的」。'),
+            ? 'Bot 自行创建或分发的任务，按状态分类。这些是执行细节，平时不用盯；出问题（受阻/失败）时会出现在「任务栏」里。'
+            : '全部任务都在这里：Boss 建的、智能体派发的、以及已经完成的。',
         }),
-        isAi ? null : h('div', { className: 'csb-bar', style: { marginTop: 8 } },
-          attentionOnly
-            ? h('button', { className: 'csb-btn csb-btn-s', onClick: () => setAttentionOnly(false) }, `看全部${HUMAN_LABEL}的任务`)
-            : h('button', { className: 'csb-btn csb-btn-s', onClick: () => setAttentionOnly(true) }, '只看需要我管的')),
         h('div', { className: 'csb-bar', style: { marginTop: 12 } },
           h('input', {
             className: 'csb-in csb-grow', placeholder: isLong
@@ -2980,7 +3404,7 @@ window.__ModuleLoader__.load({
                   onChange: (e) => setMandateBasis(e.target.value),
                 },
                   h('option', { value: '' }, '不记录（UI 建的，不算授权）'),
-                  h('option', { value: 'explicit' }, '人明确点名要做（可以直接动手）'),
+                  h('option', { value: 'explicit' }, 'Boss 明确点名要做（可以直接动手）'),
                   h('option', { value: 'inferred' }, '按规则推断（动手前先确认）'),
                   h('option', { value: 'task-board' }, '任务板派发（管理面正式派活）')),
                 h('div', { className: 'csb-fld-h' },
@@ -2993,7 +3417,7 @@ window.__ModuleLoader__.load({
                     onChange: (e) => setRequiresPaid(e.target.checked),
                   }),
                   h('span', null, '允许付费（默认只走免费渠道）')),
-                h('div', { className: 'csb-fld-h' }, '只有确实需要强模型时才勾；勾了就是花你的钱。')))
+                h('div', { className: 'csb-fld-h' }, '只有确实需要强模型时才勾；勾了就是花 Boss 的钱。')))
           : null,
         h('div', { className: 'csb-bar', style: { marginTop: 8, flexWrap: 'wrap' } },
           h('button', {
@@ -3076,7 +3500,7 @@ window.__ModuleLoader__.load({
                             si ? h('div', { style: { marginTop: 4, display: 'flex', gap: 6, flexWrap: 'wrap' } },
                               h('span', { className: stageBadgeCls(si.group) }, si.label),
                               si.needsPerson
-                                ? h('span', { className: 'csb-b csb-b-run', title: si.reason }, '需你处理')
+                                ? h('span', { className: 'csb-b csb-b-run', title: si.reason }, '需 Boss 处理')
                                 : null) : null,
                             h('div', { className: 'csb-progress' },
                               h('div', { className: 'csb-progress-fill', style: { width: `${Math.max(0, Math.min(100, t.progress ?? 0))}%` } })),
@@ -3100,7 +3524,7 @@ window.__ModuleLoader__.load({
 
     const SKILL_SOURCES = [
       { id: 'custom', label: '自建' },
-      { id: 'user', label: '用户级' },
+      { id: 'user', label: 'Boss 级' },
       { id: 'project', label: '项目级' },
       { id: 'bundled', label: '系统自带' },
     ]
@@ -3120,7 +3544,7 @@ window.__ModuleLoader__.load({
           skill ? h('div', null,
             h('div', { className: 'csb-kv', style: { marginBottom: 10 } },
               h('span', { className: 'csb-k' }, '描述'), h('span', { className: 'csb-v' }, skill.description || '—'),
-              h('span', { className: 'csb-k' }, '来源'), h('span', { className: 'csb-v' }, skill.source === 'bundled' ? '系统自带' : skill.source === 'custom' ? '自建' : skill.source === 'user' ? '用户级' : '项目级')),
+              h('span', { className: 'csb-k' }, '来源'), h('span', { className: 'csb-v' }, skill.source === 'bundled' ? '系统自带' : skill.source === 'custom' ? '自建' : skill.source === 'user' ? 'Boss 级' : '项目级')),
             h('div', { className: 'csb-pre', style: { maxHeight: 400, overflow: 'auto' } }, skill.body || '（空）'))
             : null,
         ],
@@ -3899,7 +4323,7 @@ window.__ModuleLoader__.load({
         error ? h('div', { className: 'csb-err' }, error) : null,
         !loading && bots.length === 0
           ? h(Empty, {
-              icon: '⬡', title: '还没有 Bot', hint: '先在上面建一个。如果只是临时分工，不用建 Bot —— 直接建任务指派给人就行。',
+              icon: '⬡', title: '还没有 Bot', hint: '先在上面建一个。如果只是临时分工，不用建 Bot —— 直接建任务指派给 Bot 就行。',
               action: { label: '新建 Bot', icon: '✎', onClick: () => nameRef.current?.focus() },
             })
           : null,
@@ -4052,7 +4476,7 @@ window.__ModuleLoader__.load({
             h('span', { className: 'csb-k' }, '专家身份'), h('span', { className: 'csb-v' }, bot.preset ?? '默认'),
             h('span', { className: 'csb-k' }, '档案文件'), h('span', { className: 'csb-v csb-mono' }, data.profilePath ?? '—')),
           data.hasOutside
-            ? h('div', { className: 'csb-note' }, '你的 AGENTS.md 里还有手写内容 —— 保存档案不会覆盖它，只改 cs-bots 托管的那一段。')
+            ? h('div', { className: 'csb-note' }, 'Boss 的 AGENTS.md 里还有手写内容 —— 保存档案不会覆盖它，只改 cs-bots 托管的那一段。')
             : null,
 
           h(Section, { title: '① 岗位名', desc: '一句话说清它是什么角色。会作为档案里的小标题显示。' }),
@@ -4062,7 +4486,7 @@ window.__ModuleLoader__.load({
             value: draft.title, onChange: (e) => setDraft({ ...draft, title: e.target.value }),
           }),
 
-          h(Section, { title: '② 人格与说话方式', desc: '它该用什么性格、什么口吻跟你说话。不填就用默认的。' }),
+          h(Section, { title: '② 人格与说话方式', desc: '它该用什么性格、什么口吻跟 Boss 说话。不填就用默认的。' }),
           h('textarea', {
             className: 'csb-ta', style: { marginTop: 10 },
             placeholder: '例如：说话先给结论再列证据；不确定就明说不知道，不许编；不要用"作为一个 AI"这类腔调。',
@@ -4079,11 +4503,11 @@ window.__ModuleLoader__.load({
           h(Section, { title: '④ 身份', desc: '它是谁、负责什么。这段话会在每次对话开始前进到它的上下文里。' }),
           h('textarea', {
             className: 'csb-ta', style: { marginTop: 10 },
-            placeholder: '例如：你是本项目的后端工程师，负责 API 设计、数据模型与数据库迁移；对 SQL 性能负责；拿不准时先给方案再动手。',
+            placeholder: '例如：它是本项目的后端工程师，负责 API 设计、数据模型与数据库迁移；对 SQL 性能负责；拿不准时先给方案再动手。',
             value: draft.identity, onChange: (e) => setDraft({ ...draft, identity: e.target.value }),
           }),
 
-          h(Section, { title: '⑤ 经验与规矩', desc: '它踩过的坑、你定下的规矩。写在这里的每一条，它每次都会看到。' }),
+          h(Section, { title: '⑤ 经验与规矩', desc: '它踩过的坑、Boss 定下的规矩。写在这里的每一条，它每次都会看到。' }),
           h('textarea', {
             className: 'csb-ta', style: { marginTop: 10, minHeight: 100 },
             placeholder: '例如：改数据库结构必须先写迁移；禁止直接 force push；测试必须全绿才算完成。',
@@ -4403,7 +4827,7 @@ window.__ModuleLoader__.load({
         h(Section, {
           title: '房间 = 群聊',
           desc: '房间就是一群成员共用的消息流。成员是「会话」，消息可以直接转发去唤醒某个 Bot。'
-            + '你是超级管理员：所有房间都能进、都能看全文、都能改设置。',
+            + 'Boss 是超级管理员：所有房间都能进、都能看全文、都能改设置。',
         }),
         h('div', { className: 'csb-bar', style: { marginTop: 12 } },
           h('input', {
@@ -4474,7 +4898,7 @@ window.__ModuleLoader__.load({
               h('div', { className: 'csb-room-chat' },
                 h(Section, {
                   title: `消息 · ${current.name}`,
-                  desc: `共 ${msgs.length} 条，当前显示最近 ${Math.min(shownCount, msgs.length)} 条。发帖者必须是成员；你是超级管理员，可以直接看全部内容。`,
+                  desc: `共 ${msgs.length} 条，当前显示最近 ${Math.min(shownCount, msgs.length)} 条。发帖者必须是成员；Boss 是超级管理员，可以直接看全部内容。`,
                 }),
                 current.purpose ? h('div', { className: 'csb-note', style: { marginTop: 10 } }, `用途：${current.purpose}`) : null,
                 current.notice ? h('div', { className: 'csb-note', style: { marginTop: 10 } }, current.notice) : null,
@@ -4683,14 +5107,14 @@ window.__ModuleLoader__.load({
                 onChange: (e) => setForm({ ...form, adminId: e.target.value }),
               }))
           : null,
-        h(Field, { label: '房间公告', hint: '会显示在消息列表上方，所有进这个房间的人都能看到' },
+        h(Field, { label: '房间公告', hint: '会显示在消息列表上方，所有进这个房间的成员都能看到' },
           h('textarea', {
             className: 'csb-ta', value: form.notice,
             placeholder: '例如：本房间只讨论发布相关事项；发版前 24 小时冻结代码。',
             onChange: (e) => setForm({ ...form, notice: e.target.value }),
           })),
         h('h4', { style: { marginTop: 18 } }, '房间规则'),
-        h(Field, { label: '允许 Bot 自己发言', hint: '关掉后只有人能主动发消息，Bot 只能被动回复' },
+        h(Field, { label: '允许 Bot 自己发言', hint: '关掉后只有 Boss 能主动发消息，Bot 只能被动回复' },
           h('label', { style: { display: 'flex', gap: 6, alignItems: 'center' } },
             h('input', {
               type: 'checkbox', checked: settings.allowBotAutoPost,
@@ -4993,12 +5417,12 @@ window.__ModuleLoader__.load({
       return h('div', { className: 'csb-wrap' },
         h(Section, {
           title: 'PDCA 复盘周期',
-          desc: 'PDCA 是给人的长任务做复盘跟进的，人类主导——五步不可跳，这正是「不自欺」的纪律。智能体有自己的归纳周期（周期驱动、自动闭环），折叠在下面。',
+          desc: 'PDCA 是给 Boss 的长任务做复盘跟进的，Boss 主导——五步不可跳，这正是「不自欺」的纪律。智能体有自己的归纳周期（周期驱动、自动闭环），折叠在下面。',
         }),
 
         // ── 我的长任务周期（human）────────────────────────────────────────────
         h('div', { className: 'csb-sec-t' }, `📋 ${HUMAN_LABEL} 的任务周期`),
-        h('div', { className: 'csb-set-d' }, '为你的长任务开一个周期。目标原文是「防漂移锚」——复盘时拿它对照，看有没有走偏。'),
+        h('div', { className: 'csb-set-d' }, '为长任务开一个周期。目标原文是「防漂移锚」——复盘时拿它对照，看有没有走偏。'),
         h('div', { className: 'csb-bar', style: { marginTop: 8, flexWrap: 'wrap', gap: 6 } },
           h('input', { className: 'csb-in', style: { width: 120 }, placeholder: '任务 id（t-x）', value: taskId, onChange: (e) => setTaskId(e.target.value) }),
           h('input', { className: 'csb-in', style: { width: 260 }, placeholder: '目标原文（防漂移锚）', value: objective, onChange: (e) => setObjective(e.target.value) }),
@@ -5012,7 +5436,7 @@ window.__ModuleLoader__.load({
 
         // ── 智能体归纳周期（agent）────────────────────────────────────────────
         h('div', { className: 'csb-sec-t', style: { marginTop: 18 } }, '🤖 智能体归纳周期'),
-        h('div', { className: 'csb-set-d' }, '智能体用来做定期归纳提升的周期。与人的周期不同：归纳是批量总结，可以一次性提交，提交后自动完成——不需要人点「完成」，也不需要假装走完五步。'),
+        h('div', { className: 'csb-set-d' }, '智能体用来做定期归纳提升的周期。与 Boss 的周期不同：归纳是批量总结，可以一次性提交，提交后自动完成——不需要 Boss 点「完成」，也不需要假装走完五步。'),
         // 到期未归纳的会话：这是「定期归纳」真正被驱动的入口
         dueSessions.length > 0
           ? h('div', { className: 'csb-note', style: { marginTop: 8 } },
@@ -5029,7 +5453,7 @@ window.__ModuleLoader__.load({
           : null,
         urgeMsg ? h('div', { className: 'csb-notice csb-notice-ok', style: { marginTop: 8 } }, h('span', { className: 'csb-notice-t' }, urgeMsg)) : null,
         agentCycles.length === 0
-          ? h(Empty, { icon: '🧠', title: '智能体尚未开归纳周期', hint: '智能体通常自动创建归纳周期；如果你要手动触发，填任务 id 和归纳目标。' })
+          ? h(Empty, { icon: '🧠', title: '智能体尚未开归纳周期', hint: '智能体通常自动创建归纳周期；Boss 要手动触发时，填任务 id 和归纳目标。' })
           : h('div', { className: 'csb-list' }, agentCycles.map((c) => renderCycle(c, true))),
         agentMsg ? h('div', { className: 'csb-notice csb-notice-ok', style: { marginTop: 8 } }, h('span', { className: 'csb-notice-t' }, agentMsg)) : null)
     }
@@ -5085,6 +5509,9 @@ window.__ModuleLoader__.load({
       // 只取用户建的团队（big）；智能体自建的 small 不上上层
       const listQ = useApi('/teams?type=big', [])
       const rosterQ = useApi('/roster')
+      // 契约 §3(UI)：团队卡片要显示 `房间：<名>` —— 房间名不在团队记录里，
+      // 要拿 roomId 从 /rooms 列表里查出名字（没有房间就只有 roomId 显示）。
+      const roomsQ = useApi('/rooms', [])
       const [name, setName] = useState('')
       const [leadId, setLeadId] = useState('')
       const [purpose, setPurpose] = useState('')
@@ -5118,6 +5545,14 @@ window.__ModuleLoader__.load({
       // 可用的 Bot（不含已退役）——成员与队长都从这里选
       const bots = (rosterQ.data?.bots ?? []).filter((b) => b.state !== 'retired')
       const botBySession = new Map(bots.map((b) => [b.sessionId, b]))
+      // 契约 §3(UI)：roomId → 房间名（团队卡片要显示 `房间：<名>`）。
+      // 房间列表可能还没回来 / 房间被归档 —— 查不到就退回 roomId，绝不显示 "undefined"。
+      const roomNameById = new Map((roomsQ.data?.rooms ?? []).map((r) => [r.id, r.name]))
+      const roomLabelOf = (t) => {
+        const id = typeof t?.roomId === 'string' ? t.roomId : ''
+        if (!id) return ''
+        return roomNameById.get(id) ?? id
+      }
 
       const createTeam = async () => {
         if (!name.trim()) { setMsg('团队名必填'); return }
@@ -5137,7 +5572,8 @@ window.__ModuleLoader__.load({
             adminPolicy: DEFAULT_ADMIN_POLICY,
             by: 'ui',
           })
-          setMsg(`团队「${r.team.name}」已创建（负责人：${botBySession.get(leadId)?.name ?? leadId}）`)
+          setMsg(`团队「${r.team.name}」已创建（负责人：${botBySession.get(leadId)?.name ?? leadId}）`
+            + (r.room?.name ? ` · 议事厅：${r.room.name}` : (r.roomError ? ` · 议事厅未建好（${r.roomError}）` : '')))
           setName(''); setLeadId(''); setPurpose(''); setSelected([])
           listQ.reload()
         } catch (e) { setMsg(String(e.message ?? e)) } finally { setBusy(false) }
@@ -5239,7 +5675,7 @@ window.__ModuleLoader__.load({
       return h('div', { className: 'csb-wrap' },
         h(Section, {
           title: '团队',
-          desc: '你创建的团队。每个团队有负责人（队长）、成员和讨论房间。'
+          desc: 'Boss 创建的团队。每个团队有负责人（队长）、成员和讨论房间。'
             + '智能体自己组织的临时小组不在这里（点右上角「⚙ 穿透」可查）。',
         }),
 
@@ -5371,16 +5807,29 @@ window.__ModuleLoader__.load({
                           }))
                       : null,
 
-                    // 跳转房间（用户补充：可以穿透房间看子团队工作内容 / 定向搜索）
+                    // 契约 §3(UI)：团队卡片显示 `房间：<名>` + 「去房间」按钮。
+                    // 房间名要从 /rooms 列表里查（团队记录只有 roomId）；
+                    // 没有房间就直说，不能假装有。
+                    h('div', { className: 'csb-card-m' },
+                      h('span', { className: 'csb-b csb-b-run', title: '团队的议事厅（契约 §3）' }, '🏛 房间：'),
+                      h('span', null, roomLabelOf(t) || '（还没有房间）')),
+
+                    // 跳转房间（契约 §3：选中该团队自己的房间，而不是按名字筛）
                     h('div', { className: 'csb-bar', style: { marginTop: 8 } },
                         h('button', {
                           className: 'csb-btn csb-btn-s',
-                          title: '查看这个团队的讨论房间与成员工作内容',
+                          title: '去这个团队的议事厅（选中该房间）',
                           // 必须带 sub:'rooms' —— safeGoTab 会把 'rooms' 映射成主页签 'team'，
                           // 不带 sub 就落到该页签的第一个子视图（Bot 档案），这就是
                           // 「点去房间却跳到 Bot 创建页」的真正原因。
-                          onClick: () => onGoto?.('team', { sub: 'rooms', filter: t.name }),
-                        }, '💬 看房间'),
+                          // 带 roomId ⇒ 房间页直接选中这个房间；没有 roomId 就退回按名字筛。
+                          onClick: () => onGoto?.(
+                            'team',
+                            t.roomId
+                              ? { sub: 'rooms', roomId: t.roomId }
+                              : { sub: 'rooms', filter: t.name },
+                          ),
+                        }, '💬 去房间'),
                         h('button', {
                           className: 'csb-btn csb-btn-s',
                           onClick: () => onGoto?.('bots'),
@@ -5507,7 +5956,7 @@ window.__ModuleLoader__.load({
         }
         if (rows.length === 0) {
           rows.push(h('div', { key: 'empty', className: 'csb-set-d', style: { paddingTop: 6 } },
-            '这个团队还没有成员。去「团队」页加人，或到「Bot 档案」新建一个 Bot。'))
+            '这个团队还没有成员。去「团队」页加成员，或到「Bot 档案」新建一个 Bot。'))
         }
 
         return h('div', { style: { paddingTop: 8 } },
@@ -5684,7 +6133,7 @@ window.__ModuleLoader__.load({
     // ── 记忆 ────────────────────────────────────────────────────────────────
 
     const LAYERS = ['L0', 'L1', 'L2', 'L3', 'L4', 'L5']
-    const LAYER_HINT = { L0: '人格（仅人可改）', L1: '用户偏好', L2: '团队规矩', L3: '分支专属', L4: '任务笔记', L5: '归档' }
+    const LAYER_HINT = { L0: '人格（仅 Boss 可改）', L1: 'Boss 偏好', L2: '团队规矩', L3: '分支专属', L4: '任务笔记', L5: '归档' }
 
     function MemoryTab() {
       const [layer, setLayer] = useState('')
@@ -5789,7 +6238,7 @@ window.__ModuleLoader__.load({
             await call('/suggestions/accept', { method: 'POST', body: { id: sg.id } })
             setOk('已采纳，内容已写入记忆')
           } else {
-            await call('/suggestions/reject', { method: 'POST', body: { id: sg.id, reason: '人工驳回' } })
+            await call('/suggestions/reject', { method: 'POST', body: { id: sg.id, reason: 'Boss 驳回' } })
             setOk('已驳回')
           }
           reload()
@@ -5813,7 +6262,7 @@ window.__ModuleLoader__.load({
               onClick: () => setShowSug(true),
             },
             h('span', { className: 'csb-notice-t' },
-              `有 ${suggestions.length} 条「自动整理建议」等你确认 —— 模型不能直接改你的长期记忆，只能提议。点这里看。`),
+              `有 ${suggestions.length} 条「自动整理建议」等 Boss 确认 —— 模型不能直接改 Boss 的长期记忆，只能提议。点这里看。`),
             h('span', { className: 'csb-b' }, '去确认'))
           : null,
 
@@ -5896,7 +6345,7 @@ window.__ModuleLoader__.load({
               h('div', { className: 'csb-card-m' },
                 h('span', { className: 'csb-b' }, `${e.layer} · ${LAYER_HINT[e.layer] ?? ''}`),
                 e.botId ? h('span', { className: 'csb-b' }, `Bot ${short(e.botId, 10)}`) : h('span', { className: 'csb-b' }, '全局'),
-                e.explicit ? h('span', { className: 'csb-b csb-b-ok' }, '你说过的') : null,
+                e.explicit ? h('span', { className: 'csb-b csb-b-ok' }, 'Boss 明确说的') : null,
                 e.conflict ? h('span', { className: 'csb-b csb-b-err' }, '与另一条冲突') : null,
                 e.archived
                   ? h('span', { className: 'csb-b csb-b-idle' },
@@ -5951,7 +6400,7 @@ window.__ModuleLoader__.load({
                 onChange: (e) => setNewTags(e.target.value),
               })),
             h('div', { className: 'csb-field-h' },
-              '你手动写的内容会标记为「你说过的」——以后自动整理只能建议、不能改它。'))
+              'Boss 手动写的内容会标记为「Boss 明确说的」——以后自动整理只能建议、不能改它。'))
           : null,
 
         // ── 编辑 ──
@@ -5975,7 +6424,7 @@ window.__ModuleLoader__.load({
                 className: 'csb-in', value: editing.tagsText ?? '',
                 onChange: (e) => setEditing({ ...editing, tagsText: e.target.value }),
               })),
-            h(Field, { label: '保护级别', hint: '勾上＝你说过的话，自动整理不能改；不勾＝允许模型提议修订' },
+            h(Field, { label: '保护级别', hint: '勾上＝Boss 明确说过的话，自动整理不能改；不勾＝允许模型提议修订' },
               h('label', { style: { display: 'flex', gap: 6, alignItems: 'center' } },
                 h('input', {
                   type: 'checkbox', checked: editing.explicit === true,
@@ -5993,7 +6442,7 @@ window.__ModuleLoader__.load({
             h('div', { className: 'csb-card-m', style: { marginBottom: 10 } },
               h('span', { className: 'csb-b' }, `${detail.entry?.layer} · ${LAYER_HINT[detail.entry?.layer] ?? ''}`),
               h('span', { className: 'csb-b' }, `第 ${detail.entry?.rev} 版`),
-              detail.entry?.explicit ? h('span', { className: 'csb-b csb-b-ok' }, '你说过的') : null),
+              detail.entry?.explicit ? h('span', { className: 'csb-b csb-b-ok' }, 'Boss 明确说的') : null),
             h('div', { className: 'csb-pre', style: { whiteSpace: 'pre-wrap' } }, detail.entry?.content ?? ''),
             h('h4', { style: { marginTop: 18 } }, '修改历史'),
             h('div', { className: 'csb-list' }, (detail.history ?? []).slice(-10).reverse().map((ev, i) =>
@@ -6014,7 +6463,7 @@ window.__ModuleLoader__.load({
               footer: [h('button', { key: 'c', className: 'csb-btn', onClick: () => setShowSug(false) }, '关闭')],
             },
             h('p', { style: { color: 'var(--dsw-alias-label-secondary)', fontSize: 12 } },
-              '这些是模型整理的「它认为该记住/该改」的条目。你不点采纳，它就不会生效。'),
+              '这些是模型整理的「它认为该记住/该改」的条目。Boss 不点采纳，它就不会生效。'),
             suggestions.length === 0
               ? h(Empty, { icon: '✓', title: '没有待确认的建议', hint: '有建议时这里会出现。' })
               : h('div', { className: 'csb-list' }, suggestions.map((sg) => h('div', { key: sg.id, className: 'csb-card' },
@@ -6061,7 +6510,7 @@ window.__ModuleLoader__.load({
               title: '彻底删除，无法恢复',
               message: `内容：${confirmPurge.content.slice(0, 120)}\n\n`
                 + '这一步会把这条件目从记忆库里抹掉，模型以后永远看不到它，也不能恢复。\n'
-                + '如果里面有你以后还想查的内容，请先用「恢复」拿回来备份。',
+                + '如果里面有 Boss 以后还想查的内容，请先用「恢复」拿回来备份。',
               danger: true, confirmText: '我确认，彻底删除',
               onCancel: () => setConfirmPurge(null),
               onConfirm: async () => {
@@ -6272,7 +6721,7 @@ window.__ModuleLoader__.load({
         h(Section, {
           title: '记忆自审',
           desc: '每聊若干回合，让模型停下来检查一次「有没有该记住的、有没有记错的」。'
-            + '它只会**提议**，你在「记忆」页点采纳才真正写进去。',
+            + '它只会**提议**，Boss 在「记忆」页点采纳才真正写进去。',
         }),
         h(ReviewSettings, {}),
 
@@ -6839,7 +7288,7 @@ window.__ModuleLoader__.load({
           ? h(Empty, {
               icon: '⌘',
               title: '还没有提示词',
-              hint: '把「你每次都要说一遍的要求」存成提示词，以后一键注入，不用重复打字。',
+              hint: '把「Boss 每次都要说一遍的要求」存成提示词，以后一键注入，不用重复打字。',
               action: { label: '新建提示词', icon: '✎', onClick: () => setEditing({ ...blank }) },
             })
           : null,
@@ -7218,7 +7667,7 @@ window.__ModuleLoader__.load({
       {
         id: 'workspace', label: '工作台',
         subs: [
-          { id: 'board', label: `${HUMAN_LABEL}的任务`, Comp: UserTasksTab },
+          { id: 'board', label: '任务栏', Comp: UserTasksTab },
           { id: 'ai-tasks', label: '智能体任务', Comp: AiTasksTab },
           { id: 'cycles', label: '复盘周期', Comp: CyclesTab },
           { id: 'todo', label: '我的待办', Comp: TodoTab },
@@ -7563,6 +8012,12 @@ window.__ModuleLoader__.load({
     exports.ConfirmModal = ConfirmModal
     // 改造04（CONTRACT-bots04 §3）：派活 / 补充说明 / 目标锚 / 房间建任务
     exports.TaskAnchorPanel = TaskAnchorPanel
+    // 契约 §2.5 / §4.3：阶段产出物面板 + Boss 直接动手面板
+    exports.TaskPhasePanel = TaskPhasePanel
+    exports.TaskBossActions = TaskBossActions
+    exports.toDateInput = toDateInput
+    exports.dateInputToMs = dateInputToMs
+    exports.humanizeBy = humanizeBy
     exports.BotAssignModal = BotAssignModal
     exports.BotMessageModal = BotMessageModal
     exports.RoomTaskCreateModal = RoomTaskCreateModal

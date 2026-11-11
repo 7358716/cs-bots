@@ -64,7 +64,7 @@ export const DEFAULT_TEAM_ADMIN_POLICY = 'open'
 const HUMAN_IDS = Object.freeze(['ui', 'user', 'person'])
 
 /** 合法动作（含 setPolicy：策略变更本身也是要留痕的事件）。 */
-const ACTIONS = Object.freeze(['create', 'addMember', 'removeMember', 'setRole', 'close', 'note', 'setPolicy'])
+const ACTIONS = Object.freeze(['create', 'addMember', 'removeMember', 'setRole', 'close', 'note', 'setPolicy', 'attachRoom'])
 
 /** 结构化错误。 */
 export class TeamError extends Error {
@@ -474,6 +474,36 @@ export function createTeams(ctx, config = {}) {
 
   // ── API：读 ────────────────────────────────────────────────────────────────
 
+  /**
+   * 给团队挂上一个房间（契约 §3：团队自动配议事厅）。
+   *
+   * 幂等：同一个 roomId 再调一次 ⇒ 直接返回现有团队（rev 不变）。
+   * 房间已经存在、只是想补关联时**不重复写事件** —— 否则 `/teams` 反复保存
+   * 会把事件流刷成一条重复行，rev 也跟着虚增，页面上的「谁改了团队」就失真了。
+   * @param {{ id: string, expectedRev?: number, roomId: string, by: string, now?: number }} input
+   */
+  function attachRoom(input = {}) {
+    assertAlive('attachRoom')
+    const { id, expectedRev, roomId, by, now } = input ?? {}
+    const author = requireString(by, 'by', 'attachRoom')
+    const at = normalizeNow(now, 'attachRoom')
+    const room = requireString(roomId, 'roomId', 'attachRoom')
+    const current = cas(id, expectedRev, 'attachRoom')
+    if (current.roomId === room) {
+      return clone(current) // 幂等：已关联同一房间，不重复落事件
+    }
+    const next = clone(current)
+    next.rev = current.rev + 1
+    next.roomId = room
+    next.updatedAt = at
+    next.updatedBy = author
+    commit('attachRoom', at, author, clone(current), next)
+    info(`[cs-bots/teams] 团队 ${id} 关联房间 ${room}（by ${author}）`)
+    return clone(next)
+  }
+
+  // ── API：读 ────────────────────────────────────────────────────────────────
+
   function list(query = {}) {
     assertAlive('list')
     let rows = [...entries.values()]
@@ -515,6 +545,9 @@ export function createTeams(ctx, config = {}) {
     note,
     close,
     setPolicy,
+    // 契约 §3：把「议事厅」绑到团队上。api.js 的 ensureTeamRoom 会调它；
+    // 不导出 ⇒ 房间建好了但团队记不住 roomId，重启后自动配厅就永远重配一遍。
+    attachRoom,
     list,
     get,
     stats,

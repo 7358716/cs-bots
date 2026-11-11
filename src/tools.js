@@ -30,7 +30,8 @@ function success(payload) {
  * 从宿主上下文取本平台的域服务。
  * @param {object} ctx
  * @returns {{ board?: object, roster?: object, room?: object, memory?: object, dispatcher?: object,
- *   todo?: object, scratch?: object, prompts?: object, discipline?: object, suggest?: object }}
+ *   todo?: object, scratch?: object, prompts?: object, discipline?: object, suggest?: object,
+ *   phaseWrite?: (taskId: string, patch: object) => object }}
  */
 function servicesOf(ctx) {
   return getServices(ctx)
@@ -254,6 +255,80 @@ const DEFS = [
         return success({ task: s.board.accept({ ...a, by: callerOf(exec) }) })
       } catch (error) {
         return failure(error?.code ?? 'accept-failed', { message: error?.message ?? String(error) })
+      }
+    },
+  },
+
+  // ── 阶段产出物（契约 §2.4，纯增量）──────────────────────────────────────────
+  {
+    name: 'bot_task_phase',
+    description:
+      '边做边交阶段产出物：每完成一个阶段就调用一次，带上这一阶段交出的文件路径/链接。' +
+      '【重要】不要等到整条任务做完才汇报 —— 阶段产物是给 Boss 点开就能看到的东西，' +
+      '分阶段交付（doing = 正在做这一阶段 / done = 这一阶段交完 / blocked = 卡在这一阶段）。' +
+      '需要 B 侧的 `services.phaseWrite(taskId, patch)` 能力；后端未注入时返回 failure，' +
+      '不会静默成功。',
+    parameters: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', description: '任务 id' },
+        index: { type: 'number', description: '阶段下标（从 0 开始，必填；越界会被后端拒）' },
+        state: {
+          type: 'string',
+          enum: ['doing', 'done', 'blocked'],
+          description: '该阶段状态（默认 done）',
+        },
+        artifacts: {
+          type: 'array',
+          items: { type: 'string' },
+          description: '这一阶段交出的文件路径/URL（可为空数组，表示「这一阶段没产出物」）',
+        },
+        note: { type: 'string', description: '一句话说明' },
+        expectedRev: { type: 'number', description: '当前任务 rev（可选，CAS）' },
+      },
+      required: ['id', 'index'],
+      additionalProperties: false,
+    },
+    run: (s, a, exec) => {
+      // 契约 §2.4：阶段写入能力由 B 侧 installApi 挂到 services.phaseWrite。
+      // 拿不到就是拿不到 —— **绝不静默成功**，返回 failure 让调用方看见。
+      const phaseWrite = s?.phaseWrite
+      if (typeof phaseWrite !== 'function') {
+        return failure('phase-unavailable', {
+          hint: '后端未就绪：services.phaseWrite 未注入（应由 api.js 挂载）。'
+            + '请稍后重试；或先用 bot_task_update 交付总产出物。',
+        })
+      }
+      if (typeof a?.id !== 'string' || a.id === '') {
+        return failure('bad-argument', { field: 'id', hint: 'id 必填' })
+      }
+      const index = a?.index
+      if (typeof index !== 'number' || !Number.isInteger(index) || index < 0) {
+        return failure('bad-argument', { field: 'index', hint: 'index 必填，且必须是 >=0 的整数' })
+      }
+      const state = a?.state === undefined ? 'done' : a.state
+      if (state !== 'doing' && state !== 'done' && state !== 'blocked') {
+        return failure('bad-argument', { field: 'state', hint: 'state 只允许 doing | done | blocked' })
+      }
+      try {
+        // `by` 由调用者身份得出（事实留痕，不猜）；`expectedRev` 若给了就带上做 CAS。
+        const res = phaseWrite(a.id, {
+          index,
+          state,
+          artifacts: a?.artifacts,
+          note: a?.note,
+          by: callerOf(exec),
+          expectedRev: a?.expectedRev,
+        })
+        if (!res || typeof res !== 'object') {
+          return failure('phase-write-failed', { message: 'phaseWrite 返回了非法结果' })
+        }
+        return res
+      } catch (error) {
+        // 写不进 task-meta.jsonl 必须让模型看见（不许吞）
+        return failure(error?.code ?? 'phase-write-failed', {
+          message: error?.message ?? String(error),
+        })
       }
     },
   },
