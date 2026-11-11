@@ -1,8 +1,8 @@
 {
   "name": "cs-bots",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "type": "module",
-  "description": "Boss 体验 + 任务管控 + 升级可回滚。",
+  "description": "跨团队桥 + 定向唤醒 + 升级可回滚。",
   "main": "src/index.js",
   "exports": {
     ".": "./src/index.js",
