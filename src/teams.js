@@ -64,7 +64,10 @@ export const DEFAULT_TEAM_ADMIN_POLICY = 'open'
 const HUMAN_IDS = Object.freeze(['ui', 'user', 'person'])
 
 /** 合法动作（含 setPolicy：策略变更本身也是要留痕的事件）。 */
-const ACTIONS = Object.freeze(['create', 'addMember', 'removeMember', 'setRole', 'close', 'note', 'setPolicy', 'attachRoom'])
+const ACTIONS = Object.freeze(['create', 'addMember', 'removeMember', 'setRole', 'close', 'note', 'setPolicy', 'attachRoom', 'route'])
+
+/** 跨团队路由的最大 hop 数（>3 拒绝）。 */
+const ROUTE_MAX_HOP = 3
 
 /** 结构化错误。 */
 export class TeamError extends Error {
@@ -192,6 +195,12 @@ export function createTeams(ctx, config = {}) {
     if (rows.length === 0) { diagnostics.hydratedFrom = 'empty'; return }
     let skipped = 0
     for (const ev of rows) {
+      // route 事件是**审计记录**，不是团队状态变更 —— 没有 id/rev，仍要进 events
+      // 供 listRoutes 查询；只有团队状态变更事件才需要 id + rev 去重。
+      if (ev?.action === 'route') {
+        events.push(clone(ev))
+        continue
+      }
       if (!ev || typeof ev.id !== 'string' || !ev.after) { skipped += 1; continue }
       const current = entries.get(ev.id)
       if (current && Number.isFinite(ev.rev) && ev.rev <= current.rev) { skipped += 1; continue }
@@ -282,7 +291,7 @@ export function createTeams(ctx, config = {}) {
    */
   function create(input = {}) {
     assertAlive('create')
-    const { name, type, purpose, memberIds, leadId, adminPolicy, by, now } = input ?? {}
+    const { name, type, purpose, memberIds, leadId, adminPolicy, by, now, kind } = input ?? {}
     const nameNorm = requireString(name, 'name', 'create')
     if (nameNorm.length > 120) throw new TeamError(`teams.create：name ≤120 字符（收到 ${nameNorm.length}）`, 'TEAM_BAD_FIELD', { field: 'name' })
     const teamType = type ?? 'big'
@@ -301,18 +310,31 @@ export function createTeams(ctx, config = {}) {
       throw new TeamError(`teams.create：leadId ${lead} 不能同时出现在 memberIds 中（会形成自引用）`, 'TEAM_BAD_FIELD', { field: 'memberIds' })
     }
 
+    // ── kind：人类/智能体（服务层强制推导，防止伪造）─────────────────────────
+    // 由执行者身份（author）硬推导：HUMAN_IDS ⇒ 'human'，其他 ⇒ 'agent'。
+    // 显式传 kind 但与推导矛盾 ⇒ 抛 TEAM_KIND_MISMATCH（不许伪造 Boss 建的团队）。
+    const derivedKind = HUMAN_IDS.includes(author) ? 'human' : 'agent'
+    if (kind !== undefined && kind !== null && kind !== derivedKind) {
+      throw new TeamError(
+        `teams.create：kind=${JSON.stringify(kind)} 与执行者身份矛盾（执行者 ${author} ⇒ '${derivedKind}'）——不许伪造`,
+        'TEAM_KIND_MISMATCH',
+        { author, derivedKind, requested: kind },
+      )
+    }
+    const teamKind = derivedKind
+
     idCounter += 1
     const id = `team-${idCounter}`
     /** @type {Record<string, unknown>} */
     const rec = {
-      id, rev: 1, name: nameNorm, type: teamType, purpose: purpose ?? '',
+      id, rev: 1, name: nameNorm, type: teamType, kind: teamKind, purpose: purpose ?? '',
       leadId: lead, members,
       adminPolicy: policy,
       status: 'open',
       createdAt: at, createdBy: author, updatedAt: at, updatedBy: author,
     }
     commit('create', at, author, null, rec)
-    info(`[cs-bots/teams] 团队 ${id}（${nameNorm}，${teamType}）创建 by ${author}`)
+    info(`[cs-bots/teams] 团队 ${id}（${nameNorm}，${teamType}，${teamKind}）创建 by ${author}`)
     return clone(rec)
   }
 
@@ -502,6 +524,148 @@ export function createTeams(ctx, config = {}) {
     return clone(next)
   }
 
+  // ── A. 跨团队路由（t-39 第2批 · bot_team_route 的服务层本体）────────────────
+
+  /**
+   * 解析并校验一条跨团队路由目标 —— **只做决定，不做投递**。
+   *
+   * 为什么拆开：投递要 dispatcher（wakes.jsonl / dedup / 背压），而 dispatcher 挂在
+   * `src/tools.js` 的组装层（`s.dispatcher`）。若把投递塞进 TeamsService，本服务就得
+   * 反向依赖 dispatcher —— 两个域服务互指会让装配顺序变成硬约束。所以这里只回答
+   * 「路由到谁」，投递由工具层完成，语义边界清晰。
+   *
+   * 失败一律**返回可读的 refused**，不抛裸错 —— 契约要求 `{ok:false, decision:'refused',
+   * reason}` 而不是异常（异常在工具层会被包成 `tool-crashed`，理由就丢了）。
+   *
+   * @param {{ fromTeam?: string, toTeam?: string, toBot?: string,
+   *           taskId: string, text?: string, hop?: number, by: string }} input
+   * @returns {{ ok: true, decision: 'accepted', to: { kind: 'team'|'bot', id: string,
+   *            leadId: string, name: string }, hop: number, dedupKey: string,
+   *            fromTeam: string }
+   *          | { ok: false, decision: 'refused', reason: string, to?: object, hop?: number }}
+   */
+  function resolveRoute(input = {}) {
+    assertAlive('resolveRoute')
+    const { fromTeam, toTeam, toBot, taskId, hop, by } = input ?? {}
+    const author = requireString(by, 'by', 'resolveRoute')
+
+    // ── 参数校验：全部**可读拒绝** ──
+    if (typeof taskId !== 'string' || taskId.trim() === '') {
+      return { ok: false, decision: 'refused', reason: 'ROUTE_TASK_ID_REQUIRED' }
+    }
+    if (!toTeam && !toBot) {
+      return { ok: false, decision: 'refused', reason: 'ROUTE_TARGET_REQUIRED' }
+    }
+    if (toTeam && toBot) {
+      return { ok: false, decision: 'refused', reason: 'ROUTE_TARGET_AMBIGUOUS' }
+    }
+
+    // ── hop 计数：>3 拒绝（环路防护第一道闸）──
+    const hopCount = Number.isFinite(Number(hop)) ? Math.max(0, Math.trunc(Number(hop))) : 0
+    if (hopCount > ROUTE_MAX_HOP) {
+      return { ok: false, decision: 'refused', reason: 'ROUTE_HOP_EXCEEDED', hop: hopCount }
+    }
+
+    // ── 解析目标团队 / 目标 lead ──
+    let targetTeamId = null
+    let targetLeadId = null
+    let targetName = null
+
+    if (toTeam) {
+      const team = entries.get(toTeam)
+      if (!team) return { ok: false, decision: 'refused', reason: 'ROUTE_TARGET_NOT_FOUND', hop: hopCount }
+      targetTeamId = team.id
+      targetLeadId = team.leadId ?? null
+      targetName = team.name
+    } else {
+      // toBot：必须**属于**某个 cs-bots 团队（leadId 或成员），否则无法确定唤醒谁
+      for (const t of entries.values()) {
+        if (t.leadId === toBot || (Array.isArray(t.members) && t.members.includes(toBot))) {
+          targetTeamId = t.id
+          targetLeadId = t.leadId ?? null
+          targetName = t.name
+          break
+        }
+      }
+      if (!targetTeamId) {
+        return { ok: false, decision: 'refused', reason: 'ROUTE_TARGET_NOT_FOUND', hop: hopCount }
+      }
+    }
+
+    // 目标团队必须有人可唤 —— 契约：**只唤 leadId**，不 wake 全部成员
+    if (!targetLeadId) {
+      return {
+        ok: false,
+        decision: 'refused',
+        reason: 'ROUTE_NO_LEAD',
+        to: { kind: toTeam ? 'team' : 'bot', id: targetTeamId, name: targetName },
+        hop: hopCount,
+      }
+    }
+
+    const fromKey = fromTeam ?? author
+
+    // 去重键：交给 dispatcher 的 dedupKey 机制（不自己造一套）。
+    // **不含 hop** —— 这样同一 (from→to, taskId) 的重复路由会命中 dispatcher 的
+    // IdempotencySet 而被判 skipped，正是「A→B→A→B 第 3 跳被拒」的实现路径。
+    const dedupKey = `route:${fromKey}:${targetTeamId}:${taskId}`
+
+    return {
+      ok: true,
+      decision: 'accepted',
+      to: { kind: toTeam ? 'team' : 'bot', id: targetTeamId, leadId: targetLeadId, name: targetName },
+      hop: hopCount,
+      dedupKey,
+      fromTeam: fromKey,
+    }
+  }
+
+  /**
+   * 把已经做出的路由决定**落盘留痕**（intent-first：先记后投）。
+   *
+   * 顺序不可颠倒：`记了没投` 是可见可重试的；`投了没记` 则绕过限额/审计，
+   * 让环路防护统计不到这一跳 —— 那正是要防的。
+   * @param {{ to: object, fromTeam: string, taskId: string, text?: string, hop: number,
+   *           by: string, now?: number, wake?: object }} input
+   */
+  function recordRoute(input = {}) {
+    assertAlive('recordRoute')
+    const { to, fromTeam, taskId, text, hop, by, now, wake } = input ?? {}
+    const author = requireString(by, 'by', 'recordRoute')
+    const at = normalizeNow(now, 'recordRoute')
+    const rec = {
+      toKind: to?.kind ?? 'team',
+      toId: to?.id ?? null,
+      toLeadId: to?.leadId ?? null,
+      toName: to?.name ?? null,
+      fromTeam: fromTeam ?? null,
+      taskId,
+      text: text ?? '',
+      hop: Number(hop ?? 0),
+      wake: wake ?? null,
+      at,
+    }
+    if (!appendJsonl(jsonlPath, { action: 'route', at, by: author, before: null, after: rec })) {
+      throw new TeamError(`teams.recordRoute：事件追加失败（${jsonlPath}）—— 拒绝「投了没记」`, 'TEAM_APPEND_FAILED', { action: 'route' })
+    }
+    events.push({ action: 'route', at, by: author, before: null, after: clone(rec) })
+    info(`[cs-bots/teams] route ${rec.fromTeam} → ${rec.toId}（lead=${rec.toLeadId}, hop=${rec.hop}, task=${taskId}）by ${author}`)
+    return clone(rec)
+  }
+
+  /**
+   * 查 route 审计记录（按 toId / taskId / fromTeam 过滤）。
+   * @param {{ toId?: string, fromTeam?: string, taskId?: string }} [query]
+   */
+  function listRoutes(query = {}) {
+    assertAlive('listRoutes')
+    let rows = events.filter((e) => e.action === 'route').map((e) => ({ ...e.after, by: e.by, at: e.at }))
+    if (query?.toId !== undefined && query?.toId !== null) rows = rows.filter((r) => r.toId === query.toId)
+    if (query?.fromTeam !== undefined && query?.fromTeam !== null) rows = rows.filter((r) => r.fromTeam === query.fromTeam)
+    if (query?.taskId !== undefined && query?.taskId !== null) rows = rows.filter((r) => r.taskId === query.taskId)
+    return clone(rows)
+  }
+
   // ── API：读 ────────────────────────────────────────────────────────────────
 
   function list(query = {}) {
@@ -548,6 +712,10 @@ export function createTeams(ctx, config = {}) {
     // 契约 §3：把「议事厅」绑到团队上。api.js 的 ensureTeamRoom 会调它；
     // 不导出 ⇒ 房间建好了但团队记不住 roomId，重启后自动配厅就永远重配一遍。
     attachRoom,
+    // 契约 t-39：跨团队路由（只决定 + 留痕，投递由工具层用 dispatcher 完成）
+    resolveRoute,
+    recordRoute,
+    listRoutes,
     list,
     get,
     stats,

@@ -13,6 +13,192 @@
 
 ---
 
+## [Unreleased] - bots04（第 1 批止血 + 第 2 批桥本体）
+
+> 第 1 批 = 定向唤醒 / kind 字段 / attachRoom（止血）
+> 第 2 批 = `bot_team_route` 跨团队路由 / 环路防护 / 指标埋点 / 文档校验（补欠账）
+
+### Added · 第 2 批：跨团队桥本体 `bot_team_route`
+
+**这是「大团队 = 跨团队桥」的第一块实体。** 此前 42 个工具里**没有任何一个**
+能让 Bot 表达「我要找另一个团队」—— 桥是断的。
+
+```js
+bot_team_route({ fromTeam?, toTeam?, toBot?, taskId, text, hop? })
+// 成功: { ok:true, decision:'delivered', to:{kind:'team',id,leadId,name}, hop, wake }
+// 被拒: { ok:false, decision:'refused', reason:'ROUTE_HOP_EXCEEDED'|... }
+```
+
+三条设计约束：
+1. **只唤醒对方 `leadId`**，不唤醒全部成员（测试断言 `delivered.length === 1`）
+2. **先落 route 事件再投递**（intent-first）——「记了没投」可重试；「投了没记」会绕过环路统计
+3. 失败一律返回可读 `refused + reason`，**绝不静默**
+
+**为什么 `toBot` 在 cs-bots 团队里找，不去 DSH 原生 `agentTeam` 找**：
+实测 `grep -n "agentTeam|TeamId" src/teams.js` → 除新代码外**零命中**。
+`teams.jsonl` 存 `{id, name, leadId, type, kind, members}`，而原生 team 是 `teamId = root.id`——
+**两套人模型无 id 交集**。混用恰恰是 Boss 这次要区分的那个错误。
+
+### Added · 环路防护（两道闸）
+
+1. `hop > 3` ⇒ `ROUTE_HOP_EXCEEDED`（实测 hop 0–3 放行，hop 4 拒绝）
+2. **复用 dispatcher 的 `dedupKey`**（没另造一套）：键 = `route:<from>:<to>:<taskId>`，
+   **刻意不含 hop** —— 这样 A→B(hop0) 与 A→B(hop2) 是同一个键，
+   dispatcher 的 `IdempotencySet` 判 `dedup-hit`，第 3 跳自然被拦。
+
+> 为什么不把 hop 放进键：放进去就"每一跳都是新消息"，去重永远命不中，环路防护形同虚设。
+
+### Fixed · route 审计记录重启后全丢（真 bug）
+
+`hydrate()` 里 `if (!ev || typeof ev.id !== 'string')` 把 route 事件当残缺数据跳过 ——
+**但 route 事件本来就没有 `id`**（它不改团队实体，只是审计记录）。
+
+后果：`listRoutes` 重启后返回 0 条，而**环路防护和成本核算都依赖这份历史** —— 等于失效。
+修法：回放时对 `action === 'route'` 单独放行。
+
+### Added · 指标埋点补全（欠账2）
+
+**之前 256 条 metrics 全是 `turn_end`** —— 因为只有 `index.js` 在回合结束自动记，
+认领/完成/验收这些**真正该测的动作从没被记过**。PDCA 页面因此看不到验收通过率。
+
+修法：在 `commit()` 埋点（**所有状态变更的唯一出口**，埋这里才不会漏）：
+| board 动作 | 指标 kind |
+|---|---|
+| `claim` | `task_claim` |
+| `complete` | `task_complete` |
+| `block` | `task_blocked` |
+| `accept(pass)` | `accept_pass` |
+| `accept(reject)` | `accept_reject` |
+
+**装配顺序坑**：`index.js` 里 board 在 L130 装配、metrics 在 L276 装配。
+若只接受实例，board 装配时 metrics 还是 undefined ⇒ 埋点永久静默失效。
+⇒ 改成接受**取值函数** `metrics: () => services.metrics`，规避顺序耦合。
+
+**纪律**：埋点全包在 `try{}catch{}` 里 —— 指标是旁路，**绝不能**让业务动作失败。
+
+### Added · 文档一致性校验（欠账3）
+
+`test/docs-consistency.test.mjs`（5 项，随 `run-all.sh` 自动跑）：
+① 主文档版本声明 == `package.json` version
+② 文档里的「NNN 项测试」不得低于基线
+③ 文档里的工具数 == `TOOL_NAMES.length`
+④ 历史快照必须保留「勿引用/已过期」标记
+⑤ `reports/` 交付报告必须存在
+
+**它上线当天就抓出真失真**：
+```
+docs/02-03-04 声明 v0.7.3，实际 0.8.0
+5 处写 1108 项测试，实际 1263
+```
+
+**刻意不做的事**：
+- 不改历史叙述（`01-架构文档.md` 里「0.7.3 已部署重启」是当时事实，改写就是伪造历史）
+- 不校验 CHANGELOG（它本来就按版本分段记历史）
+- 测试数用**下限**而非精确相等（否则每加一个用例就红一次，最后会被人 disable —— 比没有还糟）
+
+---
+
+## [Unreleased] - bots04 第 1 批「止血」
+
+大团队语义澄清后的第一批落地。**核心是止血**：修掉一个已经在烧 token 的实测缺陷。
+
+### Fixed · 唤醒风暴（实测已在烧钱）
+
+**改造前实测**（`~/.dsh/cs-bots/wakes.jsonl`）：
+```
+room-msg:m-1:ui         → failed    ← 居然去唤醒 Boss 自己
+room-msg:m-1:bot-6b65…  → failed
+room-msg:m-1:bot-df1c…  → failed
+```
+一条房间消息 = 3 次唤醒尝试，**3 次全失败**。
+
+**两个根因**：
+1. `relay` 的 `targets` 缺省 = 「除发送者外全部成员」⇒ 一条消息 N 个成员 = N 次模型调用；
+2. 人类身份（`ui`/`user`/`person`）被当成普通成员 ⇒ **去唤醒人**，这没有任何意义。
+
+**修法**（`src/room.js`）：
+- `DEFAULT_SETTINGS` 新增 `mentionOnly: true` —— **缺省安静**，要广播必须显式打开
+- 新增 `HUMAN_IDS` + `isHumanId()`，**任何模式**下 human id 都不被唤醒
+- `relay()` 重写为四档 `targetSource`：
+  | 档 | 行为 |
+  |---|---|
+  | `explicit` | 显式 targets 原样；混入 human 剔除 + warn |
+  | `mention` | @ 到谁只唤醒谁 |
+  | `mention-only-no-target` | **没 @ ⇒ `relayed:0` 且不抛错**（止血核心） |
+  | `broadcast` | `mentionOnly:false` 才回退全员，且仍排除 human |
+
+**为什么缺省是 `true` 而不是 `false`**：安全的默认值必须落在「少打扰」这一侧。
+要广播是少数场景，让它多打一次字，比让每条消息都烧 N 次调用更划算。
+
+### Added · 团队归属标识 `kind`
+
+`teams.jsonl` 新增 `kind: 'human' | 'agent'`：
+- `by ∈ {ui, user, person}` ⇒ **强制 `'human'`**
+- 其他 ⇒ **强制 `'agent'`**
+- 显式传入与推导矛盾 ⇒ **抛 `TEAM_KIND_MISMATCH`**
+
+**为什么必须服务层强制推导、不信任入参**：`createdBy` 是可冒用的字符串。
+Bot 传 `by:'ui'` 就能自称「Boss 建的团队」—— 那两个方向的伪造都得拦：
+Bot 谎称 Boss 建（骗信任）、Boss 谎称 Bot 建（掩盖归属）。
+
+**与 `type(big|small)` 的关系**：`type` 保留但**降级为规模提示**，不再承载「谁建的」语义。
+历史数据缺 `kind` ⇒ 前端按 `createdBy` 兜底，不显示 undefined。
+
+UI 徽标：**`👤 Boss建设`** / **`🤖 智能体建设`**。
+> 文案纪律：**不用「人建」**（Boss：「不太好听」）。连注释里也不许出现。
+
+### Fixed · 桥断了：`bot_teams_add` 不建房间
+
+`attachRoom` 只在 API 层（`src/api.js:1555`）有，**工具层没有** ⇒
+智能体用 `bot_teams_add` 加人后团队与房间脱钩，**跨团队消息发不出去**。
+这是「大团队这座桥是断的」的直接原因。
+
+**修法**（`src/tools.js`）：加成员后若 `team.roomId` 存在则自动 `room.join`；
+失败**不阻断**团队编辑，返回 `{ok:true, team, roomError}` 留痕。
+
+**过程教训**：初版在工具 `run` 里调 `warn(...)`，但 `warn` 只是 `installTools` 的**形参**、
+不在工具闭包作用域内 ⇒ `ReferenceError: warn is not defined` 导致工具整体失败。
+工具闭包里只能拿到 `ctx`，拿不到安装期的形参。
+
+### Added · 测试（+22，基线 1241 → 1263）
+
+| 文件 | 新增 |
+|---|---|
+| `test/room.test.mjs` | +6（mention 定向、无 @ 静默、human 排除、显式 targets 剔除、settings 白名单、回放持久） |
+| `test/teams.test.mjs` | +5（Boss⇒human、Bot⇒agent、矛盾抛错、事件流持久、与 type 并存） |
+| `test/tools.test.mjs` | +3（自动入房、无房间不报错、join 失败不阻断） |
+| `test/client-t38.test.mjs` | 新增 7 项（徽标文案、不置灰、@ 提示） |
+
+**变异验证**（确认断言不是摆设）：
+| 变异 | 结果 |
+|---|---|
+| `mentionOnly: true` → `false` | 5 用例转红 |
+| `derivedKind` 硬编码 `'agent'` | 4 用例转红 |
+| 关掉 auto-attach 分支 | 2 用例转红 |
+
+### 认知纠正（记录在案，避免后人重踩）
+
+旧调研 `design/大团队-可行性调研-v1.md`（11-06）把大团队定位成「组织层 / 聚合视图」，
+**这个定位错了**。Boss 2026-11-11 正式澄清：大团队是**跨团队沟通的桥梁**（路由层）。
+
+> **小团队是「谁干活」，大团队是「谁跟谁说话」。**
+
+另外调研里「小团队：Lead 自动 spawn，人不进去」也**不准确** ——
+官方 `dsh-experimental-client-ui-agent-team/README.zh.md` L34/L91/L184 证实：
+用户**能**点进 active teammate 会话发言，走 addressed-subagent 路径。
+正确表述是「人可以进，只是不常进」。
+
+### 已知限制
+
+- 「Boss 发言同步给 DSH 原生团队 leader」**本批未做**。3 条硬限制：
+  ① 官方无「Bot→Lead 发 peer 消息」公开工具；
+  ② teammate 投递需 Lead-to-child edge 授权，sibling 消息不能伪装成 Lead；
+  ③ cs-bots 当前无法读取 `agentTeam` 投影（只在 `compat.js:150` 探测服务存在）。
+  ⇒ 需单独立项 2–3 天，硬做只能走「伪装成 Lead」，违反官方不变量。
+- 跨团队定向请求（`bot_team_route`）未实现，属第 2 批。
+
+---
+
 ## [0.8.0] - 2026-11-10
 
 改造09「Boss 体验 + 任务可管理性 + 升级接续」。

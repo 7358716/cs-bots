@@ -400,18 +400,32 @@ test('relay：投递给成员 → kernel.followup 被调，且 content 正确（
   assert.equal(text.endsWith('请复核 board.js 的 CAS'), true, '正文在最后，不带截断标记')
 })
 
-test('relay：缺省 targets = 全部成员**但不含发送者自己**；空房间抛错', (t) => {
+test('relay：缺省 mentionOnly ⇒ 没 @ 就不唤醒任何人（relayed:0，不抛错）；mentionOnly:false 才广播', (t) => {
   const sent = []
   const { rooms } = setup(t, {}, { agents: liveAgents(sent) })
   const room = seed(rooms)
   const msg = rooms.post({ roomId: room.id, from: 's-b', text: '广播' })
 
-  const result = rooms.relay({ roomId: room.id, messageId: msg.id })
-  assert.deepEqual(result.deliveries.map((d) => d.target), ['s-a', 's-c'], '不回投给发送者')
+  // ── 2026-11-11 行为变更：缺省从「广播给全部成员」改为「只在被 @ 时唤醒」──
+  // 实测证据：一条无 @ 的房间消息产生 3 次唤醒尝试、3 次全失败（其中一次打给 `ui`）。
+  // 所以**缺省**必须是安静的：没 @ 到人 ⇒ relayed:0，且**不抛错**（「只记录不打扰」是合法结果）。
+  const quiet = rooms.relay({ roomId: room.id, messageId: msg.id })
+  assert.equal(quiet.relayed, 0, '缺省没 @ ⇒ 不唤醒任何人')
+  assert.equal(quiet.attempted, 0)
+  assert.equal(quiet.ok, true, '「只记录不打扰」是合法结果，不是失败')
+  assert.equal(quiet.reason, 'mention-only-no-target')
+  assert.equal(sent.length, 0, '一个 followup 都不许发出去')
+
+  // 显式关掉定向（broadcast 模式）⇒ 回退到「除发送者外全部成员」
+  const room2 = seed(rooms, { settings: { mentionOnly: false } })
+  const msg2 = rooms.post({ roomId: room2.id, from: 's-b', text: '广播' })
+  const broadcast = rooms.relay({ roomId: room2.id, messageId: msg2.id })
+  assert.deepEqual(broadcast.deliveries.map((d) => d.target), ['s-a', 's-c'], '不回投给发送者')
+  assert.equal(broadcast.targetSource, 'broadcast')
   assert.equal(sent.length, 2)
 
-  // 只有发送者一人的房间 → 无目标可投，抛错（不是静默成功）
-  const solo = rooms.createRoom_({ name: 'solo-relay', members: ['s-x'], byId: 's-x' })
+  // 只有发送者一人的房间 + 广播模式 → 无目标可投，抛错（不是静默成功）
+  const solo = rooms.createRoom_({ name: 'solo-relay', members: ['s-x'], byId: 's-x', settings: { mentionOnly: false } })
   const m2 = rooms.post({ roomId: solo.id, from: 's-x', text: '自言自语' })
   assert.throws(
     () => rooms.relay({ roomId: solo.id, messageId: m2.id }),
@@ -692,4 +706,102 @@ test('2026-11-04 P1-5：user（主管本人）可改房间设置（不被成员�
   const room = seed(rooms)
   const updated = rooms.update({ roomId: room.id, expectedRev: room.rev, byId: 'user', name: 'by-user' })
   assert.equal(updated.name, 'by-user')
+})
+
+// ══ 2026-11-11「唤醒风暴」止血 —— mentionOnly 定向唤醒 ══════════════════════
+
+test('mentionOnly：缺省 true，@ 到的人被唤醒，其他人不唤醒', (t) => {
+  const sent = []
+  const { rooms } = setup(t, {}, { agents: liveAgents(sent) })
+  const room = seed(rooms)
+  const msg = rooms.post({ roomId: room.id, from: 's-b', text: '@s-a 帮忙看下这个' })
+
+  const result = rooms.relay({ roomId: room.id, messageId: msg.id })
+  assert.equal(result.targetSource, 'mention', '有 @ 时走 mention 档')
+  assert.equal(result.relayed, 1, '只 @ 了 s-a，只唤醒 1 人')
+  assert.deepEqual(result.deliveries.map((d) => d.target), ['s-a'])
+  assert.equal(sent.length, 1, '只投递给 s-a')
+})
+
+test('mentionOnly：缺省 true，没 @ 到人 ⇒ relayed:0 不抛错，一个 followup 都不发', (t) => {
+  const sent = []
+  const { rooms } = setup(t, {}, { agents: liveAgents(sent) })
+  const room = seed(rooms)
+  const msg = rooms.post({ roomId: room.id, from: 's-b', text: '大家看下这个（没 @ 任何人）' })
+
+  const result = rooms.relay({ roomId: room.id, messageId: msg.id })
+  assert.equal(result.ok, true, '「只记录不打扰」是合法结果')
+  assert.equal(result.relayed, 0)
+  assert.equal(result.attempted, 0)
+  assert.equal(result.reason, 'mention-only-no-target')
+  assert.equal(sent.length, 0, '一个 followup 都不许发出去')
+})
+
+test('mentionOnly：human 身份（ui/user/person）在任何模式下都不被唤醒', (t) => {
+  const sent = []
+  const { rooms } = setup(t, {}, { agents: liveAgents(sent) })
+  const room = rooms.createRoom_({
+    name: 'humans-excluded',
+    members: ['s-a', 'ui', 'user', 'person'],
+    byId: 's-a',
+  })
+  const msg = rooms.post({ roomId: room.id, from: 's-a', text: '@ui @user @person 看这条' })
+
+  // mentionOnly=true 时：human 被 @ 了也跳过 → 合法空转发，不抛错
+  const result = rooms.relay({ roomId: room.id, messageId: msg.id })
+  assert.equal(result.relayed, 0, 'human id 被 @ 了也不唤醒')
+  assert.equal(result.reason, 'mention-only-no-target')
+  assert.equal(sent.length, 0)
+
+  // mentionOnly=false（广播）+ 房间里除发送者外全是 human → 无可唤醒目标，**抛错**
+  // 这是配置错误：广播模式但没有 bot 可广播给。抛错比静默更诚实。
+  const room2 = rooms.createRoom_({
+    name: 'humans-excluded-broadcast',
+    members: ['s-b', 'ui', 'user'],
+    byId: 's-b',
+    settings: { mentionOnly: false },
+  })
+  const msg2 = rooms.post({ roomId: room2.id, from: 's-b', text: '广播测试' })
+  assert.throws(
+    () => rooms.relay({ roomId: room2.id, messageId: msg2.id }),
+    (e) => e instanceof RoomError && e.code === 'ROOM_NO_TARGETS',
+    '广播模式但没有可唤醒成员（全是 human）⇒ 抛错，不静默',
+  )
+})
+
+test('mentionOnly：显式 targets 走 explicit 档，剔除混入的 human id 并 warn', (t) => {
+  const sent = []
+  const { rooms } = setup(t, {}, { agents: liveAgents(sent) })
+  const room = seed(rooms)
+  const msg = rooms.post({ roomId: room.id, from: 's-b', text: '定向投递' })
+
+  const result = rooms.relay({ roomId: room.id, messageId: msg.id, targets: ['s-a', 'ui'] })
+  assert.equal(result.targetSource, 'explicit')
+  assert.deepEqual(result.deliveries.map((d) => d.target), ['s-a'], 'ui 被剔除，只有 s-a 被投递')
+  assert.equal(result.relayed, 1)
+  assert.equal(sent.length, 1)
+})
+
+test('mentionOnly：settings 未知键仍抛错（mentionOnly 加入白名单但不放宽校验）', (t) => {
+  const { rooms } = setup(t)
+  assert.throws(
+    () => rooms.createRoom_({ name: 'bad-key', members: ['s-a'], byId: 's-a', settings: { nonExistent: true } }),
+    (e) => e instanceof RoomError && e.code === 'ROOM_BAD_SETTING' && /nonExistent/.test(e.message),
+  )
+  // mentionOnly 是合法键
+  const ok = rooms.createRoom_({ name: 'ok-mention-only', members: ['s-a'], byId: 's-a', settings: { mentionOnly: false } })
+  assert.equal(ok.settings.mentionOnly, false)
+  assert.equal(ok.settings.allowBotAutoPost, true, '未给的键回落缺省')
+})
+
+test('mentionOnly：回放持久化 —— 从磁盘重建的房间 settings.mentionOnly 与内存态一致', (t) => {
+  const { dir, rooms } = setup(t)
+  const room = rooms.createRoom_({ name: 'replay-mention', members: ['s-a', 's-b'], byId: 's-a' })
+  assert.equal(room.settings.mentionOnly, true, '缺省 true')
+  rooms.update({ roomId: room.id, expectedRev: room.rev, byId: 's-a', settings: { mentionOnly: false } })
+
+  const revived = createRoom({ logger: { info() {}, warn() {} } }, { stateDir: dir })
+  const got = revived.get(room.id)
+  assert.equal(got.settings.mentionOnly, false, '回放后 mentionOnly=false 仍在')
+  assert.equal(got.settings.maxBotsPerRound, 3, '其他缺省值也完好')
 })

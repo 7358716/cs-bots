@@ -345,14 +345,22 @@ export function createDispatcher(ctx, config = {}) {
     return { wake, durable }
   }
 
-  /** 构造 wake 草稿（此刻尚无终态；`result` 只在 `commit` 时赋值）。 */
-  function draftWake({ target, reason, dedupKey, text, at }) {
+  /**
+   * 构造 wake 草稿（此刻尚无终态；`result` 只在 `commit` 时赋值）。
+   *
+   * `teamId`：唤醒成本可见（t-39 第2批 D）。**不是所有唤醒都属于某个团队**
+   * （例如任务派活、房间广播都可能与团队无关）—— 那种情况一律写 `null`，
+   * 绝不按 target 猜一个团队塞进去：猜出来的数字比没有更糟，它会让
+   * 「每团队唤醒成本」的统计凭空多出一份不属于它的开销。
+   */
+  function draftWake({ target, reason, dedupKey, text, at, teamId }) {
     return {
       id: `wake-${at}-${process.pid.toString(36)}-${takeSeq().toString(36)}`,
       target,
       reason,
       dedupKey,
       text,
+      teamId: teamId ?? null,
       scheduledAt: at,
     }
   }

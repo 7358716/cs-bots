@@ -127,7 +127,14 @@ function applyInner(ctx, config, { log, warn }) {
     // ⚠️ 2026-11-05（P0）：createBoard 必须拿到 settings —— wipLimitPerBot（WIP 上限）
     //   与 requireTriageForReady（Ready 闸门）都从 config.settings 读。只传 stateDir 会让
     //   平台设置对任务板静默失效（永远退回代码内默认值），且用户改了设置看不到任何变化。
-    services.board = createBoard(ctx, { stateDir: config.stateDir, leaseMs: settings.defaultLeaseMs, settings })
+    services.board = createBoard(ctx, {
+      stateDir: config.stateDir,
+      leaseMs: settings.defaultLeaseMs,
+      settings,
+      // 指标旁路（bots04 欠账2）：传**取值函数**而不是实例 ——
+      // metrics 在 L276 才装配，此刻还是 undefined。传函数可规避装配顺序耦合。
+      metrics: () => services.metrics,
+    })
     log(`[cs-bots] BoardService 就绪（stateDir=${services.board.paths?.stateDir ?? '?'}）`)
     // ⚠️ 修复（2026-11-04 测试，P1-4）：expireLeases 之前无任何调用者，
     //   owner 崩溃/失联后任务永久停在 in_progress（连"重启时回收"都不做）。

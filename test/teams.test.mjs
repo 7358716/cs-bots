@@ -248,3 +248,200 @@ test('setPolicy：改策略本身留痕，且策略立即生效', async (_t) => 
   // 且事件流里有 setPolicy 事件（留痕是审计底线）
   assert.ok(readEvents(_t_dir).some((e) => e.action === 'setPolicy'), '策略变更必须留痕')
 })
+
+// ══ 2026-11-11 需求3：kind = human | agent（服务层强制推导，防伪造）══════════
+
+test('kind：Boss（ui/user/person）建的团队 ⇒ human', (t) => {
+  const { svc } = setup(t)
+  for (const bossId of ['ui', 'user', 'person']) {
+    const team = svc.create({ name: `by-${bossId}`, type: 'small', by: bossId })
+    assert.equal(team.kind, 'human', `by=${bossId} 推导为 human`)
+  }
+})
+
+test('kind：Bot（会话 id）建的团队 ⇒ agent', (t) => {
+  const { svc } = setup(t)
+  const team = svc.create({ name: 'bot-team', type: 'small', by: 'bot-6b654c19' })
+  assert.equal(team.kind, 'agent', '非 HUMAN_IDS ⇒ agent')
+})
+
+test('kind：显式传与推导矛盾的 kind ⇒ 抛 TEAM_KIND_MISMATCH（不许伪造）', (t) => {
+  const { svc } = setup(t)
+  // Bot 谎称自己是人建的团队
+  assert.throws(
+    () => svc.create({ name: 'fake-human', type: 'small', by: 'bot-x', kind: 'human' }),
+    (e) => e instanceof TeamError && e.code === 'TEAM_KIND_MISMATCH',
+  )
+  // Boss 谎称是 Bot 建的
+  assert.throws(
+    () => svc.create({ name: 'fake-agent', type: 'small', by: 'ui', kind: 'agent' }),
+    (e) => e instanceof TeamError && e.code === 'TEAM_KIND_MISMATCH',
+  )
+  // 显式传与服务层推导一致的 kind ⇒ 放行（不误伤）
+  const ok = svc.create({ name: 'consistent-agent', type: 'small', by: 'bot-y', kind: 'agent' })
+  assert.equal(ok.kind, 'agent')
+  const okHuman = svc.create({ name: 'consistent-human', type: 'small', by: 'ui', kind: 'human' })
+  assert.equal(okHuman.kind, 'human')
+})
+
+test('kind：落进事件流，回放后仍在（不是只有内存里有）', (t) => {
+  const { svc, dir } = setup(t)
+  const team = svc.create({ name: 'persisted-kind', type: 'small', by: 'ui' })
+  assert.equal(team.kind, 'human')
+  const ev = readEvents(dir).find((e) => e.id === team.id)
+  assert.equal(ev.after.kind, 'human', '事件流里的 after 必须带 kind')
+
+  const revived = createTeams({ logger: { info() {}, warn() {} } }, { stateDir: dir })
+  assert.equal(revived.get(team.id).kind, 'human', '回放后 kind 仍在')
+})
+
+test('kind：与 type(big/small) 并存互不影响', (t) => {
+  const { svc } = setup(t)
+  const big = svc.create({ name: 'B', type: 'big', by: 'ui', leadId: 'bot-lead', memberIds: ['bot-a'] })
+  assert.equal(big.type, 'big')
+  assert.equal(big.kind, 'human', 'Boss 建的大团队：kind=human + type=big')
+  const small = svc.create({ name: 'S', type: 'small', by: 'bot-z' })
+  assert.equal(small.type, 'small')
+  assert.equal(small.kind, 'agent')
+})
+
+// ══ t-39 A/B：跨团队路由 + 环路防护（服务层 resolveRoute/recordRoute/listRoutes）══
+
+/** 建两个各带 leadId 的大团队，返回 t1/t2。 */
+function twoTeams(svc) {
+  const t1 = svc.create({ name: 'A', type: 'big', by: 'ui', leadId: 'lead-A', memberIds: ['bot-a'] })
+  const t2 = svc.create({ name: 'B', type: 'big', by: 'ui', leadId: 'lead-B', memberIds: ['bot-b'] })
+  return { t1, t2 }
+}
+
+test('route：正常路由到 toTeam ⇒ accepted，目标解析到对方 leadId（不是全部成员）', (t) => {
+  const { svc } = setup(t)
+  const { t1, t2 } = twoTeams(svc)
+  const r = svc.resolveRoute({ fromTeam: t1.id, toTeam: t2.id, taskId: 't-1', text: 'hi', by: 'lead-A' })
+  assert.equal(r.ok, true)
+  assert.equal(r.decision, 'accepted')
+  assert.equal(r.to.kind, 'team')
+  assert.equal(r.to.id, t2.id)
+  assert.equal(r.to.leadId, 'lead-B', '只唤 leadId，不唤成员 bot-b')
+  assert.equal(r.hop, 0)
+})
+
+test('route：toBot 解析到该 Bot 所属团队的 lead', (t) => {
+  const { svc } = setup(t)
+  const { t2 } = twoTeams(svc)
+  const r = svc.resolveRoute({ toBot: 'bot-b', taskId: 't-2', by: 'lead-A' })
+  assert.equal(r.ok, true)
+  assert.equal(r.to.kind, 'bot')
+  assert.equal(r.to.id, t2.id)
+  assert.equal(r.to.leadId, 'lead-B', '目标仍是团队 lead，不是 bot-b 本人')
+})
+
+test('route：toTeam 与 toBot 都缺 ⇒ refused ROUTE_TARGET_REQUIRED（可读，不抛）', (t) => {
+  const { svc } = setup(t)
+  const r = svc.resolveRoute({ taskId: 't-3', by: 'lead-A' })
+  assert.equal(r.ok, false)
+  assert.equal(r.decision, 'refused')
+  assert.equal(r.reason, 'ROUTE_TARGET_REQUIRED')
+})
+
+test('route：toTeam 与 toBot 同时给 ⇒ refused ROUTE_TARGET_AMBIGUOUS', (t) => {
+  const { svc } = setup(t)
+  const { t2 } = twoTeams(svc)
+  const r = svc.resolveRoute({ toTeam: t2.id, toBot: 'bot-b', taskId: 't-4', by: 'lead-A' })
+  assert.equal(r.ok, false)
+  assert.equal(r.reason, 'ROUTE_TARGET_AMBIGUOUS')
+})
+
+test('route：taskId 缺失 ⇒ refused ROUTE_TASK_ID_REQUIRED', (t) => {
+  const { svc } = setup(t)
+  const { t2 } = twoTeams(svc)
+  const r = svc.resolveRoute({ toTeam: t2.id, by: 'lead-A' })
+  assert.equal(r.ok, false)
+  assert.equal(r.reason, 'ROUTE_TASK_ID_REQUIRED')
+})
+
+test('route：目标团队不存在 ⇒ refused ROUTE_TARGET_NOT_FOUND（不是抛错）', (t) => {
+  const { svc } = setup(t)
+  const r = svc.resolveRoute({ toTeam: 'team-999', taskId: 't-5', by: 'lead-A' })
+  assert.equal(r.ok, false)
+  assert.equal(r.reason, 'ROUTE_TARGET_NOT_FOUND')
+})
+
+test('route：目标团队没有 leadId ⇒ refused ROUTE_NO_LEAD（不能路由到无人可唤的团队）', (t) => {
+  const { svc } = setup(t)
+  const orphan = svc.create({ name: 'no-lead', type: 'small', by: 'bot-x' })
+  const r = svc.resolveRoute({ toTeam: orphan.id, taskId: 't-6', by: 'lead-A' })
+  assert.equal(r.ok, false)
+  assert.equal(r.reason, 'ROUTE_NO_LEAD')
+})
+
+test('route：hop=3 放行，hop=4 ⇒ refused ROUTE_HOP_EXCEEDED（>3 拒绝）', (t) => {
+  const { svc } = setup(t)
+  const { t1, t2 } = twoTeams(svc)
+  const okAt3 = svc.resolveRoute({ fromTeam: t1.id, toTeam: t2.id, taskId: 'hop-3', hop: 3, by: 'lead-A' })
+  assert.equal(okAt3.ok, true, 'hop=3 是边界，放行')
+  const badAt4 = svc.resolveRoute({ fromTeam: t1.id, toTeam: t2.id, taskId: 'hop-4', hop: 4, by: 'lead-A' })
+  assert.equal(badAt4.ok, false)
+  assert.equal(badAt4.decision, 'refused')
+  assert.equal(badAt4.reason, 'ROUTE_HOP_EXCEEDED')
+})
+
+test('route 去重键：同一 (from,to,taskId) 的 dedupKey 相同 ⇒ dispatcher 能判重（A→B→A→B 第3跳被拦）', (t) => {
+  const { svc } = setup(t)
+  const { t1, t2 } = twoTeams(svc)
+  const taskId = 'loop-task'
+  // A→B（hop0）与 A→B（hop2）必须是**同一个** dedupKey，否则 dispatcher 拦不住
+  const h0 = svc.resolveRoute({ fromTeam: t1.id, toTeam: t2.id, taskId, hop: 0, by: 'lead-A' })
+  const h2 = svc.resolveRoute({ fromTeam: t1.id, toTeam: t2.id, taskId, hop: 2, by: 'lead-A' })
+  assert.equal(h0.ok, true)
+  assert.equal(h2.ok, true)
+  assert.equal(h0.dedupKey, h2.dedupKey, 'dedupKey 不含 hop ⇒ 同一路由链能判重')
+  // 反向 B→A 是**不同**键（不是同一个方向，不该互相拦）
+  const back = svc.resolveRoute({ fromTeam: t2.id, toTeam: t1.id, taskId, hop: 1, by: 'lead-B' })
+  assert.notEqual(back.dedupKey, h0.dedupKey, '反向路由是不同的键')
+})
+
+test('recordRoute：先落 route 事件（intent-first），可在事件流里查回', (t) => {
+  const { svc, dir } = setup(t)
+  const { t1, t2 } = twoTeams(svc)
+  const r = svc.resolveRoute({ fromTeam: t1.id, toTeam: t2.id, taskId: 't-7', text: 'payload', by: 'lead-A' })
+  const rec = svc.recordRoute({
+    to: r.to, fromTeam: r.fromTeam, taskId: 't-7', text: 'payload', hop: r.hop, by: 'lead-A',
+    wake: { ok: true, result: 'sent' },
+  })
+  assert.equal(rec.toId, t2.id)
+  assert.equal(rec.toLeadId, 'lead-B')
+  assert.equal(rec.taskId, 't-7')
+  assert.equal(rec.hop, 0)
+  // 落盘可查
+  const ev = readEvents(dir).find((e) => e.action === 'route')
+  assert.ok(ev, 'teams.jsonl 里必须有 route 事件')
+  assert.equal(ev.after.toLeadId, 'lead-B')
+  assert.equal(ev.by, 'lead-A')
+})
+
+test('listRoutes：按 toId / fromTeam / taskId 过滤', (t) => {
+  const { svc } = setup(t)
+  const { t1, t2 } = twoTeams(svc)
+  const r1 = svc.resolveRoute({ fromTeam: t1.id, toTeam: t2.id, taskId: 'task-x', by: 'lead-A' })
+  svc.recordRoute({ to: r1.to, fromTeam: r1.fromTeam, taskId: 'task-x', hop: 0, by: 'lead-A' })
+  const r2 = svc.resolveRoute({ fromTeam: t2.id, toTeam: t1.id, taskId: 'task-y', by: 'lead-B' })
+  svc.recordRoute({ to: r2.to, fromTeam: r2.fromTeam, taskId: 'task-y', hop: 0, by: 'lead-B' })
+
+  assert.equal(svc.listRoutes({}).length, 2)
+  assert.equal(svc.listRoutes({ taskId: 'task-x' }).length, 1)
+  assert.equal(svc.listRoutes({ fromTeam: t1.id }).length, 1)
+  assert.equal(svc.listRoutes({ toId: t1.id }).length, 1)
+})
+
+test('recordRoute：route 事件重启后仍在（不只在内存）', (t) => {
+  const { svc, dir } = setup(t)
+  const { t1, t2 } = twoTeams(svc)
+  const r = svc.resolveRoute({ fromTeam: t1.id, toTeam: t2.id, taskId: 'persist-route', by: 'lead-A' })
+  svc.recordRoute({ to: r.to, fromTeam: r.fromTeam, taskId: 'persist-route', hop: 0, by: 'lead-A' })
+
+  const revived = createTeams({ logger: { info() {}, warn() {} } }, { stateDir: dir })
+  const rows = revived.listRoutes({ taskId: 'persist-route' })
+  assert.equal(rows.length, 1, '回放后 route 记录仍在')
+  assert.equal(rows[0].toLeadId, 'lead-B')
+})

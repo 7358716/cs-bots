@@ -78,7 +78,7 @@ test('工具全部注册成功，且数量与 TOOL_NAMES 一致', () => {
     // PDCA 建设：cycle 4 + metrics 2 + verify 1 + teams 3 = 10 个（28 → 38）；
 // 改造07：subscription 3 个（task_subscribe / unsubscribe / subscriptions）→ 41
 // 升级09（契约 §2.4）：阶段产出物 bot_task_phase（纯增量新工具）→ 42
-    assert.equal(TOOL_NAMES.length, 42, `工具总数应为 42，实际 ${TOOL_NAMES.length}`)
+    assert.equal(TOOL_NAMES.length, 43, `工具总数应为 43，实际 ${TOOL_NAMES.length}`)
   } finally {
     h.cleanup()
   }
@@ -353,4 +353,216 @@ test('域服务缺失时工具返回可读失败（不是抛崩）', async () =>
   } finally {
     rmSync(stateDir, { recursive: true, force: true })
   }
+})
+
+// ══ 2026-11-11 需求3 补充：bot_teams_add 自动把新成员拉进团队议事厅 ══════════
+
+test('bot_teams_add：团队已绑房间 ⇒ 加成员时自动 room.join，成员真进房间', async () => {
+  const h = boot()
+  try {
+    const s = getServices(h.ctx)
+    const room = s.room.create({ name: 'attach-auto', members: ['probe-session'], byId: 'probe-session' })
+    const team = s.teams.create({
+      name: 'T-auto', type: 'big', by: 'probe-session', leadId: 'probe-session', memberIds: [],
+    })
+    s.teams.attachRoom({ id: team.id, roomId: room.id, by: 'probe-session' })
+
+    const res = await h.call('bot_teams_add', { id: team.id, memberId: 'bot-new' })
+    assert.equal(res.ok, true, JSON.stringify(res))
+    assert.ok(res.team.members.includes('bot-new'), '团队成员已加')
+    assert.equal(res.roomError, undefined, '成功时不应有 roomError')
+
+    const after = s.room.get(room.id)
+    assert.ok(after.members.includes('bot-new'), '房间成员表里必须有新成员（不是只改了团队）')
+  } finally {
+    h.cleanup()
+  }
+})
+
+test('bot_teams_add：团队没绑房间 ⇒ 不加房间，也不报 roomError', async () => {
+  const h = boot()
+  try {
+    const s = getServices(h.ctx)
+    const team = s.teams.create({ name: 'T-noroom', type: 'small', by: 'probe-session' })
+    const res = await h.call('bot_teams_add', { id: team.id, memberId: 'bot-x' })
+    assert.equal(res.ok, true)
+    assert.equal(res.roomError, undefined, '没房间时不该有 roomError')
+    assert.ok(res.team.members.includes('bot-x'))
+  } finally {
+    h.cleanup()
+  }
+})
+
+test('bot_teams_add：房间 join 失败 ⇒ 团队编辑仍成功，roomError 说明原因（不阻断主流程）', async () => {
+  const h = boot()
+  try {
+    const s = getServices(h.ctx)
+    const room = s.room.create({ name: 'attach-dup', members: ['probe-session', 'bot-dup'], byId: 'probe-session' })
+    const team = s.teams.create({
+      name: 'T-dup', type: 'big', by: 'probe-session', leadId: 'probe-session', memberIds: [],
+    })
+    s.teams.attachRoom({ id: team.id, roomId: room.id, by: 'probe-session' })
+
+    // bot-dup 已在房间里 ⇒ room.join 会抛 ROOM_ALREADY_MEMBER
+    const res = await h.call('bot_teams_add', { id: team.id, memberId: 'bot-dup' })
+    assert.equal(res.ok, true, '团队编辑必须成功（房间失败不阻断）')
+    assert.ok(res.team.members.includes('bot-dup'), '团队成员确实加上了')
+    assert.equal(typeof res.roomError, 'string', 'roomError 必须回传')
+    assert.match(res.roomError, /ROOM_ALREADY_MEMBER/, 'roomError 要带可读原因')
+    // 没有独立 logger（工具作用域内），roomError 本身就是留痕证据
+  } finally {
+    h.cleanup()
+  }
+})
+
+// ══ t-39 A/B：bot_team_route 工具层测试（跨团队路由 + 环路防护 + 1消息=1唤醒）══
+
+/**
+ * 造一个带 fake agents 的宿主，让 dispatcher 能真实投递（记录 delivered）。
+ * 复用 boot() 的 apply(ctx, {stateDir})，再给 ctx.get('agents') 加替身。
+ */
+function bootWithAgents() {
+  const base = boot()
+  const stateDir = base.stateDir
+  // 重新 apply 一次带 agents 服务的 ctx
+  const delivered = []
+  const leadAgent = { id: 'lead-B', followup(message) { delivered.push(message) } }
+  const memberAgent = { id: 'bot-b', followup(message) { delivered.push(message) } }
+  const leadAAgent = { id: 'lead-A', followup(message) { delivered.push(message) } }
+  base.ctx.get = (key) => {
+    if (key === 'tools') {
+      return { register: (def) => { base.registered.push(def); return () => {} }, guard: () => () => {}, schemas: () => [] }
+    }
+    if (key === 'agents') {
+      return {
+        get: (id) => (id === 'lead-B' ? leadAgent : id === 'bot-b' ? memberAgent : id === 'lead-A' ? leadAAgent : undefined),
+        list: () => [leadAgent, memberAgent, leadAAgent],
+      }
+    }
+    return undefined
+  }
+  // 重新注册工具（因为 ctx.get 变了）
+  base.registered.length = 0
+  installTools(base.ctx, { warn: () => {} })
+  return { ...base, delivered, leadAgent, memberAgent }
+}
+
+test('bot_team_route：跨团队路由成功 ⇒ decision=delivered，wake target 是对方 leadId', async (t) => {
+  const h = bootWithAgents()
+  t.after(h.cleanup)
+  // 建两个团队
+  const t1 = await h.call('bot_teams_create', { name: 'team-A', type: 'big', leadId: 'lead-A', memberIds: [] })
+  assert.equal(t1.ok, true)
+  const t2 = await h.call('bot_teams_create', { name: 'team-B', type: 'big', leadId: 'lead-B', memberIds: ['bot-b'] })
+  assert.equal(t2.ok, true)
+
+  const res = await h.call('bot_team_route', {
+    fromTeam: t1.team.id, toTeam: t2.team.id, taskId: 't-route-1', text: 'hello from A', hop: 0,
+  }, { agent: { id: 'lead-A' } })
+  assert.equal(res.ok, true)
+  assert.equal(res.decision, 'delivered')
+  assert.equal(res.to.id, t2.team.id)
+  assert.equal(res.to.leadId, 'lead-B', '唤醒目标是对方 lead，不是成员')
+  assert.equal(res.hop, 0)
+  // 只唤了 lead-B，没唤 bot-b
+  assert.equal(h.delivered.length, 1, '1 条消息 = 1 次唤醒（只唤 leadId）')
+  // followup 收到的是消息对象（content[0].text 才是正文），不是裸字符串
+  assert.match(h.delivered[0].content[0].text, /hello from A/)
+})
+
+test('bot_team_route：目标团队不存在 ⇒ {ok:false, decision:refused, ROUTE_TARGET_NOT_FOUND}', async (t) => {
+  const h = bootWithAgents()
+  t.after(h.cleanup)
+  const res = await h.call('bot_team_route', { toTeam: 'team-nope', taskId: 't-x' })
+  assert.equal(res.ok, false)
+  assert.equal(res.decision, 'refused')
+  assert.equal(res.reason, 'ROUTE_TARGET_NOT_FOUND')
+})
+
+test('bot_team_route：toTeam 与 toBot 都没给 ⇒ refused ROUTE_TARGET_REQUIRED', async (t) => {
+  const h = bootWithAgents()
+  t.after(h.cleanup)
+  const res = await h.call('bot_team_route', { taskId: 't-x' })
+  assert.equal(res.ok, false)
+  assert.equal(res.decision, 'refused')
+  assert.equal(res.reason, 'ROUTE_TARGET_REQUIRED')
+})
+
+test('bot_team_route：hop=4 ⇒ refused ROUTE_HOP_EXCEEDED（>3 拒绝）', async (t) => {
+  const h = bootWithAgents()
+  t.after(h.cleanup)
+  const t1 = await h.call('bot_teams_create', { name: 'A', type: 'big', leadId: 'lead-A', memberIds: [] })
+  const t2 = await h.call('bot_teams_create', { name: 'B', type: 'big', leadId: 'lead-B', memberIds: [] })
+  const res = await h.call('bot_team_route', {
+    fromTeam: t1.team.id, toTeam: t2.team.id, taskId: 't-hop4', hop: 4,
+  })
+  assert.equal(res.ok, false)
+  assert.equal(res.reason, 'ROUTE_HOP_EXCEEDED')
+})
+
+test('bot_team_route：环路防护 A→B→A→B，第 3 跳被拒（dedupKey 命中 dispatcher 去重）', async (t) => {
+  const h = bootWithAgents()
+  t.after(h.cleanup)
+  const t1 = await h.call('bot_teams_create', { name: 'A', type: 'big', leadId: 'lead-A', memberIds: [] })
+  const t2 = await h.call('bot_teams_create', { name: 'B', type: 'big', leadId: 'lead-B', memberIds: [] })
+  const taskId = 'loop-task'
+  // A→B hop0：dedupKey = route:team-A:team-B:loop-task
+  let r1 = await h.call('bot_team_route', { fromTeam: t1.team.id, toTeam: t2.team.id, taskId, hop: 0, text: 'A→B' }, { agent: { id: 'lead-A' } })
+  assert.equal(r1.ok, true, 'A→B hop0 应成功')
+  // B→A hop1：不同 dedupKey（方向相反），应成功
+  let r2 = await h.call('bot_team_route', { fromTeam: t2.team.id, toTeam: t1.team.id, taskId, hop: 1, text: 'B→A' }, { agent: { id: 'lead-B' } })
+  assert.equal(r2.ok, true, 'B→A hop1 应成功（不同方向）')
+  // A→B hop2：dedupKey 与 hop0 相同 → dispatcher 判 skipped
+  let r3 = await h.call('bot_team_route', { fromTeam: t1.team.id, toTeam: t2.team.id, taskId, hop: 2, text: 'A→B again' }, { agent: { id: 'lead-A' } })
+  assert.equal(r3.ok, true, '路由决策层仍 accepted（先记后投）')
+  assert.equal(r3.wake.result, 'skipped', '但 dispatcher 因 dedupKey 相同判 skipped —— 第3跳被拦')
+  assert.equal(r3.wake.reason, 'dedup-hit')
+  // A→B hop4：hop 守卫直接拒
+  let r4 = await h.call('bot_team_route', { fromTeam: t1.team.id, toTeam: t2.team.id, taskId, hop: 4 })
+  assert.equal(r4.ok, false)
+  assert.equal(r4.reason, 'ROUTE_HOP_EXCEEDED')
+  // 总唤醒次数：A→B(hop0) + B→A(hop1) = 2 次；A→B(hop2) 被 dedup 拦 → 不投递
+  assert.equal(h.delivered.length, 2, 'A→B→A→B 只投递了 2 次（第3次被 dedup 拦）')
+})
+
+test('bot_team_route：route 事件落盘 ⇒ teams.jsonl 里有 action=route 记录', async (t) => {
+  const h = bootWithAgents()
+  t.after(h.cleanup)
+  const t1 = await h.call('bot_teams_create', { name: 'A', type: 'big', leadId: 'lead-A', memberIds: [] })
+  const t2 = await h.call('bot_teams_create', { name: 'B', type: 'big', leadId: 'lead-B', memberIds: [] })
+  await h.call('bot_team_route', { fromTeam: t1.team.id, toTeam: t2.team.id, taskId: 't-persist', text: 'check', hop: 0 })
+  const { existsSync, readFileSync } = await import('node:fs')
+  const { join } = await import('node:path')
+  const f = join(h.stateDir, 'teams.jsonl')
+  assert.ok(existsSync(f), 'teams.jsonl 应存在')
+  const lines = readFileSync(f, 'utf8').split('\n').filter((l) => l.trim())
+  const routeEvent = lines.find((l) => {
+    const ev = JSON.parse(l)
+    return ev.action === 'route' && ev.after?.taskId === 't-persist'
+  })
+  assert.ok(routeEvent, 'teams.jsonl 必须有 action=route 的事件')
+  const ev = JSON.parse(routeEvent)
+  assert.equal(ev.after.toLeadId, 'lead-B')
+  assert.equal(ev.after.fromTeam, t1.team.id)
+})
+
+test('bot_team_route：wakes.jsonl 记录带 target=leadId（唤醒成本可见）', async (t) => {
+  const h = bootWithAgents()
+  t.after(h.cleanup)
+  const t1 = await h.call('bot_teams_create', { name: 'A', type: 'big', leadId: 'lead-A', memberIds: [] })
+  const t2 = await h.call('bot_teams_create', { name: 'B', type: 'big', leadId: 'lead-B', memberIds: [] })
+  await h.call('bot_team_route', { fromTeam: t1.team.id, toTeam: t2.team.id, taskId: 't-wake', hop: 0 })
+  const { existsSync, readFileSync } = await import('node:fs')
+  const { join } = await import('node:path')
+  const f = join(h.stateDir, 'wakes.jsonl')
+  assert.ok(existsSync(f), 'wakes.jsonl 应存在')
+  const lines = readFileSync(f, 'utf8').split('\n').filter((l) => l.trim())
+  const routeWake = lines.find((l) => {
+    const w = JSON.parse(l)
+    return w.target === 'lead-B' && w.reason === 'room-message'
+  })
+  assert.ok(routeWake, 'wakes.jsonl 必须有 target=lead-B 的记录')
+  const wake = JSON.parse(routeWake)
+  assert.equal(wake.result, 'sent')
+  assert.match(wake.text, /t-wake/)
 })

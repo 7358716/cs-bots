@@ -87,6 +87,22 @@ const STATUSES = ['pending', 'in_progress', 'completed', 'blocked', 'deleted']
 const ACCEPT_RESULTS = ['pass', 'reject']
 /** 租约缺省 TTL（ms）。 */
 const DEFAULT_LEASE_MS = 300_000
+/**
+ * board 动作 → `src/metrics.js` 的 METRIC_KINDS 映射（bots04 欠账2）。
+ *
+ * 为什么需要这张表：board 的动作名（`claim`/`complete`/`accept`…）与 metrics 的
+ * 指标种类（`task_claim`/`task_complete`/`accept_pass`…）**不是同名**，而且不是一对一
+ * （`accept` 要按 result 拆成 pass/reject）。硬编码在 commit 里会变成一长串 if。
+ *
+ * 没有映射的动作（`create`/`edit`/`release`/`reopen`/`delete`）故意不记：
+ * metrics 的 METRIC_KINDS 里没有对应种类，**新增种类要同步改 metrics.js 与它的测试**，
+ * 不能在这里偷偷塞一个不认识的 kind（metrics.record 会抛错的）。
+ */
+const ACTION_TO_METRIC = Object.freeze({
+  claim: 'task_claim',
+  complete: 'task_complete',
+  block: 'task_blocked',
+})
 /** 复杂度档位（契约 §6 冻结；路由侧 `src/routing/complexity.js` 用同一套字面量）。 */
 const COMPLEXITY_TIERS = ['T0', 'T1', 'T2', 'T3']
 /**
@@ -620,6 +636,31 @@ export function createBoard(ctx, config = {}) {
     : (Number.isFinite(config.wipLimitPerBot) && config.wipLimitPerBot >= 1 ? config.wipLimitPerBot : 2)
   const requireTriageForReady = settings.requireTriageForReady === true || config.requireTriageForReady === true
 
+  /**
+   * 指标旁路（bots04 欠账2）。
+   *
+   * 为什么是「注入」而不是从 ctx 取：服务注册表在 `src/registry.js` 用的是
+   * `WeakMap<ctx, services>`，且 `index.js` 里 **board 先于 metrics 装配的顺序不保证**。
+   * 用注入（`config.metrics`）能拿到**装配完成后的实例**，也避免 board→registry 的循环依赖。
+   *
+   * 取不到就不记（返回 false），绝不抛 —— 指标缺失是可接受的退化，
+   * 业务动作失败是不可接受的。
+   */
+  // ⚠️ 为什么支持函数：`index.js` 里 **board 先于 metrics 装配**（board 在 L130，
+  //    metrics 在 L276）。若只接受实例，board 装配时 metrics 还是 undefined，
+  //    埋点会永久静默失效 —— 那正是「256 条全是 turn_end」这类 bug 的成因。
+  //    传函数 ⇒ 每次记录时现取，装配顺序就不再影响正确性。
+  const metricsSink = config && config.metrics !== undefined ? config.metrics : null
+  function recordMetric(kind, taskId, by) {
+    let sink = metricsSink
+    if (typeof sink === 'function') {
+      try { sink = sink() } catch { sink = null }
+    }
+    if (!sink || typeof sink.record !== 'function') return false
+    sink.record({ kind, taskId: taskId ?? null, by: by ?? null })
+    return true
+  }
+
   const jsonlPath = statePath(stateDir, 'board.jsonl')
   const snapPath = statePath(stateDir, 'board.snap.json')
 
@@ -696,6 +737,20 @@ export function createBoard(ctx, config = {}) {
     }
     tasks.set(taskId, clone(after))
     events.push(event)
+    // ── 指标埋点（bots04 欠账2）─────────────────────────────────────────
+    // 为什么埋在 commit 而不是各个动作里：commit 是**所有**状态变更的唯一出口，
+    // 埋在这里才不会漏（create/update/claim/complete/accept 全过它）。
+    //
+    // 为什么必须**服务端**埋：此前 256 条 metrics 全是 `turn_end` —— 因为
+    // 只有 `index.js` 在回合结束自动记，其余 11 种 kind 只靠「谁主动调
+    // bot_metrics_record」才记，而没有任何业务代码主动调。PDCA 页面因此只看得见
+    // 「回合结束」一种指标，看不到验收通过率、任务认领率。
+    //
+    // 纪律：埋点失败**绝不能**影响业务动作 —— 主流程已经落盘成功，指标是旁路。
+    try {
+      const metricsAction = ACTION_TO_METRIC[action]
+      if (metricsAction) recordMetric(metricsAction, taskId, byId)
+    } catch { /* 指标是旁路，绝不影响主流程 */ }
     if (after.sourceSeq) {
       // 幂等键在这里登记（而不是在 create 开头），保证「校验/落盘失败不污染键」
       idem.check(after.sourceSeq)
@@ -1863,6 +1918,12 @@ export function createBoard(ctx, config = {}) {
       delete next.latestReport // 旧的收尾结论一并作废（重做后会重新产生）
       delete next.accepted // 驳回即取消「已验收」，与 acceptance.result='reject' 一致
     }
+    // 验收埋点（bots04 欠账2）：accept 的指标要按 result 拆成 pass/reject，
+    // 不能用 ACTION_TO_METRIC（那里是动作名→kind 的一对一映射）。
+    // 放在 commit **之前**：commit 成功后已经落盘，埋点是旁路，先记不影响主结果。
+    try {
+      recordMetric(result === 'pass' ? 'accept_pass' : 'accept_reject', taskId, actor)
+    } catch { /* 指标是旁路，绝不影响主流程 */ }
     return commit(taskId, 'accept', actor, at, before, next)
   }
 

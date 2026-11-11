@@ -90,7 +90,7 @@ test('新建房间：admin 模式下 adminId 的角色记为 admin；purpose/set
   })
   assert.equal(room.purpose, '一期需求评审')
   assert.deepEqual(room.roles, { 's-a': 'admin', 's-b': 'member' })
-  assert.deepEqual(room.settings, { allowBotAutoPost: false, maxBotsPerRound: 5, relayEnabled: true },
+  assert.deepEqual(room.settings, { allowBotAutoPost: false, maxBotsPerRound: 5, relayEnabled: true, mentionOnly: true },
     '未显式给的开关必须回落缺省值（增量合并口径）')
 })
 
@@ -142,7 +142,7 @@ test('update：可改 purpose 与 settings（增量合并），rev 递增，事�
     byId: 's-b',
     settings: { maxBotsPerRound: 7 },
   })
-  assert.deepEqual(afterSettings.settings, { allowBotAutoPost: true, maxBotsPerRound: 7, relayEnabled: true },
+  assert.deepEqual(afterSettings.settings, { allowBotAutoPost: true, maxBotsPerRound: 7, relayEnabled: true, mentionOnly: true },
     '增量合并：只改给定的键，其余保持原值')
   assert.equal(afterSettings.rev, 3)
   assert.equal(eventRows(dir, room.id).at(-1).type, 'settings_changed')
@@ -611,7 +611,7 @@ test('replay：purpose/roles/settings/archivedAt 持久化，回放后逐字段�
   const got = revived.get(room.id)
   assert.equal(got.purpose, '回放用用途')
   assert.deepEqual(got.roles, { 's-a': 'member', 's-b': 'observer', 's-c': 'member' })
-  assert.deepEqual(got.settings, { allowBotAutoPost: false, maxBotsPerRound: 2, relayEnabled: true })
+  assert.deepEqual(got.settings, { allowBotAutoPost: false, maxBotsPerRound: 2, relayEnabled: true, mentionOnly: true })
   assert.equal(got.archivedAt, 777)
   assert.equal(got.rev, archived.rev)
 

@@ -154,6 +154,18 @@ const RELAY_MULTIPLIER = 3
 const RELAY_FLOOR = 3
 /** 人类发送者 id（§3.2：`from` 为 sessionId 或 `'user'`）。 */
 const USER = 'user'
+/**
+ * 人类身份全集 —— 与 `teams.js` 的 `HUMAN_IDS` 对齐（`ui` / `user` / `person`）。
+ *
+ * **绝不唤醒人**：人是「看页面的人」，不是会话；`kernel.followup` 对着这些 id 必然失败。
+ * 实测证据（2026-11-11）：`wakes.jsonl` 里 `room-msg:m-1:ui → failed` ——
+ * 缺省广播把 Boss 自己也算成唤醒目标，每次必失败一条。
+ */
+const HUMAN_IDS = Object.freeze(['ui', 'user', 'person'])
+/** 是否为人类身份（房间转发一律跳过）。 */
+function isHumanId(id) {
+  return typeof id === 'string' && HUMAN_IDS.includes(id)
+}
 /** 房间事件类型集合（审计流可枚举）。 */
 const EVENTS = [
   'room_created',
@@ -186,6 +198,14 @@ const DEFAULT_SETTINGS = Object.freeze({
   allowBotAutoPost: true,
   maxBotsPerRound: 3,
   relayEnabled: true,
+  // ── 定向唤醒（2026-11-11「唤醒风暴」止血）────────────────────────────────
+  // 缺省 **true**：房间消息**只在被 @ 时**才唤醒成员。
+  //
+  // 为什么缺省要改成「安静」：实测 `wakes.jsonl` 里一条消息产生 3 次唤醒尝试、
+  // 3 次全失败（`room-msg:m-1:ui` + 两个 bot 全 failed）—— 缺省广播「除自己外全部成员」
+  // 既吵又必然失败（`ui` 根本没有会话可唤醒）。改缺省 = 把最吵、最容易失败的路径关掉；
+  // 需要广播的房间显式 `mentionOnly:false` 打开。
+  mentionOnly: true,
 })
 /** `bodyRef` 的合法形态（防路径穿越：只允许 `bodies/<安全文件名>.txt`）。 */
 const BODY_REF_RE = /^bodies\/[A-Za-z0-9._-]+\.txt$/
@@ -283,6 +303,55 @@ function stringList(value, field, where) {
   return out
 }
 
+/**
+ * 从消息里收集「被 @ 的成员 id」（与 `admission.isAddressed` 的 `@id` 解析同口径）。
+ *
+ * 两条来源（取并集）：
+ *   1. `message.mentions` —— 结构化数组，若有则优先
+ *   2. `message.text` 里的 `@id` —— 兜底解析（必须是 word-boundary 后的 `@`，避免误伤 `@bot-2` 当 `@bot`）
+ *
+ * 仅保留 **room.members 里实际存在的** id（非成员被 @ 了也不算唤醒目标）。
+ *
+ * ⚠️ 注意：`message.from` 即使被 @ 了也不进唤醒名单（自己不唤醒自己）。
+ * `HUMAN_IDS`（人类身份）也在 `wakeable()` 里统一过滤，这里不再二次过滤。
+ * @param {object} message
+ * @param {string[]} members
+ * @returns {string[]} 被 @ 的可唤醒成员 id（去重、保序）
+ */
+function collectMentions(message, members) {
+  if (!message || typeof message !== 'object') return []
+  const memberSet = new Set(members)
+  const out = []
+  const seen = new Set()
+
+  // ① 结构化 mentions 数组
+  if (Array.isArray(message.mentions)) {
+    for (const m of message.mentions) {
+      if (typeof m === 'string' && memberSet.has(m) && !seen.has(m)) {
+        seen.add(m)
+        out.push(m)
+      }
+    }
+  }
+
+  // ② 文本里的 @id（与 admission.js 同口径：`@id` 后必须跟非标识符字符或结尾）
+  const text = typeof message.text === 'string' ? message.text : ''
+  if (text) {
+    for (const m of members) {
+      if (seen.has(m)) continue
+      const idx = text.indexOf(`@${m}`)
+      if (idx >= 0) {
+        const after = text.slice(idx + 1 + m.length)
+        if (after === '' || !/[A-Za-z0-9_-]/.test(after[0])) {
+          seen.add(m)
+          out.push(m)
+        }
+      }
+    }
+  }
+  return out
+}
+
 /** 时间参数归一：缺省 now；支持 ms 数字与 Date。 */
 function normalizeNow(value, where) {
   if (value === undefined || value === null) return Date.now()
@@ -373,7 +442,7 @@ function normalizePurpose(value, where = 'createRoom') {
 
 /** `settings` 单个开关校验（按键分派；未知键抛错 —— 拒绝写入「怎么写都不会生效」的配置）。 */
 function normalizeSettingValue(key, value, where) {
-  if (key === 'allowBotAutoPost' || key === 'relayEnabled') {
+  if (key === 'allowBotAutoPost' || key === 'relayEnabled' || key === 'mentionOnly') {
     if (typeof value !== 'boolean') {
       throw new RoomError(
         `room.${where}：settings.${key} 必须是布尔值，收到 ${JSON.stringify(value)}`,
@@ -1880,18 +1949,24 @@ export function createRoom(ctx, config = {}) {
     const message = requireMessage(room.id, mid, 'relay')
     const actor = optionalString(byId, 'byId', 'relay')
 
+    // ══ 目标计算（2026-11-11「唤醒风暴」止血）═══════════════════════════════
+    // 四档，**顺序即优先级**：
+    //   ① 显式给了 targets  → 原样采信（调用方说了算；仍强制排除人类 id）
+    //   ② mentionOnly=true 且消息 @ 了某人 → 只打给被 @ 的成员（不含发送者/人类）
+    //   ③ mentionOnly=true 但没 @      → **只落消息，不唤醒任何人**（relayed:0）
+    //   ④ mentionOnly=false（显式关掉定向）→ 回退「除自己外全部成员」，但仍排除人类
+    //
+    // 为什么③不抛错：「只记录不打扰」是合法结果（Boss 只是同步信息，不需要谁被叫醒）。
+    // 抛错会把「安静」变成「失败」，页面反而要处理异常 —— 那是更差的设计。
+    const settings = room.settings ?? DEFAULT_SETTINGS
+    const mentionOnly = settings.mentionOnly !== false
+    /** 唤醒排除表：人类一律不算唤醒目标（见 HUMAN_IDS 注释的实测证据）。 */
+    const wakeable = (id) => id !== message.from && !isHumanId(id)
     let targetList
-    if (targets === undefined || targets === null) {
-      targetList = room.members.filter((m) => m !== message.from)
-      if (targetList.length === 0) {
-        throw new RoomError(
-          `room.relay：房间 ${room.id} 除发送者（${message.from}）外没有其他成员，且未显式指定 targets`
-          + ' —— 拒绝空转发（静默无操作）',
-          'ROOM_NO_TARGETS',
-          { roomId: room.id, messageId: mid, from: message.from },
-        )
-      }
-    } else {
+    let targetSource
+    let noTargetReason
+
+    if (targets !== undefined && targets !== null) {
       targetList = stringList(targets, 'targets', 'relay')
       if (targetList.length === 0) {
         throw new RoomError(
@@ -1899,6 +1974,81 @@ export function createRoom(ctx, config = {}) {
           'ROOM_NO_TARGETS',
           { roomId: room.id, messageId: mid },
         )
+      }
+      targetSource = 'explicit'
+      // 显式 targets 可能混进人类 —— 剔除，但这是**调用方的错**，如实 warn 不静默
+      const humans = targetList.filter((t) => isHumanId(t))
+      if (humans.length > 0) {
+        warn(`[cs-bots/room] relay 显式 targets 含人类身份 ${humans.join(',')} —— 已剔除（人不可被唤醒）`)
+        targetList = targetList.filter((t) => !isHumanId(t))
+      }
+    } else if (mentionOnly) {
+      // 从消息里解析「被 @ 的人」：mentions 字段 + text 里的 `@id`（与 admission.isAddressed 同口径）
+      const mentioned = collectMentions(message, room.members)
+      targetList = mentioned.filter(wakeable)
+      targetSource = 'mention'
+      if (targetList.length === 0) {
+        targetSource = 'mention-only-no-target'
+        noTargetReason = 'mention-only-no-target'
+      }
+    } else {
+      targetList = room.members.filter(wakeable)
+      targetSource = 'broadcast'
+      if (targetList.length === 0) {
+        throw new RoomError(
+          `room.relay：房间 ${room.id} 除发送者（${message.from}）外没有其他可唤醒成员，且未显式指定 targets`
+          + ' —— 拒绝空转发（静默无操作）',
+          'ROOM_NO_TARGETS',
+          { roomId: room.id, messageId: mid, from: message.from },
+        )
+      }
+    }
+
+    // ── ③「没 @ 到谁」：合法空转发 —— 记事件、返回 relayed:0，**不抛错** ──────
+    // 必须在后台账之前分流：否则每次安静发言都吃掉一次 relayLimit 配额。
+    if (targetList.length === 0) {
+      const at0 = normalizeNow(now, 'relay')
+      appendRoomEvent(room.id, {
+        type: 'relay',
+        roomId: room.id,
+        rev: room.rev,
+        byId: actor ?? null,
+        at: at0,
+        messageId: mid,
+        targets: [],
+        attempted: 0,
+        limit: room.relayLimit,
+        targetSource,
+        reason: noTargetReason ?? 'no-wakeable-target',
+      })
+      let audit0 = { written: true }
+      try {
+        appendRoomEvent(room.id, {
+          type: 'relay_result',
+          roomId: room.id,
+          rev: room.rev,
+          byId: actor ?? null,
+          at: at0,
+          messageId: mid,
+          deliveries: [],
+        })
+      } catch (error) {
+        audit0 = { written: false, reason: `relay-result-append-failed:${error?.message ?? error}` }
+        diagnostics.relayResultAppendFailures += 1
+        warn(`[cs-bots/room] 转发结果事件写入失败（投递已发生）：${audit0.reason}`)
+      }
+      return {
+        ok: true,
+        roomId: room.id,
+        messageId: mid,
+        relayed: 0,
+        attempted: 0,
+        limit: room.relayLimit,
+        remaining: Math.max(0, room.relayLimit - (relayCounts.get(relayKey(room.id, mid)) ?? 0)),
+        deliveries: [],
+        audit: audit0,
+        targetSource,
+        reason: noTargetReason ?? 'no-wakeable-target',
       }
     }
 
@@ -1992,6 +2142,7 @@ export function createRoom(ctx, config = {}) {
       remaining: Math.max(0, limit - (relayCounts.get(rkey) ?? 0)),
       deliveries,
       audit,
+      targetSource,
     }
     if (failed.length > 0) {
       result.reason = failed

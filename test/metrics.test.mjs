@@ -129,3 +129,64 @@ test('METRIC_KINDS 冻结不可改', () => {
   assert.ok(METRIC_KINDS.includes('accept_reject'))
   assert.ok(METRIC_KINDS.includes('turn_end'))
 })
+
+// ── bots04 欠账2：board 动作埋点 ───────────────────────────────────────────
+// 为什么单独一条：此前 256 条 metrics **全是 turn_end** —— 因为只有 index.js
+// 在回合结束自动记，认领/完成/验收这些**真正该测的动作**从没被记过。
+// 后果是 PDCA 页面看不到验收通过率、任务认领率。
+
+test('埋点：board 的 claim/complete/accept 会真实写入对应 kind（不是只有 turn_end）', async (t) => {
+  const { createBoard } = await import('../src/board.js')
+  const dir = mkdtempSync(join(tmpdir(), `cs-bots-inst-${process.pid}-${counter++}-`))
+  t.after(() => { try { rmSync(dir, { recursive: true, force: true }) } catch { /* */ } })
+  const metrics = createMetrics({ logger: { info() {}, warn() {} } }, { stateDir: dir })
+  // 用取值函数传入，模拟 index.js 的真实用法（metrics 晚于 board 装配）
+  const board = createBoard({}, { stateDir: dir, leaseMs: 300000, metrics: () => metrics })
+
+  const task = board.create({ byId: 'ui', subject: '埋点验证' })
+  board.update({ id: task.id, expectedRev: task.rev, action: 'claim', byId: 'bot-1' })
+  let cur = board.get(task.id)
+  board.update({
+    id: cur.id, expectedRev: cur.rev, action: 'complete', byId: 'bot-1', artifacts: ['x.md'],
+  })
+  cur = board.get(task.id)
+  board.accept({ id: cur.id, expectedRev: cur.rev, by: 'ui', result: 'pass' })
+
+  const byKind = metrics.aggregate({}).byKind
+  assert.equal(byKind.task_claim, 1, 'claim 必须记 task_claim')
+  assert.equal(byKind.task_complete, 1, 'complete 必须记 task_complete')
+  assert.equal(byKind.accept_pass, 1, 'accept(pass) 必须记 accept_pass')
+})
+
+test('埋点：accept(reject) 记 accept_reject（与 pass 分开统计）', async (t) => {
+  const { createBoard } = await import('../src/board.js')
+  const dir = mkdtempSync(join(tmpdir(), `cs-bots-inst2-${process.pid}-${counter++}-`))
+  t.after(() => { try { rmSync(dir, { recursive: true, force: true }) } catch { /* */ } })
+  const metrics = createMetrics({ logger: { info() {}, warn() {} } }, { stateDir: dir })
+  const board = createBoard({}, { stateDir: dir, leaseMs: 300000, metrics })
+
+  const task = board.create({ byId: 'ui', subject: '打回验证' })
+  board.update({ id: task.id, expectedRev: task.rev, action: 'claim', byId: 'bot-1' })
+  let cur = board.get(task.id)
+  board.update({
+    id: cur.id, expectedRev: cur.rev, action: 'complete', byId: 'bot-1', artifacts: ['x.md'],
+  })
+  cur = board.get(task.id)
+  board.accept({ id: cur.id, expectedRev: cur.rev, by: 'ui', result: 'reject', note: '不合格' })
+
+  const byKind = metrics.aggregate({}).byKind
+  assert.equal(byKind.accept_reject, 1, 'accept(reject) 必须记 accept_reject')
+  assert.equal(byKind.accept_pass ?? 0, 0, 'pass 与 reject 必须分开')
+})
+
+test('埋点：metrics 缺失时业务动作照常成功（指标是旁路，绝不影响主流程）', async (t) => {
+  const { createBoard } = await import('../src/board.js')
+  const dir = mkdtempSync(join(tmpdir(), `cs-bots-inst3-${process.pid}-${counter++}-`))
+  t.after(() => { try { rmSync(dir, { recursive: true, force: true }) } catch { /* */ } })
+  // 故意不传 metrics —— 模拟 metrics 装配失败
+  const board = createBoard({}, { stateDir: dir, leaseMs: 300000 })
+
+  const task = board.create({ byId: 'ui', subject: '无指标也要能干活' })
+  const claimed = board.update({ id: task.id, expectedRev: task.rev, action: 'claim', byId: 'bot-1' })
+  assert.equal(claimed.status, 'in_progress', '没有 metrics 时 claim 仍必须成功')
+})

@@ -537,6 +537,47 @@ window.__ModuleLoader__.load({
         text: '写入失败了，可能是磁盘或权限问题，请检查状态目录',
         hint: '事件追加失败：拒绝「只改内存不落盘」',
       },
+      // 契约 第2批 ①：跨团队路由错误（对齐 backend-b 的实际枚举，见 src/teams.js resolveRoute）
+      ROUTE_TASK_ID_REQUIRED: {
+        actionLabel: null,
+        text: '缺少关联任务，无法发协作请求',
+        hint: 'taskId 必填：路由靠 taskId 做环路检测与去重',
+      },
+      ROUTE_TARGET_REQUIRED: {
+        actionLabel: null,
+        text: '没选目标团队',
+        hint: 'toTeam 或 toBot 必须给一个',
+      },
+      ROUTE_TARGET_AMBIGUOUS: {
+        actionLabel: null,
+        text: '目标不明确（团队和 Bot 只能选一个）',
+        hint: 'toTeam 与 toBot 同时给出会被拒',
+      },
+      ROUTE_TARGET_NOT_FOUND: {
+        actionLabel: '刷新团队列表',
+        text: '目标团队不存在了，刷新一下',
+        hint: 'route.toTeam 不在团队列表中',
+      },
+      ROUTE_HOP_EXCEEDED: {
+        actionLabel: null,
+        text: '跳数超限，已阻止循环转发',
+        hint: '路由 hop 超过上限（3），防止 A→B→A→B 死循环',
+      },
+      ROUTE_NO_LEAD: {
+        actionLabel: null,
+        text: '目标团队没有负责人，无法送达',
+        hint: '目标团队 leadId 为空，没人可唤醒',
+      },
+      ROUTE_NO_DISPATCHER: {
+        actionLabel: null,
+        text: '唤醒通道不可用，这次请求没送出去',
+        hint: 'dispatcher 未装配（宿主缺组件），路由决定不做',
+      },
+      ROUTE_RECORD_FAILED: {
+        actionLabel: null,
+        text: '留痕失败，请求已中止（不会偷偷投递）',
+        hint: 'route 事件追加失败（磁盘/权限），intent-first 原则拒绝「投了没记」',
+      },
     }
 
     /**
@@ -1073,7 +1114,7 @@ window.__ModuleLoader__.load({
             }, '📦 看产出物')),
           h('div', { className: 'csb-kv' },
             // ── 5W：谁建的 / 是什么 / 何时 / 在哪做 / 为什么 ──
-            // 需求5：表述以「人」为主体——人建的任务就说「用户」，不暴露 Bot 会话 id
+            // 需求5：表述以「Boss」为主体——Boss 建的任务就说「Boss」，不暴露 Bot 会话 id
             h('span', { className: 'csb-k' }, '谁建的'),
             h('span', { className: 'csb-v' }, task.source === 'human' ? HUMAN_LABEL : (task.createdBy ? botName(bots, task.createdBy) : '智能体')),
             h('span', { className: 'csb-k' }, '来源'),
@@ -1936,7 +1977,7 @@ window.__ModuleLoader__.load({
           // 规则（契约原文，逐条实现，不自作主张）：
           //   room + exists !== false → 按钮「回到消息出处（房间名 #N）」
           //   room + exists === false → 按钮禁用 + 提示「来源房间已删除」
-          //   none                    → **不渲染任何来源区块**（人建的任务不占位）
+          //   none                    → **不渲染任何来源区块**（Boss 建的任务不占位）
           //   todo/evolve             → 只读一行「来源：<sourceSeq>」
           //   unparsed                → 只读一行 + 后端 reason（绝不渲染跳不动的按钮）
           sourceQ.error
@@ -3096,7 +3137,7 @@ window.__ModuleLoader__.load({
     /**
      * 任务看板。
      *
-     * 需求1（2026-11-08）：任务页**默认只展示人建任务**；智能体自建/分发的任务
+     * 需求1（2026-11-08）：任务页**默认只展示 Boss 建任务**；智能体自建/分发的任务
      * 走独立子页签（`sourceFilter='ai'`），按状态分类展示。
      *
      * 为什么这样分：人关心的是「我要盯的活」，智能体之间互相派的活是执行细节——
@@ -4951,6 +4992,11 @@ window.__ModuleLoader__.load({
                     onKeyDown: (e) => e.key === 'Enter' && post(),
                   }),
                   h('button', { className: 'csb-btn csb-btn-p', disabled: !text.trim(), onClick: post }, '发送')),
+              // 契约 t-38 ③：mentionOnly 缺省 true 时提示「@ 才唤醒」
+              current.settings?.mentionOnly !== false
+                ? h('div', { className: 'csb-set-d', style: { fontSize: 12, marginTop: 4 } },
+                    '只有被 @ 的人会被唤醒；不 @ 就只记录不打扰。')
+                : null,
               // ── 右栏：管理 ──
               h('div', { className: 'csb-room-side' },
                 h(Section, { title: '房间信息', desc: '基本信息和设置' }),
@@ -5048,6 +5094,8 @@ window.__ModuleLoader__.load({
         allowBotAutoPost: room.settings?.allowBotAutoPost !== false,
         maxBotsPerRound: room.settings?.maxBotsPerRound ?? 3,
         relayEnabled: room.settings?.relayEnabled !== false,
+        // 契约 t-38 ③：缺省 true —— 不 @ 就只落消息、不唤醒任何人
+        mentionOnly: room.settings?.mentionOnly !== false,
       })
       const save = async () => {
         try {
@@ -5065,6 +5113,7 @@ window.__ModuleLoader__.load({
                 allowBotAutoPost: settings.allowBotAutoPost,
                 maxBotsPerRound: Number(settings.maxBotsPerRound) || 3,
                 relayEnabled: settings.relayEnabled,
+                mentionOnly: settings.mentionOnly,
               },
               byId: 'user',
             },
@@ -5130,7 +5179,14 @@ window.__ModuleLoader__.load({
             h('input', {
               type: 'checkbox', checked: settings.relayEnabled,
               onChange: (e) => setSettings({ ...settings, relayEnabled: e.target.checked }),
-            }), settings.relayEnabled ? '允许' : '不允许')))
+            }), settings.relayEnabled ? '允许' : '不允许')),
+        // 契约 t-38 ③：只有被 @ 的人才被唤醒；不 @ 就只记录不打扰（缺省开）
+        h(Field, { label: '只有被 @ 的人才被唤醒', hint: '关掉后房间每条消息都会唤醒所有 Bot（不推荐，实测会烧 token）' },
+          h('label', { style: { display: 'flex', gap: 6, alignItems: 'center' } },
+            h('input', {
+              type: 'checkbox', checked: settings.mentionOnly,
+              onChange: (e) => setSettings({ ...settings, mentionOnly: e.target.checked }),
+            }), settings.mentionOnly ? '开启' : '关闭')))
     }
 
     // ── 成果（artifacts 聚合）────────────────────────────────────────────────
@@ -5467,7 +5523,7 @@ window.__ModuleLoader__.load({
     }
     /** 下拉里的合法取值（顺序即页面顺序：安全 → 宽松 → 逃生阀）。 */
     const ADMIN_POLICY_KEYS = ['lead-only', 'any-member', 'open']
-    /** 团队默认策略：人建的团队一律默认「仅负责人可管理」。 */
+    /** 团队默认策略：Boss 建的团队一律默认「仅负责人可管理」。 */
     const DEFAULT_ADMIN_POLICY = 'lead-only'
     /**
      * 团队页（需求3，2026-11-08 重做）。
@@ -5480,7 +5536,7 @@ window.__ModuleLoader__.load({
      *
      * ## 由此确定的三条设计
      *
-     * 1. **上层只显示「用户建的团队」**。智能体自建的小团队不再占用上层版面——
+     * 1. **上层只显示「Boss 建的团队」**。智能体自建的小团队不再占用上层版面——
      *    它们是执行细节，要看请走「穿透」。所以本页 `list({ type:'big' })` 过滤，
      *    且 UI 上**完全不出现「大/小」字样**（用户明确说不需要这个概念）。
      *
@@ -5506,7 +5562,7 @@ window.__ModuleLoader__.load({
      *   房间页本身已支持列出全部房间 + 消息内容查看，超级管理员不受限制。
      */
     function TeamsTab({ onGoto }) {
-      // 只取用户建的团队（big）；智能体自建的 small 不上上层
+      // 只取 Boss 建的团队（big）；智能体自建的 small 不上上层
       const listQ = useApi('/teams?type=big', [])
       const rosterQ = useApi('/roster')
       // 契约 §3(UI)：团队卡片要显示 `房间：<名>` —— 房间名不在团队记录里，
@@ -5535,6 +5591,13 @@ window.__ModuleLoader__.load({
         policyTimerRef.current = setTimeout(() => setPolicyMsg(null), 3000)
       }
       const act = (p, body) => call(p, { method: 'POST', body })
+
+      // 契约 第2批 ①：跨团队协作请求弹窗状态
+      const [routeOpen, setRouteOpen] = useState(null)
+      const [routeTarget, setRouteTarget] = useState('')
+      const [routeText, setRouteText] = useState('')
+      const [routeBusy, setRouteBusy] = useState(false)
+      const [routeMsg, setRouteMsg] = useState(null)
 
       const teams = listQ.data?.items ?? []
       // 后端下发的合法策略（/teams 返回 policies）；万一旧后端没这个字段，就用本地常量兜底
@@ -5567,7 +5630,7 @@ window.__ModuleLoader__.load({
             leadId,
             purpose: purpose.trim() || undefined,
             memberIds: selected,
-            // 人建的团队默认「仅负责人可管理」（服务端缺省是 open，为了不破坏既有调用面；
+            // Boss 建的团队默认「仅负责人可管理」（服务端缺省是 open，为了不破坏既有调用面；
             // 页面是新入口，没有历史包袱，所以在这里给安全默认值）
             adminPolicy: DEFAULT_ADMIN_POLICY,
             by: 'ui',
@@ -5611,6 +5674,37 @@ window.__ModuleLoader__.load({
           setMsg(`团队「${t.name}」已关闭`)
           listQ.reload()
         } catch (e) { setMsg(String(e.message ?? e)) } finally { setBusy(false) }
+      }
+
+      // 契约 第2批 ①：跨团队发协作请求
+      const sendRoute = async () => {
+        if (!routeTarget) { setRouteMsg('请选择目标团队'); return }
+        if (!routeText.trim()) { setRouteMsg('请填写请求内容'); return }
+        const team = teams.find((t) => t.id === routeOpen)
+        if (!team) { setRouteMsg('源团队不存在'); return }
+        setRouteBusy(true); setRouteMsg(null)
+        try {
+          const r = await act('/teams/route', {
+            fromTeam: routeOpen,
+            toTeam: routeTarget,
+            text: routeText.trim(),
+            hop: 1,
+            by: 'ui',
+          })
+          if (r.ok && r.decision === 'delivered') {
+            const toTeam = teams.find((t) => t.id === routeTarget)
+            setRouteMsg(`已送达「${toTeam?.name ?? routeTarget}」的负责人（唤醒 1 次）`)
+            setRouteText('')
+          } else {
+            const he = humanizeError({ code: r.decision, reason: r.reason, details: r.details })
+            setRouteMsg(he.text + (he.hint ? ` —— ${he.hint}` : ''))
+          }
+        } catch (e) {
+          const he = humanizeError(e)
+          setRouteMsg(he.text + (he.hint ? ` —— ${he.hint}` : ''))
+        } finally {
+          setRouteBusy(false)
+        }
       }
 
       /**
@@ -5718,12 +5812,19 @@ window.__ModuleLoader__.load({
             const leadName = botBySession.get(t.leadId)?.name ?? (t.leadId ? short(t.leadId, 12) : '（未指定）')
             const pending = pendingMembers[t.id] ?? []
             const addable = bots.filter((b) => !members.includes(b.sessionId))
+            // 契约 t-38 ①：徽标改文案。kind: 'human' | 'agent'（后端在加）；
+            // 旧数据无 kind ⇒ 按 createdBy 兜底（ui/user/person ⇒ Boss建设）。
+            const teamKind = t.kind ?? (['ui','user','person'].includes(t.createdBy) ? 'human' : 'agent')
+            const kindBadge = teamKind === 'human'
+              ? h('span', { className: 'csb-b csb-b-run', title: 'Boss 建设的团队' }, '👤 Boss建设')
+              : h('span', { className: 'csb-b csb-b-idle', title: '智能体建设的团队' }, '🤖 智能体建设')
             return h('div', { key: t.id, className: 'csb-card', style: { flexDirection: 'column', alignItems: 'stretch', marginBottom: 8 } },
               h('div', { className: 'csb-card-main' },
                 h('div', { className: 'csb-card-t' },
                   t.name,
                   t.status === 'closed' ? h('span', { className: 'csb-b csb-b-idle', style: { marginLeft: 8 } }, '已关闭') : null,
-                  t.purpose ? h('span', { className: 'csb-set-d' }, ` · ${t.purpose.slice(0, 40)}`) : null),
+                  t.purpose ? h('span', { className: 'csb-set-d' }, ` · ${t.purpose.slice(0, 40)}`) : null,
+                  h('span', { style: { marginLeft: 8 } }, kindBadge)),
 
                 // 管理员权限边界（需求：管理员权限边界从页面控制）
                 // 徽章：人要能一眼看出「谁能动这个团队」，所以常驻显示当前策略的中文名。
@@ -5834,13 +5935,77 @@ window.__ModuleLoader__.load({
                           className: 'csb-btn csb-btn-s',
                           onClick: () => onGoto?.('bots'),
                         }, '🤖 看 Bot'),
+                        // 契约 t-38 ②：AI 团队不置灰，正常可进入查看
+                        h('button', {
+                          className: 'csb-btn csb-btn-s',
+                          onClick: () => onGoto?.('team', { sub: 'teams' }),
+                        }, '🏠 进入团队'),
                         h('div', { className: 'csb-spacer' }),
+
+                        // 契约 t-38 ②：AI 团队额外提示
+                        teamKind === 'agent'
+                          ? h('div', { className: 'csb-set-d', style: { marginTop: 6, fontSize: 12, color: 'var(--dsw-alias-text-sub)' } },
+                              '这是智能体自己建的团队，你可以查看和发言')
+                          : null,
                         h('button', {
                           className: 'csb-btn csb-btn-s csb-btn-d',
                           disabled: busy, onClick: () => closeTeam(t),
-                        }, '关闭团队')))
+                        }, '关闭团队')),
+                    // 契约 第2批 ③：团队卡片显示今日唤醒数
+                    t.wakeCountToday !== undefined
+                      ? h('div', { className: 'csb-set-d', style: { marginTop: 6, fontSize: 12, color: 'var(--dsw-alias-text-sub)' } },
+                          `今日唤醒 ${t.wakeCountToday} 次`)
+                      : null,
+                    // 契约 第2批 ①：跨团队发请求按钮
+                    h('button', {
+                      className: 'csb-btn csb-btn-s',
+                      disabled: busy,
+                      onClick: () => setRouteOpen(t.id),
+                    }, '📤 发协作请求'))
                 : null)
-          })))
+          })),
+
+        // 契约 第2批 ①：跨团队协作请求弹窗。
+        // 后端端点按 /teams/route（B 在加 bot_team_route 工具，端点未定则按此先写）。
+        routeOpen
+          ? h(Modal, {
+              title: '发协作请求给另一个团队',
+              onClose: () => { setRouteOpen(null); setRouteMsg(null); setRouteText(''); setRouteTarget('') },
+              footer: [
+                h('button', {
+                  key: 'c', className: 'csb-btn',
+                  onClick: () => { setRouteOpen(null); setRouteMsg(null); setRouteText(''); setRouteTarget('') },
+                }, '取消'),
+                h('button', {
+                  key: 's', className: 'csb-btn csb-btn-p',
+                  disabled: routeBusy || !routeTarget || !routeText.trim(),
+                  onClick: sendRoute,
+                }, routeBusy ? '发送中…' : '发送请求'),
+              ],
+            },
+            h('div', null,
+              h('div', { className: 'csb-fld' },
+                h('div', { className: 'csb-fld-l' }, `从「${teams.find((x) => x.id === routeOpen)?.name ?? routeOpen}」发给`),
+                h('select', {
+                  className: 'csb-sel', style: { width: '100%' },
+                  value: routeTarget,
+                  onChange: (e) => { setRouteTarget(e.target.value); setRouteMsg(null) },
+                },
+                  h('option', { value: '' }, '选择目标团队…'),
+                  teams.filter((x) => x.id !== routeOpen && x.status !== 'closed')
+                    .map((x) => h('option', { key: x.id, value: x.id }, x.name)))),
+              h('div', { className: 'csb-fld' },
+                h('div', { className: 'csb-fld-l' }, '请求内容（会唤醒对方负责人一次）'),
+                h('textarea', {
+                  className: 'csb-in', rows: 4, style: { width: '100%', resize: 'vertical' },
+                  placeholder: '一句话说清要对方做什么…',
+                  value: routeText, onChange: (e) => setRouteText(e.target.value),
+                })),
+              routeMsg
+                ? h('div', { className: 'csb-notice csb-notice-ok', style: { marginTop: 8 } },
+                    h('span', { className: 'csb-notice-t' }, routeMsg))
+                : null))
+          : null)
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -5913,12 +6078,18 @@ window.__ModuleLoader__.load({
         const open = expanded[t.id] === true
         const lead = botBySession.get(t.leadId)
         const memberBots = (t.members ?? []).map((m) => botBySession.get(m)).filter(Boolean)
+        // 契约 t-38 ①：同 TeamsTab 的 kindBadge 逻辑
+        const teamKind = t.kind ?? (['ui','user','person'].includes(t.createdBy) ? 'human' : 'agent')
+        const kindBadge = teamKind === 'human'
+          ? h('span', { className: 'csb-b csb-b-run', title: 'Boss 建设的团队' }, '👤 Boss建设')
+          : h('span', { className: 'csb-b csb-b-idle', title: '智能体建设的团队' }, '🤖 智能体建设')
         return h('div', { key: t.id, className: 'csb-set-c' },
           h('div', { className: 'csb-row', style: { alignItems: 'center' } },
             h('div', { style: { flex: 1, minWidth: 0 } },
               h('div', { style: { fontWeight: 600 } },
                 t.name,
-                t.status === 'closed' ? h('span', { className: 'csb-set-d' }, ' （已关闭）') : null),
+                t.status === 'closed' ? h('span', { className: 'csb-set-d' }, ' （已关闭）') : null,
+                h('span', { style: { marginLeft: 8 } }, kindBadge)),
               h('div', { className: 'csb-set-d' },
                 `负责人：${lead?.name ?? t.leadId ?? '（无）'}`,
                 `　成员 ${memberBots.length} 个`)),
@@ -5969,7 +6140,13 @@ window.__ModuleLoader__.load({
             h('button', {
               type: 'button', className: 'csb-btn csb-btn-s',
               onClick: () => onGoto?.('team', { sub: 'teams' }),
-            }, '→ 管理团队')))
+            }, '→ 管理团队')),
+          // 契约 t-38 ②：AI 团队额外提示
+          teamKind === 'agent'
+            ? h('div', { className: 'csb-set-d', style: { marginTop: 6, fontSize: 12, color: 'var(--dsw-alias-text-sub)' } },
+                '这是智能体自己建的团队，你可以查看和发言')
+            : null
+      )
       }
 
       return h('div', { className: 'csb-wrap' },
@@ -8048,7 +8225,7 @@ window.__ModuleLoader__.load({
     exports.TaskConversationPanel = TaskConversationPanel
     // 需求4：PDCA 周期页（human / agent 两类周期）
     exports.CyclesTab = CyclesTab
-    // 需求3：团队页（只显示用户建的大团队）
+    // 需求3：团队页（只显示 Boss 建的大团队）
     exports.TeamsTab = TeamsTab
     exports.PANEL_ID = PANEL_ID
     exports.API = API
