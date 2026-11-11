@@ -297,6 +297,21 @@ export function hostLlmAvailable() {
  *    sole ordinary message of its own turn."
  * ⇒ 适合「有新活要干」的唤醒。
  *
+ * ⚠️ **`followup` 在 `agent` 对象上，不在 `agents` 服务上** —— 这里极易搞错。
+ *
+ * 写测试替身时，很多人会自然地把 `followup` 挂到假 `agents` 服务上
+ * （像 `create` / `get` / `list` 那样），结果永远拿到 `followup-unsupported`，
+ * 而且报错信息不指向真正的原因。2026-11-11 实测踩过一次，
+ * 排查时还一度以为是 `assertDeliverable` 拦的。
+ *
+ * 正确形状：
+ * ```js
+ * get: (key) => key === 'agents' ? {
+ *   get: (id) => ({ id, sessionId: id, followup(msg) { ... } }),  // ← 挂在这里
+ *   // 不是这里：followup(msg) {}
+ * } : undefined
+ * ```
+ *
  * @param {object} ctx
  * @param {string} sessionId
  * @param {string} text
