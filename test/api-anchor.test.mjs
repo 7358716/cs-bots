@@ -749,3 +749,40 @@ test('source：鉴权走既有 createFence（不新增绕过；公网代理路�
   assert.equal(denied.status, 403, '经代理的公网请求必须被既有围栏挡下')
   assert.equal(denied.json.ok, false)
 })
+
+// ══ 2026-11-12 t-40：任务栏要看到「用户说的话」+「执行者回复」═══════════════
+//
+// Boss：「任务栏中，应该把用户在对话中发送的信息和回复都展示出来」
+// 原实现只读执行者会话，用户在任务里写的补充说明完全看不到 —— 任务栏永远缺一半。
+
+test('t-40 对话：没有执行者会话时，用户的补充说明照样出现在时间线里', async (t) => {
+  const h = boot()
+  t.after(() => h.cleanup())
+  const task = h.createTask({ subject: '对话时间线' })
+
+  // 用户在任务下发一条补充说明（这是「用户说过的话」的权威记录）
+  const noted = await h.req('POST', '/tasks/note', { id: task.id, text: '先看登录接口，别动数据库', byId: 'user' })
+  assert.equal(noted.status, 200, JSON.stringify(noted.json))
+
+  const r = await h.req('GET', `/tasks/conversation?id=${task.id}`)
+  assert.equal(r.status, 200)
+  assert.equal(r.json.ok, true, `不应因为"没有执行者会话"就整体失败：${JSON.stringify(r.json)}`)
+  const texts = (r.json.messages ?? []).map((m) => m.text)
+  assert.ok(
+    texts.some((x) => String(x).includes('先看登录接口')),
+    '★ 用户的补充说明必须出现在对话时间线里',
+  )
+  const noteMsg = (r.json.messages ?? []).find((m) => String(m.text).includes('先看登录接口'))
+  assert.equal(noteMsg.source, 'note', '要标注来源，前端才能区分「任务里说的」')
+  assert.equal(noteMsg.role, 'user', '人说的话角色必须是 user')
+  assert.equal(r.json.counts.note, 1)
+})
+
+test('t-40 对话：既没派活也没补充说明 ⇒ 给可读空态（不是崩）', async (t) => {
+  const h = boot()
+  t.after(() => h.cleanup())
+  const task = h.createTask({ subject: '空任务' })
+  const r = await h.req('GET', `/tasks/conversation?id=${task.id}`)
+  assert.equal(r.status, 200)
+  assert.equal(r.json.code, 'NO_CONVERSATION', '空态要有明确 code，前端据此显示引导')
+})

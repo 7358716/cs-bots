@@ -5389,30 +5389,94 @@ export function installApi(ctx, { warn } = {}) {
           sendJson(response, 404, { ok: false, reason: `任务 ${id} 不存在` })
           return
         }
-        // 找执行者会话：assignee → ownerId → 平台伪身份排除
+        // ══ t-40 需求（2026-11-12）：任务栏要看到「用户说的话」+「Bot 的回复」═════
+        // 原实现只读**执行者的会话**，看不到用户自己说过什么：
+        // 用户在页面上发的指令走的是**用户自己的会话**（或只落进 task.note），
+        // 执行者会话里只有 Bot 的输出 —— 于是任务栏永远缺一半。
+        //
+        // 现在改成**多会话合并成一条时间线**，每条消息标注来源：
+        //   ① 执行者会话（Bot 怎么干的、说了什么）
+        //   ② 用户会话（用户下了什么令 —— 从 task.note 的 by 反查不到会话时，
+        //      仍用 note 行兜底，保证「用户说过的话」至少不会丢）
+        // 合并后按时间升序，前端按 role/source 区分气泡。
+        const HUMAN_IDS_ = new Set(['ui', 'user', 'person', 'anyone', 'system'])
         const candidates = [task.assignee, task.ownerId, task.anchor?.ownerId]
-          .filter((v) => typeof v === 'string' && v && !['ui', 'user', 'anyone', 'system'].includes(v))
-        if (candidates.length === 0) {
-          sendJson(response, 200, {
-            ok: false,
-            reason: '这个任务还没有执行者（未派活），没有对话可看',
-            code: 'NO_EXECUTOR',
-          })
-          return
-        }
-        // 把候选 sessionId 映射到 Bot 记录（拿真名）
+          .filter((v) => typeof v === 'string' && v && !HUMAN_IDS_.has(v))
+
+        // 执行者身份（拿真名用）
         let bot
         try {
           const all = services.roster?.list?.({ includeRetired: true }) ?? []
           bot = all.find((b) => candidates.includes(b.sessionId) || candidates.includes(b.id))
         } catch { bot = undefined }
         const sessionId = bot?.sessionId ?? candidates[0]
-        const limit = qn(url, 'limit')
-        const out = await readSessionMessages(ctx, sessionId, { limit: limit ?? 40 })
+
+        const limit = qn(url, 'limit') ?? 40
+        /** @type {Array<object>} 合并后的时间线 */
+        const timeline = []
+
+        if (sessionId) {
+          const out = await readSessionMessages(ctx, sessionId, { limit })
+          if (out?.ok && Array.isArray(out.messages)) {
+            for (const m of out.messages) {
+              timeline.push({
+                ...m,
+                source: 'executor',
+                speaker: bot?.name ?? sessionId,
+                sessionId,
+              })
+            }
+          }
+        }
+
+        // 用户侧：任务的补充说明（note）就是「用户在任务里说的话」的权威记录。
+        // 它**一定存在**且一定属于这个任务，比猜会话可靠 —— 所以以它为准，
+        // 不依赖「用户当时在哪个会话里」这种我们记录不到的信息。
+        try {
+          const notes = typeof readTaskNotes === 'function' ? readTaskNotes(services, id) : []
+          for (const n of notes) {
+            if (!n || typeof n.text !== 'string' || !n.text.trim()) continue
+            const by = typeof n.by === 'string' ? n.by : 'user'
+            timeline.push({
+              role: HUMAN_IDS_.has(by) ? 'user' : 'assistant',
+              kind: 'text',
+              text: n.text,
+              at: Number.isFinite(Number(n.at)) ? Number(n.at) : undefined,
+              source: 'note',
+              speaker: HUMAN_IDS_.has(by) ? 'Boss' : by,
+            })
+          }
+        } catch { /* notes 读不到不影响主时间线 */ }
+
+        // 时间升序；没有时间戳的排在前面（避免被甩到最后）
+        timeline.sort((a, b) => {
+          const ta = Number.isFinite(a.at) ? a.at : 0
+          const tb = Number.isFinite(b.at) ? b.at : 0
+          return ta - tb
+        })
+
+        if (timeline.length === 0) {
+          sendJson(response, 200, {
+            ok: false,
+            reason: '这个任务还没有对话记录（未派活、也没有补充说明）',
+            code: 'NO_CONVERSATION',
+          })
+          return
+        }
+
         sendJson(response, 200, {
+          ok: true,
           ...(bot ? { bot: { id: bot.id, name: bot.name, label: bot.label ?? null } } : {}),
-          sessionId,
-          ...out,
+          sessionId: sessionId ?? null,
+          messages: timeline,
+          total: timeline.length,
+          // 分开给，前端要单看某一侧时不用自己筛
+          counts: {
+            executor: timeline.filter((m) => m.source === 'executor').length,
+            note: timeline.filter((m) => m.source === 'note').length,
+            user: timeline.filter((m) => m.role === 'user').length,
+            assistant: timeline.filter((m) => m.role === 'assistant').length,
+          },
         })
         return
       }

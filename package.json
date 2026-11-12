@@ -1,6 +1,6 @@
 {
   "name": "cs-bots",
-  "version": "0.9.1",
+  "version": "0.9.2",
   "type": "module",
   "description": "跨团队桥 + 定向唤醒 + 升级可回滚。",
   "main": "src/index.js",

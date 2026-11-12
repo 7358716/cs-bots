@@ -2464,6 +2464,8 @@ window.__ModuleLoader__.load({
       // 后端在「没有执行者」时返回 ok:false + code NO_EXECUTOR，call() 会抛错 ——
       // 那不是故障，是正常空态，要按空态呈现。
       const noExecutor = /NO_EXECUTOR/.test(convQ.error ?? '') || /没有执行者/.test(convQ.error ?? '')
+      // t-40：有执行者但一条记录都没有（既没对话也没补充说明）——也是一种正常空态
+      const noConversation = /NO_CONVERSATION/.test(convQ.error ?? '') || /还没有对话记录/.test(convQ.error ?? '')
 
       /** 跳到执行者的会话（宿主支持就直接开，不支持则复制 ID 兜底）。 */
       const gotoSession = async () => {
@@ -2482,8 +2484,13 @@ window.__ModuleLoader__.load({
       }
 
       const roleLabel = (m) => {
-        if (m.role === 'user') return HUMAN_SELF_LABEL
-        if (m.role === 'assistant') return bot?.name ?? '执行者'
+        // t-40：消息来自两条来源 —— executor（执行者会话）/ note（用户在任务里的补充说明）。
+        // 用户说的话必须一眼可辨，所以 note 来源的 user 消息额外标「任务里」。
+        if (m.role === 'user') {
+          if (m.source === 'note') return `${HUMAN_SELF_LABEL}（任务里）`
+          return HUMAN_SELF_LABEL
+        }
+        if (m.role === 'assistant') return m.speaker && m.speaker !== bot?.name ? m.speaker : (bot?.name ?? '执行者')
         if (m.role === 'tool') return m.toolName ? `工具 · ${m.toolName}` : '工具'
         return m.role ?? '?'
       }
@@ -2496,9 +2503,10 @@ window.__ModuleLoader__.load({
         h(Section, {
           title: '任务对话',
           desc: bot
-            ? `执行者「${bot.name}」的会话记录（最近 ${messages.length} 条${data?.truncated ? '，已截断' : ''}）。`
+            ? `执行者「${bot.name}」的会话 + 你在任务里说的话，按时间合并（共 ${messages.length} 条`
+              + `${data?.counts ? `：执行者 ${data.counts.executor} 条 / 任务说明 ${data.counts.note} 条` : ''}）。`
               + '这里是只读的：要看全部或继续聊，点「去对话」。'
-            : '任务派给 Bot 之后，它的执行过程会出现在这里。',
+            : '任务派给 Bot 之后，它的执行过程和你下的指令都会出现在这里。',
         }, null),
 
         convQ.loading ? h(Skeleton, { n: 2 }) : null,
@@ -2509,7 +2517,13 @@ window.__ModuleLoader__.load({
               title: '还没有执行者',
               hint: '任务派给 Bot 之后才会有对话记录。先在「可以做什么」里派活，或者用 Bot 页的「派发」把任务交给它。',
             })
-          : convQ.error
+          : noConversation
+            ? h(Empty, {
+                icon: '◌',
+                title: '还没有对话记录',
+                hint: '这个任务既没派活、也没有补充说明。派活之后执行过程会出现在这里；你也可以在下面写一条补充说明，它同样会显示在这里。',
+              })
+            : convQ.error
             ? h('div', { className: 'csb-err' }, `读不到对话：${convQ.error}`)
             : null,
 
