@@ -727,3 +727,62 @@ test('setPreset：已退役 Bot 不可改（与 rename/setCwd 同口径）', asy
     (e) => e instanceof RosterError && e.code === 'ROSTER_RETIRED',
   )
 })
+
+// ── bots04：adoptSession（把已有会话注册成 Bot）────────────────────────────
+// 为什么需要：Boss 要把「当前正在跑、带着全部上下文的会话」变成可派活的 Bot，
+// 而 `create()` 原本只会新建会话（`bot-${randomUUID()}`）⇒ 会话 id 会变，上下文丢失。
+
+test('adoptSession：接管已有会话，id 与 sessionId 都沿用原会话（不生成 bot-xxx）', async (t) => {
+  const h = setup(t)
+  const existing = 'session-external-abc-123'
+  const before = h.createCalls.length
+
+  const bot = await h.roster.create({
+    name: '接管来的岗',
+    cwd: join(h.ws, 'adopted'),
+    byId: 'ui',
+    adoptSession: existing,
+  })
+
+  assert.equal(bot.id, existing, 'id 必须等于原 sessionId（否则 wake/派活对不上）')
+  assert.equal(bot.sessionId, existing, 'sessionId 必须保持原值')
+  assert.equal(
+    h.createCalls.length, before,
+    '接管模式**不得**调用 kernel.createSession —— 那是新建会话，会丢失原上下文',
+  )
+})
+
+test('adoptSession：同一会话不能注册成两个 Bot（ROSTER_SESSION_TAKEN）', async (t) => {
+  const h = setup(t)
+  const existing = 'session-external-dup'
+  await h.roster.create({ name: '第一个', cwd: join(h.ws, 'a1'), byId: 'ui', adoptSession: existing })
+
+  await assert.rejects(
+    () => h.roster.create({ name: '第二个', cwd: join(h.ws, 'a2'), byId: 'ui', adoptSession: existing }),
+    (e) => e instanceof RosterError && e.code === 'ROSTER_SESSION_TAKEN',
+    '同一会话被两个 Bot 占用会让派活/唤醒目标歧义',
+  )
+})
+
+test('adoptSession：接管后能被 hasSession 查到（可被派活）', async (t) => {
+  const h = setup(t)
+  const existing = 'session-external-findable'
+  const bot = await h.roster.create({
+    name: '可派活的岗', cwd: join(h.ws, 'af'), byId: 'ui', adoptSession: existing,
+  })
+  assert.equal(h.roster.hasSession(bot.id), true, '接管后必须能被派活系统找到')
+})
+
+test('adoptSession：退役 Bot 占过的同名会话不阻止接管（终态释放名额）', async (t) => {
+  const h = setup(t)
+  const existing = 'session-external-retired'
+  const first = await h.roster.create({
+    name: '先占的', cwd: join(h.ws, 'r1'), byId: 'ui', adoptSession: existing,
+  })
+  h.roster.retire({ id: first.id, byId: 'ui' })
+
+  const second = await h.roster.create({
+    name: '后接的', cwd: join(h.ws, 'r2'), byId: 'ui', adoptSession: existing,
+  })
+  assert.equal(second.sessionId, existing, '退役是终态，名额应释放，可被重新接管')
+})

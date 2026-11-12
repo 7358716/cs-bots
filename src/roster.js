@@ -694,7 +694,7 @@ export function createRoster(ctx, config = {}) {
    * @throws {RosterError} 缺字段 / 非法 cwd / 重名 / 会话创建失败 / 事件落盘失败
    */
   async function create(input = {}) {
-    const { name, cwd, label, model, instructions, preset, permission, profile, prepareCommand, byId, now } = input ?? {}
+    const { name, cwd, label, model, instructions, preset, permission, profile, prepareCommand, byId, now, adoptSession } = input ?? {}
     const by = requireString(byId, 'byId', 'create')
     const displayName = requireString(name, 'name', 'create')
     const dir = assertBotCwd(cwd, 'create')
@@ -707,6 +707,28 @@ export function createRoster(ctx, config = {}) {
     // ── 唯一性（校验通过后才动会话，避免「建了会话才发现重名」的资源泄漏）──
     assertNameFree(displayName, undefined, 'create')
 
+    // ── adoptSession：把**已存在的会话**注册成 Bot（2026-11-11 Boss 需求）──
+    // 为什么需要：`create()` 原本只会**新建**会话（`bot-${randomUUID()}`），
+    //   无法接管一个已经在跑、已有上下文的会话。Boss 要把当前会话（带着全部上下文）
+    //   变成可在协作平台派活的 Bot ⇒ 会话 id 必须保持不变。
+    // 语义边界：
+    //   - `adoptSession` 给出时**不建新会话**，注册表直接引用它；
+    //   - 该 sessionId 不能已被别的活跃 Bot 占用（`hasSession` 查重）；
+    //   - 退役 Bot 里的同名 session 不阻止接管（终态已释放名额）。
+    const adopt = optionalString(adoptSession, 'adoptSession', 'create')
+    if (adopt !== undefined) {
+      for (const other of bots.values()) {
+        if (other.state !== 'retired' && other.sessionId === adopt) {
+          throw new RosterError(
+            `roster.create：会话 ${adopt} 已被 Bot「${other.name}」（${other.id}）占用——`
+            + '同一会话不能注册成两个 Bot',
+            'ROSTER_SESSION_TAKEN',
+            { sessionId: adopt, occupiedBy: other.id },
+          )
+        }
+      }
+    }
+
     // ── 同 cwd 提示（非阻塞）：两个活 Bot 共用一个目录会撞 fs 写入边界 ──
     for (const other of bots.values()) {
       if (other.state !== 'retired' && other.cwd === dir) {
@@ -717,29 +739,41 @@ export function createRoster(ctx, config = {}) {
       }
     }
 
-    // ── 会话创建：**唯一能指定 cwd 的路径**（kernel.js:249-287）──
-    const id = `bot-${randomUUID()}`
-    let handle
-    try {
-      handle = await kernel.createSession(ctx, {
-        sessionId: id,
-        cwd: dir,
-        warn,
-        ...(preset !== undefined && preset !== null && preset !== '' ? { agentPreset: String(preset) } : {}),
-      })
-    } catch (error) {
-      throw new RosterError(
-        `roster.create：Bot「${displayName}」的会话创建失败（cwd=${dir}）→ ${error?.message ?? error}`
-        + '——已中止注册（不产生半成品 Bot）',
-        'ROSTER_SESSION_CREATE_FAILED',
-        { name: displayName, cwd: dir, cause: String(error?.message ?? error) },
-      )
-    }
-    const sessionId = pickSessionId(handle, id)
-    if (sessionId !== id) {
-      warn(
-        `[cs-bots/roster] 宿主返回的会话 id（${sessionId}）与请求的（${id}）不同——以宿主返回为准并记入注册表`,
-      )
+    // ── 会话：要么新建，要么接管已有（adoptSession）──
+    //
+    // 新建时这是**唯一能指定 cwd 的路径**（kernel.js:249-287）。
+    // 接管时**不碰会话**：那个会话已经在跑、有自己的 cwd 与上下文，
+    // 我们只是把它登记进注册表 —— 因此 `id` 直接沿用该 sessionId
+    // （不生成 `bot-xxx`），这样 `wake`/任务派活的目标 id 与真实会话对得上。
+    let id
+    let sessionId
+    if (adopt !== undefined) {
+      id = adopt
+      sessionId = adopt
+    } else {
+      id = `bot-${randomUUID()}`
+      let handle
+      try {
+        handle = await kernel.createSession(ctx, {
+          sessionId: id,
+          cwd: dir,
+          warn,
+          ...(preset !== undefined && preset !== null && preset !== '' ? { agentPreset: String(preset) } : {}),
+        })
+      } catch (error) {
+        throw new RosterError(
+          `roster.create：Bot「${displayName}」的会话创建失败（cwd=${dir}）→ ${error?.message ?? error}`
+          + '——已中止注册（不产生半成品 Bot）',
+          'ROSTER_SESSION_CREATE_FAILED',
+          { name: displayName, cwd: dir, cause: String(error?.message ?? error) },
+        )
+      }
+      sessionId = pickSessionId(handle, id)
+      if (sessionId !== id) {
+        warn(
+          `[cs-bots/roster] 宿主返回的会话 id（${sessionId}）与请求的（${id}）不同——以宿主返回为准并记入注册表`,
+        )
+      }
     }
 
     /** @type {Record<string, unknown>} */
