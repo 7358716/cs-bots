@@ -1829,9 +1829,17 @@ async function ensureRoomForTeam(services, team, by) {
     const room = rooms.create({
       name: `${team.name} · 议事厅`,
       members,
-      // 负责人是群主 ⇒ admin 模式（他能改名/归档）；他一定在 members 里（上面首位）
-      mode: 'admin',
-      adminId: leadId,
+      // ⚠️ 必须是 `everyone`，不能是 `admin`（2026-11-12 t-46 缺陷#5 实测修正）。
+      //
+      // 曾经的错误推理：「负责人是群主 ⇒ admin 模式（他能改名/归档）」。
+      // 但 `admin` 模式在 `src/room.js:1754` 会把**除群主外的所有成员**挡在门外：
+      //     ROOM_POST_FORBIDDEN：成员 … 无发言权
+      // 而这个房间的用途恰恰是「**别人**把长任务的结果回传进来」——
+      // 执行者不是群主，于是结果一条都发不出去，需求直接落空。
+      //
+      // 群主/负责人的特权用 `adminId` 之外的方式表达（成员表里首位 = 负责人），
+      // 不靠牺牲发言权来换。
+      mode: 'everyone',
       purpose: `长任务「${team.name}」的议事厅：负责人主持，进展与结论回传到此`,
       byId: by ?? 'ui',
     })

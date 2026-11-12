@@ -169,10 +169,12 @@ test('长任务 ⇒ 自动建议事厅，群主 = 负责人，委托人也在成
     assert.equal(r.json.autoRoom.created, true, '第一次应当新建')
 
     const room = h.services.room.get(r.json.autoRoom.roomId)
-    assert.equal(room.adminId, bot.sessionId, '群主 = 负责人（他要能主持这个房间）')
+    assert.equal(room.members[0], bot.sessionId, '成员表首位 = 负责人')
     assert.ok(room.members.includes(bot.sessionId), '负责人必须在成员里')
     assert.ok(room.members.includes('ui'), '委托人也要在成员里 —— 否则他看不到回传的结果')
-    assert.equal(room.mode, 'admin', '负责人是群主 ⇒ admin 模式（可改名/归档）')
+    // ⚠️ 必须是 everyone：admin 模式只允许群主发言（room.js:1754），
+    // 而结果是要**执行者**发进来的 —— 用 admin 就等于需求落空。
+    assert.equal(room.mode, 'everyone', '议事厅必须全员可发言，否则执行者汇报不进来')
   } finally { h.cleanup() }
 })
 
