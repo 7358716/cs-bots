@@ -1191,6 +1191,10 @@ export function createRoom(ctx, config = {}) {
         { roomId, roomsDir },
       )
     }
+    // ⚠️ 从这里到 commit 之间任何一步抛错，都要把刚建的目录删掉（t-46 缺陷#2）。
+    //   实测：`everyone + adminId` 的校验在 ensureDir **之后**抛错，
+    //   只包住 commit 是不够的 —— 那样照样留孤儿目录（测试当场抓到 1 !== 0）。
+    try {
 
     /** @type {Record<string, unknown>} */
     const room = {
@@ -1222,7 +1226,20 @@ export function createRoom(ctx, config = {}) {
     room.settings = { ...DEFAULT_SETTINGS, ...(settingsPatch ?? {}) }
     room.archivedAt = null
 
-    return commit(roomId, 'room_created', creator, at, null, room)
+    // ⚠️ 原子性（2026-11-12 t-46 缺陷#2 修复）：
+    //   `bodies/` 目录在上面就建好了，而事件到这里才写。中间任何一步抛错，
+    //   磁盘上就留下一个**只有 bodies/ 没有 events.jsonl** 的空壳目录 ——
+    //   运行实例看不到它（index 里没有），但它会永远躺在 rooms/ 下，
+    //   启动时每次都刷「目录存在但没有任何可回放的房间事件」的警告。
+    //   实测：13 个房间目录里只有 10 个是真房间，3 个是这样来的。
+    //   ⇒ commit 失败就把刚建的目录删掉，回到「什么都没发生」的状态。
+      return commit(roomId, 'room_created', creator, at, null, room)
+    } catch (error) {
+      // 回滚：本次调用建出来的目录必须删掉，回到「什么都没发生」。
+      // 用 force:true 是安全的 —— roomId 是本函数内新生成的，不可能有别人的数据。
+      try { rmSync(roomDir(roomId), { recursive: true, force: true }) } catch { /* 清理失败不掩盖原错误 */ }
+      throw error
+    }
   }
 
   /** @param {string} roomId @returns {object | undefined} Room（不存在返回 undefined，与 board.get 同口径） */

@@ -274,7 +274,7 @@ test('依赖：blockedBy 指向不存在的任务必须被拒（防悬空引用�
 
 // ── 租约自动回收（封死官方硬伤）───────────────────────────────────────────────
 
-test('租约回收：owner 崩溃后任务自动回 pending，可被重新认领', () => {
+test('租约回收：owner 崩溃后只清 lease（状态与负责人都不变），仍可被重新认领', () => {
   const h = boot()
   try {
     const task = h.board.create({ subject: '会崩溃的任务', byId: 'lead' })
@@ -292,10 +292,15 @@ test('租约回收：owner 崩溃后任务自动回 pending，可被重新认领
     assert.deepEqual(reaped, [task.id])
 
     const back = h.board.get(task.id)
-    assert.equal(back.status, 'pending', '回收后应回 pending')
-    assert.equal(back.lease, undefined)
+    // t-40-B：状态保持 in_progress（Boss：「又变成代办了，状态不对」）
+    assert.equal(back.status, 'in_progress', '★ 回收不改状态')
+    assert.equal(back.lease, undefined, '★ 但租约必须清，否则无法被重新领取')
     // ★ t-40-A：回收只让租约失效，**不抹掉负责人**（Boss：「负责人不用切换，避免内容丢失」）
-    assert.equal(back.ownerId, h.sessionId, '★ 负责人必须保留，任务回到待领池但仍归属原负责人')
+    assert.equal(back.ownerId, h.sessionId, '★ 负责人必须保留')
+    // 关键：租约清掉后，原负责人仍可 claim 回来（这是「可被重新认领」的真实保证）
+    const reclaimed = h.board.update({ id: task.id, expectedRev: back.rev, action: 'claim', byId: h.sessionId })
+    assert.equal(reclaimed.status, 'in_progress')
+    assert.ok(reclaimed.lease, '★ 能被重新 claim 回来，不是死锁')
     // 回收来源应可审计（board 会在事件流里记，任务上带 releasedBy 或 list 里可查）
     const hist = h.board.history(task.id)
     assert.ok(

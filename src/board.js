@@ -1882,7 +1882,16 @@ export function createBoard(ctx, config = {}) {
       const before = clone(current)
       const next = clone(current)
       next.rev = current.rev + 1
-      next.status = 'pending'
+      // ⚠️ **不改 status**（2026-11-12 t-40-B 修复，Boss：「负责人不用切换，状态也不能变」）。
+      //   旧行为是 `next.status = 'pending'` —— 租约一过期，任务就从「进行中」掉回「待办」，
+      //   页面上看起来像「这个活没人管、退回来了」，于是 Boss 看到的就是「又变成代办了」。
+      //   但租约过期只说明「持有者那一次心跳没续上」，**不代表这个活被放弃了**：
+      //     · lease    = 谁此刻正在动手（过期即失效，必须清）
+      //     · status   = 这个活处在什么阶段（进行中就是进行中，与租约无关）
+      //     · ownerId  = 这个活归谁管（与租约无关）
+      //   三者各自有生命周期，回收动作只该动 lease。
+      //   代价：过期任务不会再出现在 ready() 里可被抢 —— 那正是我们要的：
+      //   在役负责人还在，别人不该抢；真要重派由人显式 release。
       delete next.lease
       // ⚠️ **不删 ownerId**（2026-11-12 t-40-A 修复，Boss 原话「负责人不用切换，避免内容丢失」）。
       //   旧行为是 `delete next.ownerId` —— 租约一过期就把「谁负责这个任务」这条事实抹掉，
@@ -1901,7 +1910,7 @@ export function createBoard(ctx, config = {}) {
       recycled.push(current.id)
       info(
         `[cs-bots/board] 租约回收：${current.id} 由 ${current.lease.ownerId} 于 ${new Date(exp).toISOString()} 过期`
-        + ` → pending（负责人保留为 ${next.ownerId ?? '无'}）`,
+        + `（状态保持 ${next.status}，负责人保留为 ${next.ownerId ?? '无'}）`,
       )
     }
     return recycled

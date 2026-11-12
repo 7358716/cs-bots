@@ -515,10 +515,28 @@ export function createTeams(ctx, config = {}) {
    */
   function attachRoom(input = {}) {
     assertAlive('attachRoom')
-    const { id, expectedRev, roomId, by, now } = input ?? {}
+    const { id, expectedRev, roomId, by, now, roomExists } = input ?? {}
     const author = requireString(by, 'by', 'attachRoom')
     const at = normalizeNow(now, 'attachRoom')
     const room = requireString(roomId, 'roomId', 'attachRoom')
+
+    // ⚠️ 房间存在性校验（2026-11-12 t-46 缺陷#3 实测修复）。
+    //
+    // 现场事故：`team-2.roomId` 被设成了 `room-29e9c15c`，而那个房间是**旁路写盘**建的、
+    // 运行实例看不见 ⇒ 团队记着一个打不开的 roomId ⇒ 「长任务结果回传群主」整条链路失效，
+    // 而且没有任何报错（团队页显示「已绑定房间」，点进去才发现打不开）。
+    //
+    // 为什么用**校验函数**而不是直接依赖 room 服务：teams 域不该反向依赖 room 域
+    // （依赖面：node 内置 + store.js + kernel.js）。调用方把校验能力传进来，
+    // 不传则跳过（保持旧行为，不破坏既有测试与脚本）。
+    if (typeof roomExists === 'function' && !roomExists(room)) {
+      throw new TeamError(
+        `teams.attachRoom：房间 ${room} 不存在——拒绝把团队绑到一个打不开的房间上`,
+        'TEAM_ROOM_NOT_FOUND',
+        { id, roomId: room },
+      )
+    }
+
     const current = cas(id, expectedRev, 'attachRoom')
     if (current.roomId === room) {
       return clone(current) // 幂等：已关联同一房间，不重复落事件

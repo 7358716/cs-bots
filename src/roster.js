@@ -807,6 +807,13 @@ export function createRoster(ctx, config = {}) {
         bot.profile = normalizeProfile(profile)
         const written = writeAgentsFile(bot.cwd, { ...bot.profile, botName: bot.name, preset: bot.preset })
         bot.profilePath = written.path
+        // t-46 缺陷#4：空身份如实告警（详见 setProfile 处注释）
+        if (written.identityMissing) {
+          warn(
+            `[cs-bots/roster] 新 Bot「${bot.name}」的档案未填写 identity —— `
+            + 'AGENTS.md 里只有占位符。若与别的 Bot 共用 cwd，可能覆盖对方身份说明。',
+          )
+        }
         // 技能：每个名字建一个 SKILL.md 骨架（已存在则不覆盖正文）
         for (const skillName of bot.profile.skills ?? []) {
           try {
@@ -1121,6 +1128,15 @@ export function createRoster(ctx, config = {}) {
         `roster.${where}：写 AGENTS.md 失败（cwd=${current.cwd}）→ ${error?.message ?? error}`,
         'ROSTER_PROFILE_WRITE_FAILED',
         { id: current.id, cwd: current.cwd, cause: String(error?.message ?? error) },
+      )
+    }
+    // t-46 缺陷#4：档案没有 identity 时如实告警（不再静默）。
+    // 空档案会覆盖同 cwd 下别的 Bot 的完整身份说明，且过去没有任何提示。
+    if (written?.identityMissing) {
+      warn(
+        `[cs-bots/roster] Bot「${current.name}」（${current.id}）的档案未填写 identity —— `
+        + `AGENTS.md 里只有「（未填写身份描述）」占位。若它与别的 Bot 共用 cwd=${current.cwd}，`
+        + '可能已覆盖对方的身份说明。请到 Bot 档案里补上身份描述。',
       )
     }
 

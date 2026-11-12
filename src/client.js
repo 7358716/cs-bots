@@ -987,6 +987,8 @@ window.__ModuleLoader__.load({
      */
     function TaskDrawer({ id, bots, workflows, onClose, onChange, onGotoSource }) {
       const { data, loading, error, reload } = useApi(`/tasks/detail?id=${encodeURIComponent(id)}`, [id])
+      // 对话全屏页开关（t-40：抽屉不再堆对话，改为独立页）
+      const [convOpen, setConvOpen] = useState(false)
       const [err, setErr] = useState(null)
       const [picking, setPicking] = useState(null) // 'complete' | 'abort'
       const [artifacts, setArtifacts] = useState('')
@@ -1188,8 +1190,29 @@ window.__ModuleLoader__.load({
             onReassign: () => setReassignOpen(true),
           }),
 
-          // 需求2：任务对话（进度 + 对话内容 + 去对话跳转），直接放在产出物之前
-          h(TaskConversationPanel, { taskId: task.id, task, bots, onGotoSource }),
+          // 需求2：任务对话 —— 2026-11-12 改为**入口按钮**，不再整块塞进抽屉。
+          // Boss：「当前侧边栏页面拉的太长了」「或者换一个页面展示」。
+          // 抽屉里只留一行摘要 + 按钮；点开是全屏对话页（含用户发言与执行者回复）。
+          h(Section, {
+            title: '任务对话',
+            desc: '你在这个任务里说过的话 + 执行者的回复，按时间合并。',
+          }, h('div', { style: { display: 'flex', gap: 8, alignItems: 'center' } },
+            h('button', {
+              className: 'csb-btn csb-btn-s csb-btn-p',
+              onClick: () => setConvOpen(true),
+            }, '打开对话（全屏）'),
+            h('span', { style: { fontSize: 12, color: 'var(--dsw-alias-label-secondary)' } },
+              '侧边栏不再堆对话，避免越拉越长'))),
+
+          convOpen
+            ? h(Modal, {
+                title: `任务对话 · ${task.subject ?? task.id}`,
+                wide: true,
+                onClose: () => setConvOpen(false),
+                footer: [h('button', { key: 'c', className: 'csb-btn', onClick: () => setConvOpen(false) }, '关闭')],
+              },
+              h(TaskConversationPanel, { taskId: task.id, task, bots, onGotoSource, fullscreen: true }))
+            : null,
 
           // 契约 §2.5（需求3）：阶段产出物 —— 必须在总产出物证据之前，
           // 让 Boss 「点击去看产出物」时先看到过程产物，不用去翻对话。
@@ -1287,8 +1310,22 @@ window.__ModuleLoader__.load({
             ? h(DepGraph, { graph, currentId: task.id })
             : null,
 
-          // 需求2：任务对话（进度 + 对话内容 + 去对话跳转），直接放在产出物之前
-          h(TaskConversationPanel, { taskId: task.id, task, bots, onGotoSource }),
+          // 同上：对话改为全屏页入口（不在抽屉里堆）
+          h(Section, { title: '任务对话', desc: '你在这个任务里说过的话 + 执行者的回复。' },
+            h('button', {
+              className: 'csb-btn csb-btn-s csb-btn-p',
+              onClick: () => setConvOpen(true),
+            }, '打开对话（全屏）')),
+
+          convOpen
+            ? h(Modal, {
+                title: `任务对话 · ${task.subject ?? task.id}`,
+                wide: true,
+                onClose: () => setConvOpen(false),
+                footer: [h('button', { key: 'c', className: 'csb-btn', onClick: () => setConvOpen(false) }, '关闭')],
+              },
+              h(TaskConversationPanel, { taskId: task.id, task, bots, onGotoSource, fullscreen: true }))
+            : null,
 
           // 成果展示
           h(Section, { title: '产出物证据', desc: '任务完成时要带上「做了什么」的凭据（文件路径 / 链接）。' }),
@@ -2450,7 +2487,7 @@ window.__ModuleLoader__.load({
      *   · **消息分层**：user / assistant / tool 三类各自样式，工具调用折叠，
      *     reasoning 只在展开时看 —— 手机上默认不该被思维链淹没。
      */
-    function TaskConversationPanel({ taskId, task, bots, onGotoSource }) {
+    function TaskConversationPanel({ taskId, task, bots, onGotoSource, fullscreen = false }) {
       const convQ = useApi(`/tasks/conversation?id=${encodeURIComponent(taskId)}&limit=40`, [taskId])
       const [open, setOpen] = useState(false)
       const [err, setErr] = useState(null)

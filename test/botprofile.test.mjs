@@ -223,3 +223,23 @@ test('技能正文超长抛错', () => {
     rmSync(dir, { recursive: true, force: true })
   }
 })
+
+// ── t-46 缺陷#4：空身份必须能被调用方发现 ────────────────────────────────
+// 过去空档案只渲染「_（未填写身份描述）_」，无任何告警。
+// 实测后果：空档案 Bot 与有档案 Bot 共用 cwd 时，后者 142 行身份说明被覆盖成 10 行。
+
+test('writeAgentsFile：档案有 identity ⇒ identityMissing=false', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'bp-id-'))
+  t.after(() => { try { rmSync(dir, { recursive: true, force: true }) } catch { /* */ } })
+  const out = writeAgentsFile(dir, { identity: '我是测试岗', botName: 'x', preset: 'dev-steward' })
+  assert.equal(out.identityMissing, false, '有身份时不该标缺失')
+})
+
+test('writeAgentsFile：档案无 identity ⇒ identityMissing=true（调用方可据此告警）', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'bp-noid-'))
+  t.after(() => { try { rmSync(dir, { recursive: true, force: true }) } catch { /* */ } })
+  const out = writeAgentsFile(dir, { botName: 'x', preset: 'dev-steward' })
+  assert.equal(out.identityMissing, true, '空身份必须如实标记，否则覆盖别人也没人知道')
+  const text = readFileSync(out.path, 'utf8')
+  assert.match(text, /未填写身份描述/, '文件里仍是占位符（渲染行为不变）')
+})

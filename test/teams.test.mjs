@@ -445,3 +445,35 @@ test('recordRoute：route 事件重启后仍在（不只在内存）', (t) => {
   assert.equal(rows.length, 1, '回放后 route 记录仍在')
   assert.equal(rows[0].toLeadId, 'lead-B')
 })
+
+// ── t-46 缺陷#3：attachRoom 必须校验房间存在 ──────────────────────────────
+// 现场事故：team-2.roomId 被设成旁路写盘建的 room-29e9c15c，
+// 运行实例看不见它 ⇒ 团队绑了个打不开的房间 ⇒ 「结果回传群主」整条链路静默失效。
+
+test('attachRoom：房间不存在 ⇒ TEAM_ROOM_NOT_FOUND（拒绝绑到打不开的房间）', (t) => {
+  const { svc } = setup(t)
+  const team = svc.create({ name: '绑房测试', type: 'big', leadId: 'bot-x', by: 'ui' })
+  assert.throws(
+    () => svc.attachRoom({
+      id: team.id, roomId: 'room-does-not-exist', by: 'ui', roomExists: () => false,
+    }),
+    (e) => e instanceof TeamError && e.code === 'TEAM_ROOM_NOT_FOUND',
+    '不存在的房间必须拒绝，否则团队页显示「已绑定」但点进去打不开',
+  )
+})
+
+test('attachRoom：房间存在 ⇒ 正常绑定', (t) => {
+  const { svc } = setup(t)
+  const team = svc.create({ name: '绑房成功', type: 'big', leadId: 'bot-x', by: 'ui' })
+  const got = svc.attachRoom({
+    id: team.id, roomId: 'room-real', by: 'ui', roomExists: () => true,
+  })
+  assert.equal(got.roomId, 'room-real')
+})
+
+test('attachRoom：不传 roomExists ⇒ 保持旧行为（不破坏既有脚本）', (t) => {
+  const { svc } = setup(t)
+  const team = svc.create({ name: '不校验', type: 'big', leadId: 'bot-x', by: 'ui' })
+  const got = svc.attachRoom({ id: team.id, roomId: 'room-any', by: 'ui' })
+  assert.equal(got.roomId, 'room-any', '不传校验函数时跳过校验，向后兼容')
+})

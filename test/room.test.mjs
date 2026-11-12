@@ -15,7 +15,7 @@
 
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync } from 'node:fs'
+import { mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync, readdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -887,4 +887,30 @@ test('t-40⑤：ROOM_CANONICAL_USER 是 user；ui/person 仍被认作人类（�
   const mod = await import('../src/room.js')
   assert.equal(mod.ROOM_CANONICAL_USER, 'user', '规范 id 统一为 user')
   assert.ok(mod.ROOM_USER === 'user' || mod.ROOM_USER !== undefined)
+})
+
+// ── t-46 缺陷#2：建房必须原子，失败不留孤儿目录 ──────────────────────────
+// 实测：13 个房间目录里只有 10 个是真房间，3 个只有 bodies/ 没有 events.jsonl。
+// 根因：createRoom 先 ensureDir(bodies)，事件到最后才写，中间失败就留空壳。
+// 后果：启动时每次刷「目录存在但没有任何可回放的房间事件」。
+
+test('createRoom：中途抛错 ⇒ 不留下任何房间（原子性）', (t) => {
+  const { dir, rooms } = setup(t)
+  const before = rooms.list({ includeArchived: true }).length
+  const onDiskBefore = existsSync(join(dir, 'rooms')) ? readdirSync(join(dir, 'rooms')).length : 0
+
+  // everyone 模式不接受 adminId ⇒ createRoom 内部抛 ROOM_ADMIN_ID_NOT_APPLICABLE
+  assert.throws(() => {
+    rooms.createRoom_({
+      name: '原子性测试',
+      members: ['s-a'],
+      mode: 'everyone',
+      adminId: 's-a',
+      byId: 's-a',
+    })
+  }, (e) => e instanceof RoomError)
+
+  assert.equal(rooms.list({ includeArchived: true }).length, before, '失败后不应多出房间')
+  const onDiskAfter = existsSync(join(dir, 'rooms')) ? readdirSync(join(dir, 'rooms')).length : 0
+  assert.equal(onDiskAfter, onDiskBefore, '失败后磁盘上不应多出房间目录（不留孤儿）')
 })

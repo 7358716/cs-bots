@@ -1564,7 +1564,14 @@ async function ensureTeamRoom(services, team, by) {
     let attachError
     if (services.teams && typeof services.teams.attachRoom === 'function') {
       try {
-        await services.teams.attachRoom({ id: team.id, roomId: room.id, by })
+        // 传校验函数：attachRoom 会确认这个 roomId 在房间服务里真实存在。
+        // 刚建好的房间必然存在，这里传是为了守住「不绑到打不开的房间上」这条不变量。
+        await services.teams.attachRoom({
+          id: team.id,
+          roomId: room.id,
+          by,
+          roomExists: (rid) => Boolean(services.room?.get?.(rid)),
+        })
       } catch (error) {
         attachError = `议事厅已建好（${room.id}）但未能记到团队上：${error?.message ?? error}`
       }
@@ -1846,7 +1853,12 @@ async function ensureRoomForTeam(services, team, by) {
 
     // 把房间记到团队上（幂等；已有 roomId 的情况在这里被覆盖为新房）
     if (typeof services.teams?.attachRoom === 'function') {
-      services.teams.attachRoom({ id: team.id, roomId: room.id, by: by ?? 'ui' })
+      services.teams.attachRoom({
+        id: team.id,
+        roomId: room.id,
+        by: by ?? 'ui',
+        roomExists: (rid) => Boolean(rooms.get?.(rid)),
+      })
     }
     return { room, created: true }
   } catch (error) {

@@ -409,7 +409,13 @@ export function writeAgentsFile(cwd, profile) {
   } catch (error) {
     throw new ProfileError(`写入 ${file} 失败：${error?.message ?? error}`, 'PROFILE_WRITE_FAILED', { file })
   }
-  return { path: file, created, hadManaged, outsideLength: outside.length }
+  // ⚠️ `identityMissing`（t-46 缺陷#4）：档案没填 identity 时，渲染出来只有
+  //   「_（未填写身份描述）_」这一行占位 —— 过去**没有任何告警**。
+  //   实测后果：一个空档案的 Bot 与一个有档案的 Bot 共用 cwd 时，
+  //   后者 142 行的身份说明被前者覆盖成 10 行，而且没人收到通知。
+  //   ⇒ 把「这条是空的」作为返回值交出去，让调用方能 warn / 在列表里标出来。
+  const identityMissing = !(typeof profile?.identity === 'string' && profile.identity.trim())
+  return { path: file, created, hadManaged, outsideLength: outside.length, identityMissing }
 }
 
 /**

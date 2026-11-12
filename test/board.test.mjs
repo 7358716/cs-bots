@@ -249,7 +249,7 @@ test('租约：claim 后 expireLeases 到期 → 回 pending，清 lease 但**�
   const recycled = board.expireLeases({ now: T0 + 60_000 })
   assert.deepEqual(recycled, [task.id], '返回被回收的 taskId')
   const after = board.get(task.id)
-  assert.equal(after.status, 'pending', '★ 回到待领池，不再永久挂在已死成员名下')
+  assert.equal(after.status, 'in_progress', '★ t-40-B：状态保持在进行中，不退回待办')
   // ★ t-40-A（Boss：「负责人不用切换，避免内容丢失」）：
   //   回收只该让**租约**失效，不该抹掉**负责人归属**——否则长任务一过期就变成无主，
   //   任何 Bot 都能领走，上下文归属断裂。
@@ -258,14 +258,23 @@ test('租约：claim 后 expireLeases 到期 → 回 pending，清 lease 但**�
   assert.equal(after.lastLeaseExpiredOwner, 'bot-crash', '★ 回收原因留档可追溯')
   assert.equal(after.lastLeaseExpiredAt, T0 + 60_000)
   assert.equal(after.rev, 3, '回收也要留下 rev 变更（CAS 依据）')
-  assert.ok(board.ready().some((x) => x.id === task.id), '回收后就绪，可被重新领取')
+  // t-40-B：状态保持 in_progress ⇒ 不进 ready 池（负责人还在，别人不该抢）。
+  // 「可被重新领取」的保证改为：本人可 claim 回来（见下）。
+  assert.ok(!board.ready().some((x) => x.id === task.id), '负责人仍在 ⇒ 不出现在 ready 池')
   assert.equal(board.expireLeases({ now: T0 + 10_000_000 }).length, 0, '幂等：没有租约了就不重复回收')
+
+  // t-40-B：租约清掉后本人可重新 claim（不是死锁）
+  const again = board.update({ id: task.id, expectedRev: after.rev, action: 'claim', byId: 'bot-crash', leaseMs: 60_000, now: T0 + 61_000 })
+  assert.equal(again.status, 'in_progress', '★ 租约清掉后本人可重新 claim')
+  assert.ok(again.lease, '★ 不是死锁')
 
   // 审计流里有据可查
   const leaseEvents = board.history(task.id).filter((e) => e.action === 'lease_expired')
   assert.equal(leaseEvents.length, 1)
   assert.equal(leaseEvents[0].before.status, 'in_progress')
-  assert.equal(leaseEvents[0].after.status, 'pending')
+  // t-40-B：回收不改状态 ⇒ before/after 的 status 都是 in_progress，只有 lease 被删
+  assert.equal(leaseEvents[0].after.status, 'in_progress', '★ 审计里也能看出「状态没被改」')
+  assert.equal(leaseEvents[0].after.lease, undefined, '★ 但租约确实清掉了')
 })
 
 test('租约：心跳续租可行；过期后心跳失败；他人不可抢占/不可放租约', (t) => {
@@ -595,7 +604,7 @@ test('2026-11-04 P1-1：accept/pass 拒绝依赖未完成的 completed 任务', 
 
 // 🔴 P1-4：expireLeases 之前无任何调用者 ⇒ 租约永不回收。
 
-test('2026-11-04 P1-4：expireLeases 把过期租约任务回收成 pending', (t) => {
+test('2026-11-04 P1-4：expireLeases 回收过期租约 —— 只清 lease，**不改 status**（t-40-B）', (t) => {
   const { board } = setup(t)
   const a = seed(board, { subject: 'A' })
   const claimed = board.update({ id: a.id, expectedRev: 1, action: 'claim', byId: 'worker', leaseMs: 1000 })
@@ -605,8 +614,10 @@ test('2026-11-04 P1-4：expireLeases 把过期租约任务回收成 pending', (t
   const recycled = board.expireLeases({ now: later })
   assert.deepEqual(recycled, [a.id])
   const after = board.get(a.id)
-  assert.equal(after.status, 'pending')
-  assert.equal(after.lease, undefined)
+  // t-40-B（Boss：「又变成代办了，状态不对」）：租约过期只说明心跳没续上，
+  // 不代表活被放弃 —— 状态必须保持 in_progress，否则页面看起来像退回待办。
+  assert.equal(after.status, 'in_progress', '★ 状态不变，不退回 pending')
+  assert.equal(after.lease, undefined, '★ 租约必须清掉，否则永远不可被重新领取')
 })
 
 // ── 2026-11-04 测试回归 ─────────────────────────────────────────────────────
