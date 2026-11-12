@@ -352,6 +352,64 @@ function collectMentions(message, members) {
   return out
 }
 
+/**
+ * 计算「一条房间消息该唤醒谁」—— **唤醒风暴的唯一真相源**。
+ *
+ * 为什么抽成独立函数（2026-11-12 t-40-B 修复）：
+ * 房间有**两条**唤醒路径，过去各写一份目标计算，于是必然漂移：
+ *   - `room.relay()`（`POST /rooms/relay`）实现了四档规则；
+ *   - `POST /rooms/post`（Bot 用 `bot_room_post`、Boss 用 UI **都走这条**）却是
+ *     裸的 `members.filter((m) => m !== skipSelf)` —— 不看 `mentionOnly`、
+ *     不排除人类 id。实测 6 个房间全设了 `mentionOnly:true`，**一次都没生效**；
+ *     8 成员房间 ⇒ 一条消息 8 次模型调用，其中打给人类 id 的必然失败。
+ *
+ * 所以这里只留**一份**规则，两个调用点都用它。改规则只改这里。
+ *
+ * 四档，**顺序即优先级**（与 relay 原注释一致）：
+ *   ① 显式 targets → 原样采信（剔除人类，并 warn：那是调用方的错）
+ *   ② mentionOnly=true 且 @ 了某人 → 只打给被 @ 的成员（不含发送者/人类）
+ *   ③ mentionOnly=true 但没 @ → **空**（只落消息不唤醒，合法结果，不是错误）
+ *   ④ mentionOnly=false（显式关掉定向）→ 除发送者外的全部成员，**仍排除人类**
+ *
+ * @param {{ members?: string[], settings?: object, from?: string }} room 房间快照
+ * @param {{ from?: string, text?: string, mentions?: string[] }} message 消息
+ * @param {{ targets?: unknown, warn?: (m: string) => void }} [options]
+ *        显式目标（仅 relay 用）；`warn` 注入调用方所在作用域的日志器
+ *        （工厂内部有 `warn`，模块顶层没有 —— 这里显式注入，不靠隐式作用域）
+ * @returns {{ targets: string[], source: 'explicit'|'mention'|'mention-only-no-target'|'broadcast' }}
+ */
+function computeWakeTargets(room, message, options = {}) {
+  const members = Array.isArray(room?.members) ? room.members : []
+  const settings = room?.settings ?? DEFAULT_SETTINGS
+  const mentionOnly = settings.mentionOnly !== false
+  // 发送者自己永远不唤醒（发消息的人不需要被自己的消息叫醒）
+  const sender = message?.from ?? room?.from
+  /** 唤醒排除表：人类一律不算唤醒目标（人没有会话，唤醒必然 agent-not-live）。 */
+  const wakeable = (id) => id !== sender && !isHumanId(id)
+
+  if (options?.targets !== undefined && options?.targets !== null) {
+    let list = stringList(options.targets, 'targets', 'relay')
+    const humans = list.filter((t) => isHumanId(t))
+    if (humans.length > 0) {
+      const say = typeof options.warn === 'function' ? options.warn : () => {}
+      say(`[cs-bots/room] 显式 targets 含人类身份 ${humans.join(',')} —— 已剔除（人不可被唤醒）`)
+      list = list.filter((t) => !isHumanId(t))
+    }
+    return { targets: list, source: 'explicit' }
+  }
+
+  if (mentionOnly) {
+    const mentioned = collectMentions(message, members)
+    const targets = mentioned.filter(wakeable)
+    return targets.length > 0
+      ? { targets, source: 'mention' }
+      : { targets: [], source: 'mention-only-no-target' }
+  }
+
+  // ④ 显式关掉定向才广播 —— 即便如此也不唤醒人类、不唤醒发送者自己
+  return { targets: members.filter(wakeable), source: 'broadcast' }
+}
+
 /** 时间参数归一：缺省 now；支持 ms 数字与 Date。 */
 function normalizeNow(value, where) {
   if (value === undefined || value === null) return Date.now()
@@ -1966,42 +2024,29 @@ export function createRoom(ctx, config = {}) {
     let targetSource
     let noTargetReason
 
-    if (targets !== undefined && targets !== null) {
-      targetList = stringList(targets, 'targets', 'relay')
-      if (targetList.length === 0) {
-        throw new RoomError(
-          `room.relay：targets 是空数组 —— 拒绝空转发（静默无操作），请显式给出目标或省略该字段走缺省`,
-          'ROOM_NO_TARGETS',
-          { roomId: room.id, messageId: mid },
-        )
-      }
-      targetSource = 'explicit'
-      // 显式 targets 可能混进人类 —— 剔除，但这是**调用方的错**，如实 warn 不静默
-      const humans = targetList.filter((t) => isHumanId(t))
-      if (humans.length > 0) {
-        warn(`[cs-bots/room] relay 显式 targets 含人类身份 ${humans.join(',')} —— 已剔除（人不可被唤醒）`)
-        targetList = targetList.filter((t) => !isHumanId(t))
-      }
-    } else if (mentionOnly) {
-      // 从消息里解析「被 @ 的人」：mentions 字段 + text 里的 `@id`（与 admission.isAddressed 同口径）
-      const mentioned = collectMentions(message, room.members)
-      targetList = mentioned.filter(wakeable)
-      targetSource = 'mention'
-      if (targetList.length === 0) {
-        targetSource = 'mention-only-no-target'
-        noTargetReason = 'mention-only-no-target'
-      }
-    } else {
-      targetList = room.members.filter(wakeable)
-      targetSource = 'broadcast'
-      if (targetList.length === 0) {
-        throw new RoomError(
-          `room.relay：房间 ${room.id} 除发送者（${message.from}）外没有其他可唤醒成员，且未显式指定 targets`
-          + ' —— 拒绝空转发（静默无操作）',
-          'ROOM_NO_TARGETS',
-          { roomId: room.id, messageId: mid, from: message.from },
-        )
-      }
+    // 规则统一在 computeWakeTargets（t-40-B）：与 `POST /rooms/post` 共用同一份，
+    // 避免两条唤醒路径各写一套而再度漂移。
+    const decided = computeWakeTargets(room, message, { targets, warn })
+    targetList = decided.targets
+    targetSource = decided.source
+    if (targetSource === 'mention-only-no-target') noTargetReason = 'mention-only-no-target'
+    // 显式 targets 给了空数组 ⇒ 调用方契约违反，抛错（computeWakeTargets 只管剔除人类）
+    if (targetSource === 'explicit' && Array.isArray(targets) && targets.length === 0) {
+      throw new RoomError(
+        `room.relay：targets 是空数组 —— 拒绝空转发（静默无操作），请显式给出目标或省略该字段走缺省`,
+        'ROOM_NO_TARGETS',
+        { roomId: room.id, messageId: mid },
+      )
+    }
+    // 广播档但「除发送者外全是人类」⇒ 这是**配置错误**（没有 bot 可广播），抛错比静默诚实。
+    // 注意：mention 档的空结果不算错（③「只记录不打扰」是合法结果），二者不能混。
+    if (targetSource === 'broadcast' && targetList.length === 0) {
+      throw new RoomError(
+        `room.relay：房间 ${room.id} 除发送者（${message.from}）外没有其他可唤醒成员，且未显式指定 targets`
+        + ' —— 拒绝空转发（静默无操作）',
+        'ROOM_NO_TARGETS',
+        { roomId: room.id, messageId: mid, from: message.from },
+      )
     }
 
     // ── ③「没 @ 到谁」：合法空转发 —— 记事件、返回 relayed:0，**不抛错** ──────
@@ -2304,6 +2349,14 @@ export function createRoom(ctx, config = {}) {
     leave,
     post,
     relay,
+    /**
+     * 计算「这条消息该唤醒谁」（t-40-B）。
+     * 暴露给 `POST /rooms/post` 复用，保证两条唤醒路径共用同一份规则；
+     * 纯函数、不落盘、不唤醒，调用方自己决定要不要投递。
+     * 绑定本实例的 `warn`，这样 HTTP 路径的告警与 relay 走同一个 logger。
+     */
+    computeWakeTargets: (room, message, options = {}) =>
+      computeWakeTargets(room, message, { ...options, warn }),
     readBody,
     listMessages,
     // DESIGN-v2 ①：房间配置 / 归档 / 硬删 / 成员角色（签名见 DESIGN 契约，勿改名）

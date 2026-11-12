@@ -805,3 +805,79 @@ test('mentionOnly：回放持久化 —— 从磁盘重建的房间 settings.men
   assert.equal(got.settings.mentionOnly, false, '回放后 mentionOnly=false 仍在')
   assert.equal(got.settings.maxBotsPerRound, 3, '其他缺省值也完好')
 })
+
+// ══ 2026-11-12 t-40-B：`/rooms/post` 唤醒目标统一（唤醒风暴根因修复）═══════
+//
+// 背景：`/rooms/post` 是 Bot（bot_room_post）与 Boss（UI）**实际走的那条路**，
+// 此前它自己写了一份 `members.filter(m => m !== skipSelf)`，既不看 mentionOnly、
+// 也不排除人类 id；而 `relay()` 另有一份四档规则。两条路径各写一套 ⇒ 必然漂移。
+// 实测 6 个房间全设了 `mentionOnly:true` 却一次都没生效。
+//
+// 下面直接测两个调用点共用的 `computeWakeTargets`，守住「只有一份规则」。
+
+test('t-40-B：computeWakeTargets 四档规则（post 与 relay 共用同一份）', (t) => {
+  const { rooms } = setup(t)
+
+  // ① 显式 targets → explicit
+  const r1 = rooms.computeWakeTargets(
+    { members: ['s-a', 's-b'], settings: {} },
+    { from: 's-b' },
+    { targets: ['s-a'] },
+  )
+  assert.equal(r1.source, 'explicit')
+  assert.deepEqual(r1.targets, ['s-a'])
+
+  // ② mentionOnly=true 且 @ 了人 → 只打被 @ 的
+  const r2 = rooms.computeWakeTargets(
+    { members: ['s-a', 's-b', 's-c'], settings: { mentionOnly: true } },
+    { from: 's-b', text: '@s-a 看下' },
+  )
+  assert.equal(r2.source, 'mention')
+  assert.deepEqual(r2.targets, ['s-a'])
+
+  // ③ mentionOnly=true 但没 @ → 空（合法，不是错误）
+  const r3 = rooms.computeWakeTargets(
+    { members: ['s-a', 's-b'], settings: { mentionOnly: true } },
+    { from: 's-b', text: '随便说说' },
+  )
+  assert.equal(r3.source, 'mention-only-no-target')
+  assert.deepEqual(r3.targets, [], '没 @ 就一个人都不唤醒')
+
+  // ④ mentionOnly=false → 广播，但仍排除发送者（成员里除发送者外只剩人类 ⇒ 空）
+  const r4 = rooms.computeWakeTargets(
+    { members: ['s-a', 'ui', 'user'], settings: { mentionOnly: false } },
+    { from: 's-a', text: '广播' },
+  )
+  assert.equal(r4.source, 'broadcast')
+  assert.deepEqual(r4.targets, [], '除发送者外只剩人类 ⇒ 无可唤醒目标')
+
+  const r5 = rooms.computeWakeTargets(
+    { members: ['s-a', 's-c', 'ui', 's-b'], settings: { mentionOnly: false } },
+    { from: 's-a', text: '广播' },
+  )
+  assert.equal(r5.source, 'broadcast')
+  // 成员 [s-a, s-c, ui, s-b]，发送者 s-a ⇒ 唤醒 s-c、s-b，排除 s-a 自己与 ui
+  assert.deepEqual([...r5.targets].sort(), ['s-b', 's-c'], '★ 广播也必须排除发送者自己与人类 id')
+  assert.ok(!r5.targets.includes('ui'), '★ 人类 id 绝不入唤醒目标')
+  assert.ok(!r5.targets.includes('s-a'), '★ 发送者自己不被自己的消息吵醒')
+})
+
+test('t-40-B：人类 id 在 mentionOnly=true 时被 @ 也不唤醒（人没有会话）', (t) => {
+  const { rooms } = setup(t)
+  const r = rooms.computeWakeTargets(
+    { members: ['ui', 's-a'], settings: { mentionOnly: true } },
+    { from: 'ui', text: '@ui @s-a 都叫一下' },
+  )
+  assert.equal(r.source, 'mention')
+  assert.deepEqual(r.targets, ['s-a'], '★ 只唤醒 s-a，ui 被过滤')
+})
+
+test('t-40-B：缺省 settings（未设 mentionOnly）按 true 走定向，不广播', (t) => {
+  const { rooms } = setup(t)
+  const r = rooms.computeWakeTargets(
+    { members: ['s-a', 's-b'], settings: undefined },
+    { from: 's-b', text: '没 @ 人' },
+  )
+  assert.equal(r.source, 'mention-only-no-target')
+  assert.deepEqual(r.targets, [], '★ 缺省必须是定向，不能回退成广播（那正是唤醒风暴）')
+})

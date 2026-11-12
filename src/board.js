@@ -1814,10 +1814,25 @@ export function createBoard(ctx, config = {}) {
       next.rev = current.rev + 1
       next.status = 'pending'
       delete next.lease
-      delete next.ownerId
+      // ⚠️ **不删 ownerId**（2026-11-12 t-40-A 修复，Boss 原话「负责人不用切换，避免内容丢失」）。
+      //   旧行为是 `delete next.ownerId` —— 租约一过期就把「谁负责这个任务」这条事实抹掉，
+      //   任务打回 pending 后任何 Bot 都能领走，长任务的上下文归属就此断裂。
+      //   租约（lease）本来就该失效，但它失效**不代表负责人不再负责**：
+      //   - `lease` 是「谁现在正在动手」，过期即失效，必须清（否则任务永远不可被重新领取）；
+      //   - `assignee` 是「这个活归谁管」，**与租约生命周期无关**，不该被回收动作改写。
+      //   保留 ownerId 后，被回收的任务在板上显示「待领（原负责人 X）」，重派也仍可追溯。
+      const keeper = current.ownerId ?? current.assignee
+      if (typeof keeper === 'string' && keeper !== '') next.ownerId = keeper
+      else delete next.ownerId
+      // 回收原因留档：让人一眼看出「这条不是被释放的，是过期被回收的」
+      next.lastLeaseExpiredAt = at
+      next.lastLeaseExpiredOwner = current.lease.ownerId ?? null
       commit(current.id, 'lease_expired', current.lease.ownerId ?? null, at, before, next)
       recycled.push(current.id)
-      info(`[cs-bots/board] 租约回收：${current.id} 由 ${current.lease.ownerId} 于 ${new Date(exp).toISOString()} 过期 → pending`)
+      info(
+        `[cs-bots/board] 租约回收：${current.id} 由 ${current.lease.ownerId} 于 ${new Date(exp).toISOString()} 过期`
+        + ` → pending（负责人保留为 ${next.ownerId ?? '无'}）`,
+      )
     }
     return recycled
   }

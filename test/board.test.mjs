@@ -229,7 +229,7 @@ test('依赖：未就绪时 claim 抛错（可 force 抢占）', (t) => {
 
 // ── 5. 租约（封死「owner 永不释放」硬伤）────────────────────────────────────
 
-test('租约：claim 后 expireLeases 到期 → 回 pending，并清掉 ownerId/lease', (t) => {
+test('租约：claim 后 expireLeases 到期 → 回 pending，清 lease 但**保留** ownerId（t-40-A）', (t) => {
   const { board } = setup(t)
   const task = seed(board, { subject: '会崩在 owner 手里的任务' })
 
@@ -250,8 +250,13 @@ test('租约：claim 后 expireLeases 到期 → 回 pending，并清掉 ownerId
   assert.deepEqual(recycled, [task.id], '返回被回收的 taskId')
   const after = board.get(task.id)
   assert.equal(after.status, 'pending', '★ 回到待领池，不再永久挂在已死成员名下')
-  assert.equal(after.ownerId, undefined)
-  assert.equal(after.lease, undefined)
+  // ★ t-40-A（Boss：「负责人不用切换，避免内容丢失」）：
+  //   回收只该让**租约**失效，不该抹掉**负责人归属**——否则长任务一过期就变成无主，
+  //   任何 Bot 都能领走，上下文归属断裂。
+  assert.equal(after.ownerId, 'bot-crash', '★ 负责人保留：租约失效 ≠ 负责人不再负责')
+  assert.equal(after.lease, undefined, '★ 租约必须清掉，否则任务永远不可被重新领取')
+  assert.equal(after.lastLeaseExpiredOwner, 'bot-crash', '★ 回收原因留档可追溯')
+  assert.equal(after.lastLeaseExpiredAt, T0 + 60_000)
   assert.equal(after.rev, 3, '回收也要留下 rev 变更（CAS 依据）')
   assert.ok(board.ready().some((x) => x.id === task.id), '回收后就绪，可被重新领取')
   assert.equal(board.expireLeases({ now: T0 + 10_000_000 }).length, 0, '幂等：没有租约了就不重复回收')

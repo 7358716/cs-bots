@@ -294,7 +294,8 @@ test('租约回收：owner 崩溃后任务自动回 pending，可被重新认领
     const back = h.board.get(task.id)
     assert.equal(back.status, 'pending', '回收后应回 pending')
     assert.equal(back.lease, undefined)
-    assert.equal(back.ownerId, undefined)
+    // ★ t-40-A：回收只让租约失效，**不抹掉负责人**（Boss：「负责人不用切换，避免内容丢失」）
+    assert.equal(back.ownerId, h.sessionId, '★ 负责人必须保留，任务回到待领池但仍归属原负责人')
     // 回收来源应可审计（board 会在事件流里记，任务上带 releasedBy 或 list 里可查）
     const hist = h.board.history(task.id)
     assert.ok(

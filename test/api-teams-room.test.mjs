@@ -186,3 +186,40 @@ test('§3 议事厅 idempotent：重复 attachRoom（同一 roomId）不产生�
   const attaches = rows.filter((ev) => ev.action === 'attachRoom' && ev.id === r.json.team.id)
   assert.equal(attaches.length, 1, 'attachRoom 必须幂等（不重复写事件）')
 })
+// ── 2026-11-12 t-40-B：/rooms/post 必须读 mentionOnly + 排除人类 ──────────────
+//
+// 这条路径是 bot_room_post 与 Boss UI 发言**实际走的那条**。
+// 修复前它是裸的 `members.filter(m => m !== skipSelf)`：
+//   - 不看 mentionOnly（实测 6 个房间全设了 true，一次都没生效）
+//   - 不排除人类 id（打给 ui 必然 agent-not-live，纯浪费一次模型调用）
+test('t-40-B：/rooms/post 缺省 mentionOnly ⇒ 没 @ 人就不唤醒任何成员', async (t) => {
+  const h = boot()
+  t.after(() => h.cleanup())
+  const r = await h.req('POST', '/teams', {
+    name: '定向测试团队', type: 'small', leadId: 'lead-s', members: ['bot-s'],
+  })
+  assert.equal(r.status, 200, JSON.stringify(r.json))
+  const roomId = r.json.room.id
+
+  const rp = await h.req('POST', '/rooms/post', { roomId, from: 'lead-s', text: '没 @ 任何人的一句同步' })
+  assert.equal(rp.status, 200, JSON.stringify(rp.json))
+  // 消息照常落盘，但一个唤醒都不该发
+  assert.ok(rp.json.message?.id, '消息必须落盘')
+  assert.equal(rp.json.wakes, 0, '★ mentionOnly 缺省 true + 没 @ 人 ⇒ 0 次唤醒（修复前这里是成员数-1）')
+})
+
+test('t-40-B：/rooms/post @ 了谁就只唤醒谁，不 @ 的人不被吵醒', async (t) => {
+  const h = boot()
+  t.after(() => h.cleanup())
+  // 直接建一个带 3 个非人类成员的房间（/teams 的议事厅成员装配与此无关，
+  // 本测试只验证 /rooms/post 的唤醒目标计算，故显式控住成员表）
+  const rc = await h.req('POST', '/rooms', {
+    name: '定向唤醒回归房', members: ['lead-s', 'bot-s', 'bot-z'], by: 'ui',
+  })
+  const roomId = rc.json?.room?.id ?? rc.json?.id
+  assert.ok(roomId, `建房间失败：${JSON.stringify(rc.json)}`)
+
+  const rp = await h.req('POST', '/rooms/post', { roomId, from: 'lead-s', text: '@bot-s 帮看下这个' })
+  assert.equal(rp.status, 200, JSON.stringify(rp.json))
+  assert.equal(rp.json.wakes, 1, '★ 只 @ 了 bot-s ⇒ 只 1 次唤醒（修复前是 2 次：bot-s + bot-z）')
+})

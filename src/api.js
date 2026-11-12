@@ -2690,11 +2690,21 @@ export function installApi(ctx, { warn } = {}) {
         //   - 房间设置 `allowBotAutoPost` 为 false 时跳过（给用户关开关的权利）；
         //   - dedupKey 用消息 ID，天然幂等，同一消息不会重复唤醒；
         //   - dispatcher 缺失时降级为「只落消息不唤醒」，不抛错。
+        //
+        // ⚠️ 修复（2026-11-12 t-40-B）：目标计算改走 room 服务的 `computeWakeTargets`。
+        //   此前这里是裸的 `members.filter((m) => m !== skipSelf)`，**既不看
+        //   `mentionOnly`、也不排除人类 id** —— 实测 6 个房间全部设了
+        //   `mentionOnly: true`，却一次都没生效；8 成员房间一条消息 = 8 次模型调用，
+        //   打给 `ui/user/person` 的那几次必然 agent-not-live。
+        //   现在与 `room.relay()` 共用同一份四档规则（见 room.js computeWakeTargets）。
         const room = await withService(services, 'room', (r) => r.get(message.roomId))
         const senderSession = body.from ?? 'ui'
-        const members = room?.members ?? []
-        const skipSelf = (senderSession !== 'ui' && senderSession)
-        const toWake = members.filter((m) => m !== skipSelf)
+        const decided = await withService(services, 'room', (r) =>
+          r.computeWakeTargets(
+            { members: room?.members ?? [], settings: room?.settings },
+            { from: senderSession, text: message.text, mentions: message.mentions },
+          ))
+        const toWake = decided?.targets ?? []
         const wakeByTarget = new Map()
         if (toWake.length > 0 && room?.settings?.allowBotAutoPost !== false) {
           for (const target of toWake) {
