@@ -849,3 +849,25 @@ test('2026-11-09：🔴 off 模式下点名仍然准入（三档模式都要放�
   assert.equal(detail.admission, 'explicit', '官方：三档模式下 explicit 都准入')
   assert.equal(detail.admitted, true)
 })
+
+// ══ 2026-11-12 t-40：插件安装场景下的宿主能力自检 ══════════════════════════
+//
+// Boss：「要考虑以后我发布后的运行情况，以插件的形式安装」
+// 之前 /status 只报插件自己的服务，宿主没装 session-persistence 时
+// 任务对话静默失效，而页面显示「一切正常」—— 静默失败。
+
+test('t-40 插件安装：/status 必须报宿主能力，并说明每条缺失的降级后果', async (t) => {
+  const h = boot()
+  t.after(() => h.cleanup())
+  const r = await h.req('GET', '/status')
+  assert.equal(r.status, 200)
+  assert.ok(r.json.host, '★ /status 必须带 host 能力块（插件装完能自检）')
+  assert.ok(Array.isArray(r.json.host.missing), 'missing 必须是数组（哪怕为空）')
+  // 这个测试 harness 没有 sessionPersistence ⇒ 必须被识别出来并给出修复建议
+  const deg = r.json.host.degraded ?? []
+  const sp = deg.find((d) => String(d.reason ?? '').includes('session-persistence'))
+  assert.ok(sp, '★ 缺 sessionPersistence 时必须列为降级项，不能装作没事')
+  assert.match(String(sp.effect ?? ''), /会话|对话/, '要说清「哪个功能受影响」')
+  assert.match(String(sp.feature ?? ''), /对话|对话/, '要标明受影响的功能名')
+  assert.match(String(sp.fix ?? ''), /session-persistence/, '要给出修复办法')
+})

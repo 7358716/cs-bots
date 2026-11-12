@@ -17,7 +17,7 @@ import { createRoom } from './room.js'
 import { createMemory } from './memory.js'
 import { installTools } from './tools.js'
 import { setServices } from './registry.js'
-import { service, stateDir as kernelStateDir, onLlmStream, sessionMeta, readSessionWatermark as kernelWatermark } from './kernel.js'
+import { service, stateDir as kernelStateDir, onLlmStream, sessionMeta, readSessionWatermark as kernelWatermark, capabilities } from './kernel.js'
 import { installLlmStreamHint } from './routing/hints.js'
 import { installApi } from './api.js'
 import { createDeliveryWatch, DEFAULT_GRACE_MS, DEFAULT_TICK_MS } from './delivery-watch.js'
@@ -136,6 +136,25 @@ function applyInner(ctx, config, { log, warn }) {
       metrics: () => services.metrics,
     })
     log(`[cs-bots] BoardService 就绪（stateDir=${services.board.paths?.stateDir ?? '?'}）`)
+
+    // ── 宿主能力自检（t-40 · 插件安装场景）──────────────────────────────
+    // 别人把 cs-bots 当插件装上去时，宿主不一定装配了全部能力。
+    // 缺 session-persistence ⇒ 任务对话/去对话静默失效；缺 agentTeams ⇒ 原生团队绑定不可用。
+    // 这类降级**必须在启动时就喊出来**，否则用户只会看到"功能没反应"而查不到原因。
+    try {
+      const cap = capabilities(ctx)
+      if (cap.missing?.length) {
+        warn(`[cs-bots] 宿主能力缺失：${cap.missing.join(', ')} —— 相关功能会降级，详见 GET /status 的 host 字段`)
+        if (!cap.sessionPersistence) {
+          warn('[cs-bots] 缺少 sessionPersistence ⇒ 任务对话/会话读取不可用。'
+            + '安装并启用 @deepseek-ai/dsh-session-persistence-jsonl 即可恢复。')
+        }
+      } else {
+        log('[cs-bots] 宿主能力齐备（agents/agentTeams/webServer/sandboxPolicy/sessionPersistence）')
+      }
+    } catch (error) {
+      warn(`[cs-bots] 宿主能力自检失败（不影响装配）：${error?.message ?? error}`)
+    }
     // ⚠️ 修复（2026-11-04 测试，P1-4）：expireLeases 之前无任何调用者，
     //   owner 崩溃/失联后任务永久停在 in_progress（连"重启时回收"都不做）。
     //   现在启动时先回收一次过期租约（失败不阻塞装配）。

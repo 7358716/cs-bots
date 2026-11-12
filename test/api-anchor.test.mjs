@@ -786,3 +786,32 @@ test('t-40 对话：既没派活也没补充说明 ⇒ 给可读空态（不是�
   assert.equal(r.status, 200)
   assert.equal(r.json.code, 'NO_CONVERSATION', '空态要有明确 code，前端据此显示引导')
 })
+
+// ══ 2026-11-12 t-40：「把对话消息挂到任务上」════════════════════════════════
+//
+// Boss：「要做，把对话消息挂到任务上」
+// 场景：他在**普通对话**里说「把 X 改一下」，那条消息存他自己会话里。
+// 任务记 originSessionId 后，任务详情应能并出那段对话。
+
+test('t-40 对话：任务记了 originSessionId ⇒ 返回里带 origin 计数（会话不可读时也不崩）', async (t) => {
+  const h = boot()
+  t.after(() => h.cleanup())
+  // 这个 harness 没有 sessionPersistence，读会话会返回 available:false ——
+  // 正好验证「读不到来源会话时，主时间线仍要正常返回」
+  const task = h.createTask({ subject: '带来源会话的任务', originSessionId: 'sess-origin-abc' })
+  assert.equal(task.originSessionId, 'sess-origin-abc', '★ 任务上要记下来源会话')
+
+  const r = await h.req('GET', `/tasks/conversation?id=${task.id}`)
+  assert.equal(r.status, 200)
+  // 没有执行者会话也没有 note ⇒ 空态，但**不能因为来源会话读不到而整体失败**
+  assert.ok(['NO_CONVERSATION', undefined].includes(r.json.code), `不该崩：${JSON.stringify(r.json).slice(0, 200)}`)
+})
+
+test('t-40 对话：originSessionId 缺失时行为不变（老任务不受影响）', async (t) => {
+  const h = boot()
+  t.after(() => h.cleanup())
+  const task = h.createTask({ subject: '老任务' })
+  assert.equal(task.originSessionId, undefined, '不传就不写这个字段')
+  const r = await h.req('GET', `/tasks/conversation?id=${task.id}`)
+  assert.equal(r.status, 200, '老任务仍能正常查询')
+})

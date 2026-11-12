@@ -15,7 +15,7 @@
 import { readFileSync, readdirSync, statSync, existsSync, writeFileSync, renameSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { join, resolve, sep as pathSep } from 'node:path'
-import { registerRoute, listPresets, defaultPreset, getAgent, resumeSession, readSessionMessages, attachToWorkspace, readSessionWatermark, sessionMeta } from './kernel.js'
+import { registerRoute, listPresets, defaultPreset, getAgent, resumeSession, readSessionMessages, attachToWorkspace, readSessionWatermark, sessionMeta, capabilities } from './kernel.js'
 import { createLibrary } from './library.js'
 import { createDirBrowser } from './dirbrowse.js'
 import { getServices } from './registry.js'
@@ -2339,7 +2339,32 @@ export function installApi(ctx, { warn } = {}) {
       }
 
       if (request.method === 'GET' && path === '/status') {
-        const out = { ok: true, services: {}, compat: services.compat ?? null }
+        // ── 宿主能力自检（t-40 · 插件安装场景）─────────────────────────────
+        // 之前这里只报**插件自己的**域服务，完全没报宿主能力。
+        // 后果：别人把 cs-bots 当插件装上后，若宿主没装配 session-persistence，
+        //      任务对话/阶段产物/投递回执全部静默失效，而 /status 显示「一切正常」——
+        //      正是本平台最忌讳的静默失败。
+        // 现在把 capabilities 一并报出来，并给每条缺失一句「这个功能会怎样降级」。
+        let host = null
+        try {
+          const cap = capabilities(ctx)
+          const degraded = []
+          if (!cap.sessionPersistence) {
+            degraded.push({
+              feature: '任务对话 / 去对话',
+              reason: '宿主未装配 session-persistence',
+              effect: '任务页看不到会话内容；其余功能不受影响',
+              fix: '安装并启用 @deepseek-ai/dsh-session-persistence-jsonl',
+            })
+          }
+          if (!cap.webServer) degraded.push({ feature: '页面/HTTP 接口', reason: '宿主无 webServer' })
+          if (!cap.agents) degraded.push({ feature: '建 Bot / 唤醒', reason: '宿主无 agents 服务' })
+          if (!cap.agentTeams) degraded.push({ feature: '原生团队绑定', reason: '宿主无 agentTeams（可选，不影响核心）' })
+          host = { ...cap, degraded }
+        } catch (error) {
+          host = { error: String(error?.message ?? error) }
+        }
+        const out = { ok: true, services: {}, compat: services.compat ?? null, host }
         // 状态面要覆盖**全部**域服务：新增模块若不上报，页面「系统体检」就会
         // 显示「一切正常」而实际某功能没装配 —— 那是本平台最忌讳的静默失败。
         const SERVICE_KEYS = [
@@ -5485,6 +5510,51 @@ export function installApi(ctx, { warn } = {}) {
           }
         } catch { /* notes 读不到不影响主时间线 */ }
 
+        // ── 来源会话（t-40：「把对话消息挂到任务上」）────────────────────────
+        // Boss 在**普通对话**里说「把 X 改一下」，那条消息存在他自己的会话里。
+        // 任务上记了 originSessionId，这里把那段对话也并进时间线 ——
+        // 于是任务页能完整看到「我当时怎么说的 + Bot 怎么回的」，不必两头翻。
+        //
+        // 只取**时间窗口内**的消息：从任务创建前一段时间到任务完成/现在，
+        // 避免把一个长对话里与这个任务无关的几百条全搬进来（那是看图不是看任务）。
+        const originSid = typeof task.originSessionId === 'string' ? task.originSessionId : ''
+        if (originSid && originSid !== sessionId) {
+          try {
+            const windowStart = Number(task.createdAt) - 5 * 60 * 1000 // 创建前 5 分钟起
+            const windowEnd = Number(task.completedAt ?? task.updatedAt ?? Date.now()) + 60 * 1000
+            const oOut = await readSessionMessages(ctx, originSid, { limit: Math.max(limit, 200) })
+            if (oOut?.ok && Array.isArray(oOut.messages)) {
+              for (const m of oOut.messages) {
+                if (!(m.kind === 'text' || m.role === 'user')) continue
+                const t = Number(m.at)
+                if (Number.isFinite(t) && Number.isFinite(windowStart) && t < windowStart) continue
+                if (Number.isFinite(t) && Number.isFinite(windowEnd) && t > windowEnd) continue
+                timeline.push({
+                  ...m,
+                  source: 'origin',
+                  speaker: m.role === 'user' ? 'Boss' : (bot?.name ?? '执行者'),
+                  sessionId: originSid,
+                })
+              }
+            }
+          } catch { /* 会话读不到不影响主时间线：notes 仍是保底 */ }
+        }
+
+        // 去重：note 与来源会话可能记录同一句话（用户写了补充说明，会话里也有）。
+        // 按 (role, 前 60 字) 去重，保留先出现的（note 更权威，因为它一定属于本任务）。
+        {
+          const seen = new Set()
+          const deduped = []
+          for (const m of timeline) {
+            const key = `${m.role}|${String(m.text ?? '').trim().slice(0, 60)}`
+            if (seen.has(key)) continue
+            seen.add(key)
+            deduped.push(m)
+          }
+          timeline.length = 0
+          timeline.push(...deduped)
+        }
+
         // 时间升序；没有时间戳的排在前面（避免被甩到最后）
         timeline.sort((a, b) => {
           const ta = Number.isFinite(a.at) ? a.at : 0
@@ -5511,6 +5581,7 @@ export function installApi(ctx, { warn } = {}) {
           counts: {
             executor: timeline.filter((m) => m.source === 'executor').length,
             note: timeline.filter((m) => m.source === 'note').length,
+            origin: timeline.filter((m) => m.source === 'origin').length,
             user: timeline.filter((m) => m.role === 'user').length,
             assistant: timeline.filter((m) => m.role === 'assistant').length,
           },

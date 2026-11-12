@@ -129,6 +129,12 @@ const DEFS = [
           type: 'string',
           description: '谁下的令（人/会话/Bot 标识）。不传时记录调用者 byId —— 那是事实，不是推断。',
         },
+        originSessionId: {
+          type: 'string',
+          description:
+            '这个任务是在哪个对话/会话里产生的（t-40）。**默认自动取当前会话**，一般不用填；'
+            + '填了之后任务详情能把「那一刻的对话前后文」一起展示出来。',
+        },
       },
       required: ['subject'],
       additionalProperties: false,
@@ -142,10 +148,18 @@ const DEFS = [
         const mandate = {}
         if (mandateBasis !== undefined && mandateBasis !== null) mandate.basis = mandateBasis
         if (mandateSender !== undefined && mandateSender !== null) mandate.sender = mandateSender
+        // t-40：自动记下「这个任务是在哪个对话里被创建的」——
+        // Boss 在普通对话里说「把 X 改一下」，那条消息存在他的会话里；
+        // 不记 originSessionId，任务栏就永远只能看到 Bot 的回复、看不到自己下过什么令。
+        // 调用方也可显式传 originSessionId 覆盖（例如替别人的对话建任务）。
+        const caller = callerOf(exec)
+        const origin = a?.originSessionId ?? (caller && caller !== 'unknown' ? caller : undefined)
+        const { originSessionId: _ignore, ...restNoOrigin } = rest
         return success({
           task: s.board.create({
-            ...rest,
-            byId: callerOf(exec),
+            ...restNoOrigin,
+            byId: caller,
+            ...(origin ? { originSessionId: origin } : {}),
             ...(Object.keys(mandate).length > 0 ? { mandate } : {}),
           }),
         })

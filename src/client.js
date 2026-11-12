@@ -2525,6 +2525,8 @@ window.__ModuleLoader__.load({
         // 用户说的话必须一眼可辨，所以 note 来源的 user 消息额外标「任务里」。
         if (m.role === 'user') {
           if (m.source === 'note') return `${HUMAN_SELF_LABEL}（任务里）`
+          // t-40：来源会话里说的话 —— 即「你在普通对话里下的令」
+          if (m.source === 'origin') return `${HUMAN_SELF_LABEL}（对话里）`
           return HUMAN_SELF_LABEL
         }
         if (m.role === 'assistant') return m.speaker && m.speaker !== bot?.name ? m.speaker : (bot?.name ?? '执行者')
@@ -2544,7 +2546,7 @@ window.__ModuleLoader__.load({
           title: '任务对话',
           desc: bot
             ? `执行者「${bot.name}」的会话 + 你在任务里说的话，按时间合并（共 ${messages.length} 条`
-              + `${data?.counts ? `：执行者 ${data.counts.executor} 条 / 任务说明 ${data.counts.note} 条` : ''}）。`
+              + `${data?.counts ? `：执行者 ${data.counts.executor} / 任务说明 ${data.counts.note} / 对话来源 ${data.counts.origin ?? 0}` : ''}）。`
               + '这里是只读的：要看全部或继续聊，点「去对话」。'
             : '任务派给 Bot 之后，它的执行过程和你下的指令都会出现在这里。',
         }, null),

@@ -1155,7 +1155,7 @@ export function createBoard(ctx, config = {}) {
       subject, description, blockedBy, writeScopes, priority, dueAt, byId, sourceSeq, now,
       expectedComplexity, requiresPaid, source, channel,
       labels, milestone, cycle, estimate, assignee, reviewer, progress, triaged,
-      mandate,
+      mandate, originSessionId,
     } = input ?? {}
     const by = requireString(byId, 'byId', 'create')
     // 来源判定（2026-11-12 t-40 需求①）：
@@ -1178,6 +1178,10 @@ export function createBoard(ctx, config = {}) {
       : requireString(sourceSeq, 'sourceSeq', 'create')
     // P0-B 新增可选字段（全部「可选 + 回放补默认」，老数据不受影响）
     const labelsNorm = normalizeLabels(labels, 'create')
+    // 来源会话（t-40）：任务是在**哪个对话里**被创建的。
+    // 为什么需要它：Boss 在普通对话里说"把 X 修一下"，那条消息存在他的会话里，
+    // 任务记录完全不知道 —— 任务栏只能看到 Bot 的回复，看不到自己下过什么令。
+    const originSessionNorm = normalizeOptionalString(originSessionId, 'originSessionId', 'create')
     const milestoneNorm = normalizeOptionalString(milestone, 'milestone', 'create')
     const cycleNorm = normalizeOptionalString(cycle, 'cycle', 'create')
     const estimateNorm = normalizeEstimate(estimate, 'create')
@@ -1223,6 +1227,7 @@ export function createBoard(ctx, config = {}) {
     const task = {
       id: taskId,
       rev: 1, source: src, channel: chan,
+      ...(originSessionNorm ? { originSessionId: originSessionNorm } : {}),
       subject: subj,
       description: desc,
       status: 'pending',
