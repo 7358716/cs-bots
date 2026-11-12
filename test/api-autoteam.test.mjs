@@ -150,3 +150,73 @@ test('W1 /tasks/assign 成功投递后登记回执期望（带上投递前的水
     wmCalls.push('checked')
   } finally { h.cleanup() }
 })
+
+// ── Boss 2026-11-12：长任务自动建房间，结果回传给群主 ──────────────────────
+// 原话：「以后每个长任务都自动创建房间，结果传递给房间群主」。
+// 为什么只给长任务建：普通任务一两天就结束，建房只会留下大量死房间；
+// 长任务跨多次唤醒、多阶段交付，需要一个公共出口让群主看到进展与结论。
+
+test('长任务 ⇒ 自动建议事厅，群主 = 负责人，委托人也在成员里', async () => {
+  const h = boot()
+  try {
+    const bot = await h.services.roster.create({ name: '长任务工', cwd: '/tmp/longjob', permission: 'workspace-write', byId: 'ui' })
+    const r = await h.req('POST', '/tasks', {
+      subject: '做个长活', assignee: bot.sessionId, longrun: true, byId: 'ui',
+    })
+    assert.equal(r.status, 200)
+    assert.ok(r.json.autoRoom, '响应要带 autoRoom（建没建上要能看见）')
+    assert.ok(r.json.autoRoom.roomId, `长任务必须建房，实际：${JSON.stringify(r.json.autoRoom)}`)
+    assert.equal(r.json.autoRoom.created, true, '第一次应当新建')
+
+    const room = h.services.room.get(r.json.autoRoom.roomId)
+    assert.equal(room.adminId, bot.sessionId, '群主 = 负责人（他要能主持这个房间）')
+    assert.ok(room.members.includes(bot.sessionId), '负责人必须在成员里')
+    assert.ok(room.members.includes('ui'), '委托人也要在成员里 —— 否则他看不到回传的结果')
+    assert.equal(room.mode, 'admin', '负责人是群主 ⇒ admin 模式（可改名/归档）')
+  } finally { h.cleanup() }
+})
+
+test('长任务 ⇒ 房间幂等：同一个 Bot 的第二个长任务复用同一议事厅（不建死房间）', async () => {
+  const h = boot()
+  try {
+    const bot = await h.services.roster.create({ name: '反复长活', cwd: '/tmp/long2', permission: 'workspace-write', byId: 'ui' })
+    const first = await h.req('POST', '/tasks', { subject: '长活一', assignee: bot.sessionId, longrun: true, byId: 'ui' })
+    const second = await h.req('POST', '/tasks', { subject: '长活二', assignee: bot.sessionId, longrun: true, byId: 'ui' })
+    assert.equal(first.json.autoRoom.roomId, second.json.autoRoom.roomId, '同一 Bot 的团队只有一个议事厅')
+    assert.equal(second.json.autoRoom.created, false, '第二次应当是复用，不是新建')
+  } finally { h.cleanup() }
+})
+
+test('普通任务 ⇒ 不建房间（只有长任务才建，避免死房间泛滥）', async () => {
+  const h = boot()
+  try {
+    const bot = await h.services.roster.create({ name: '短活工', cwd: '/tmp/short', permission: 'workspace-write', byId: 'ui' })
+    const r = await h.req('POST', '/tasks', { subject: '小事一桩', assignee: bot.sessionId, byId: 'ui' })
+    assert.equal(r.status, 200)
+    assert.equal(r.json.autoRoom, undefined, '普通任务不该建房')
+    assert.equal(h.services.room.list({}).length, 0, '存储里也不该多出房间')
+  } finally { h.cleanup() }
+})
+
+test('phases 数组也算长任务 ⇒ 同样建房（判定与 longrun:true 一致）', async () => {
+  const h = boot()
+  try {
+    const bot = await h.services.roster.create({ name: '阶段工', cwd: '/tmp/phased', permission: 'workspace-write', byId: 'ui' })
+    const r = await h.req('POST', '/tasks', {
+      subject: '四阶段长活', assignee: bot.sessionId, phases: ['调研', '设计', '实现', '验收'], byId: 'ui',
+    })
+    assert.ok(r.json.autoRoom?.roomId, 'phases 也应触发建房（与 longrun:true 同一判定）')
+  } finally { h.cleanup() }
+})
+
+test('autoRoom:false ⇒ 显式不建房（保留逃生阀，不强制）', async () => {
+  const h = boot()
+  try {
+    const bot = await h.services.roster.create({ name: '不要房', cwd: '/tmp/noroom', permission: 'workspace-write', byId: 'ui' })
+    const r = await h.req('POST', '/tasks', {
+      subject: '长活但不要房', assignee: bot.sessionId, longrun: true, autoRoom: false, byId: 'ui',
+    })
+    assert.equal(r.json.autoRoom, undefined, 'autoRoom:false 时不该建房')
+    assert.equal(h.services.room.list({}).length, 0)
+  } finally { h.cleanup() }
+})

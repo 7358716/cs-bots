@@ -1779,6 +1779,63 @@ async function ensureTeamForBot(services, botSessionId, by) {
   }
 }
 
+/**
+ * 给团队确保一个议事厅并返回它（Boss 2026-11-12 需求：长任务自动建房）。
+ *
+ * ## 为什么要它
+ *   `ensureTeamForBot()` 只建**团队**，不建**房间**。于是长任务建完后：
+ *   - 团队有了，但成员没有地方说话；
+ *   - 结果只能靠人挨个去问，没有一处「这个长任务进展/结论」的公共出口。
+ *   Boss 原话：「以后每个长任务都自动创建房间，结果传递给房间群主」。
+ *
+ * ## 语义
+ *   - 团队已有房间 ⇒ 直接复用（幂等，不重复建）
+ *   - 没有 ⇒ 建 `${team.name} · 议事厅`，成员 = 负责人 + 团队现有成员 + **委托人**
+ *   - `adminId = team.leadId`（群主 = 负责人），与建团队时 `adminPolicy:'lead-only'` 一致
+ *   - 负责人已在成员里 ⇒ `mode:'admin'`，让他能改名/归档
+ *
+ * ## 失败不阻断
+ *   任务和团队已经建好了，房间没建上只是少一个沟通出口 —— 返回 `{reason}` 让调用方
+ *   如实带回给页面，**绝不静默**。
+ *
+ * @returns {Promise<{room?: object, created?: boolean, reason?: string}>}
+ */
+async function ensureRoomForTeam(services, team, by) {
+  const rooms = services.room
+  if (!team || !rooms || typeof rooms.create !== 'function') return { reason: '没有可用的房间服务或团队' }
+  try {
+    if (team.roomId) {
+      const existing = rooms.get?.(team.roomId)
+      if (existing) return { room: existing, created: false }
+      // 团队记着 roomId 但房间已不存在（被归档/删除）⇒ 下面重建，并在结果里说明
+    }
+
+    // 成员：负责人（群主）+ 团队现有成员 + 委托人（谁派的活谁要能看到结果）
+    const leadId = team.leadId
+    const memberList = [leadId, ...(Array.isArray(team.members) ? team.members : []), by]
+      .filter((v) => typeof v === 'string' && v !== '')
+    const members = [...new Set(memberList)]
+
+    const room = rooms.create({
+      name: `${team.name} · 议事厅`,
+      members,
+      // 负责人是群主 ⇒ admin 模式（他能改名/归档）；他一定在 members 里（上面首位）
+      mode: 'admin',
+      adminId: leadId,
+      purpose: `长任务「${team.name}」的议事厅：负责人主持，进展与结论回传到此`,
+      byId: by ?? 'ui',
+    })
+
+    // 把房间记到团队上（幂等；已有 roomId 的情况在这里被覆盖为新房）
+    if (typeof services.teams?.attachRoom === 'function') {
+      services.teams.attachRoom({ id: team.id, roomId: room.id, by: by ?? 'ui' })
+    }
+    return { room, created: true }
+  } catch (error) {
+    return { reason: `自动建房间失败：${error?.message ?? error}` }
+  }
+}
+
 /** 
  * 投递能力预检（2026-11-09 修复「任务指派后卡在排队中、失败无声」）。
  *
@@ -2325,6 +2382,29 @@ export function installApi(ctx, { warn } = {}) {
           autoTeam = await ensureTeamForBot(services, rest.assignee, rest.byId ?? 'ui')
         }
 
+        // ── 长任务自动建房间（Boss 2026-11-12 需求）────────────────────────
+        // 原话：「以后每个长任务都自动创建房间，结果传递给房间群主」。
+        // 为什么只给长任务建：普通任务一两天就结束，建房只会留下大量死房间；
+        // 长任务跨多次唤醒、要多个阶段交付，需要一个**公共出口**让群主看到进展与结论。
+        // 复用 autoTeam 的团队（不另建），团队没有就现场补一个。
+        let autoRoom
+        if (wantsLongrun && rest.autoRoom !== false) {
+          const by = rest.byId ?? 'ui'
+          let team = autoTeam?.team
+          if (!team) {
+            autoTeam = await ensureTeamForBot(services, rest.assignee ?? by, by)
+            team = autoTeam?.team
+          }
+          if (team) {
+            const got = await ensureRoomForTeam(services, team, by)
+            autoRoom = got.room
+              ? { roomId: got.room.id, name: got.room.name, created: got.created }
+              : { reason: got.reason }
+          } else {
+            autoRoom = { reason: autoTeam?.reason ?? '没有团队可用于建房' }
+          }
+        }
+
         // 阶段清单落在 task-meta.jsonl（与 evolve 同一份存储、同一形状）⇒
         // `buildTaskAnchorText` 自动带上，第一次唤醒就可见，不需要再转。
         if (wantsLongrun) {
@@ -2338,7 +2418,9 @@ export function installApi(ctx, { warn } = {}) {
           })
           sendJson(response, 200, {
             ok: true, task, phases: normalizedPhases, longrun: true, autoTeam,
-            note: '已按长任务创建；此后每次唤醒都会带上阶段清单',
+            ...(autoRoom ? { autoRoom } : {}),
+            note: '已按长任务创建；此后每次唤醒都会带上阶段清单'
+              + (autoRoom?.roomId ? `，进展与结论请回传到议事厅 ${autoRoom.roomId}` : ''),
           })
           return
         }
