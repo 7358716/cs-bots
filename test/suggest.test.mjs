@@ -666,3 +666,64 @@ test('dispose：清空并拒绝后续调用（不静默返回空队列）', asyn
   throwsCode(() => svc.stats(), 'SUGGEST_DISPOSED')
   await rejectsCode(() => svc.accept({ id: 'sg-whatever', by: 'user', apply: () => ({}) }), 'SUGGEST_DISPOSED')
 })
+
+// ══ 2026-11-12 t-40：建议可编辑（内容 / 等级）════════════════════════════════
+//
+// Boss：「自动整理建议中，用户只能接纳和驳回，等级没办法选择、内容没办法修改，
+//        用户应该可以修改完善并确定等级范围」
+
+test('t-40 edit：改内容 —— 改完仍是 pending，内容已更新', (t) => {
+  const { svc } = setup(t)
+  const sg = seed(svc)
+  const edited = svc.edit({
+    id: sg.id, expectedRev: sg.rev, by: 'user',
+    content: '提交前**必须**跑全量测试（Boss 改过措辞）',
+  })
+  assert.equal(edited.status, 'pending', '★ 编辑不等于采纳，仍然是待确认')
+  assert.equal(edited.payload.content, '提交前**必须**跑全量测试（Boss 改过措辞）')
+  assert.equal(edited.rev, sg.rev + 1, 'rev 必须递增')
+  assert.equal(edited.editCount, 1)
+})
+
+test('t-40 edit：改等级（layer）—— L1..L5 可选，L0 拒绝', (t) => {
+  const { svc } = setup(t)
+  const sg = seed(svc)
+  const moved = svc.edit({ id: sg.id, expectedRev: sg.rev, by: 'user', layer: 'L3' })
+  assert.equal(moved.payload.layer, 'L3', '★ 用户能自己定等级')
+
+  throwsCode(
+    () => svc.edit({ id: sg.id, expectedRev: moved.rev, by: 'user', layer: 'L0' }),
+    'SUGGEST_BAD_LAYER',
+  )
+})
+
+test('t-40 edit：终态不可改；CAS 冲突要拦住', (t) => {
+  const { svc } = setup(t)
+  const sg = seed(svc)
+  const after = svc.edit({ id: sg.id, expectedRev: sg.rev, by: 'user', content: 'x' })
+  // 用旧 rev 再改 ⇒ 冲突
+  throwsCode(
+    () => svc.edit({ id: sg.id, expectedRev: sg.rev, by: 'user', content: 'y' }),
+    'SUGGEST_REV_CONFLICT',
+  )
+  // 缺 expectedRev ⇒ 拒绝（覆盖性操作必须带版本）
+  throwsCode(
+    () => svc.edit({ id: sg.id, by: 'user', content: 'z' }),
+    'SUGGEST_BAD_FIELD',
+  )
+  // 采纳后不可改
+  svc.reject({ id: sg.id, by: 'user', reason: '不要了' })
+  throwsCode(
+    () => svc.edit({ id: sg.id, expectedRev: after.rev, by: 'user', content: 'w' }),
+    'SUGGEST_NOT_PENDING',
+  )
+})
+
+test('t-40 edit：审计流里留下 edit 事件（before/after 可查）', (t) => {
+  const { dir, svc } = setup(t)
+  const sg = seed(svc)
+  svc.edit({ id: sg.id, expectedRev: sg.rev, by: 'user', content: '改过的内容' })
+  const ev = events(dir).filter((e) => e.action === 'edit')
+  assert.equal(ev.length, 1, '必须写一条 edit 事件')
+  assert.equal(ev[0].before.payload.content !== ev[0].after.payload.content, true, 'before/after 要有差异可查')
+})

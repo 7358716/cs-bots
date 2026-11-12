@@ -6425,6 +6425,38 @@ window.__ModuleLoader__.load({
         }
       }
 
+      // ── 建议编辑（t-40）──
+      // Boss：「用户应该可以修改完善并确定等级范围」。
+      // 只给「采纳/驳回」时，措辞不合意就只能驳回重等 —— 越推越远。
+      const [sgEdit, setSgEdit] = useState(null)
+      const openSgEdit = (sg) => setSgEdit({
+        id: sg.id,
+        rev: sg.rev,
+        kind: sg.kind,
+        layer: sg.layer ?? sg.payload?.layer ?? '',
+        content: sg.payload?.content ?? sg.payload?.name ?? sg.payload?.title ?? '',
+      })
+      const saveSgEdit = async () => {
+        if (!sgEdit) return
+        setErr(null)
+        try {
+          await call('/suggestions/edit', {
+            method: 'POST',
+            body: {
+              id: sgEdit.id,
+              expectedRev: sgEdit.rev,
+              content: sgEdit.content,
+              ...(sgEdit.kind === 'memory' && sgEdit.layer ? { layer: sgEdit.layer } : {}),
+            },
+          })
+          setOk('已保存修改，它仍是待确认状态')
+          setSgEdit(null)
+          reloadSug()
+        } catch (e) {
+          setErr(e.message)
+        }
+      }
+
       const decideSuggestion = async (sg, accept) => {
         setErr(null)
         try {
@@ -6657,10 +6689,11 @@ window.__ModuleLoader__.load({
               footer: [h('button', { key: 'c', className: 'csb-btn', onClick: () => setShowSug(false) }, '关闭')],
             },
             h('p', { style: { color: 'var(--dsw-alias-label-secondary)', fontSize: 12 } },
-              '这些是模型整理的「它认为该记住/该改」的条目。Boss 不点采纳，它就不会生效。'),
+              '这些是模型整理的「它认为该记住/该改」的条目。不点采纳不会生效；措辞或等级不合意，点「编辑」改完再采纳。'),
             suggestions.length === 0
               ? h(Empty, { icon: '✓', title: '没有待确认的建议', hint: '有建议时这里会出现。' })
-              : h('div', { className: 'csb-list' }, suggestions.map((sg) => h('div', { key: sg.id, className: 'csb-card' },
+              : h('div', null,
+                h('div', { className: 'csb-list' }, suggestions.map((sg) => h('div', { key: sg.id, className: 'csb-card' },
                   h('div', { className: 'csb-card-main' },
                     h('div', { className: 'csb-card-t2' }, sg.payload?.content ?? sg.payload?.name ?? sg.payload?.title ?? '（无内容）'),
                     h('div', { className: 'csb-card-m' },
@@ -6669,8 +6702,39 @@ window.__ModuleLoader__.load({
                       sg.reason ? h('span', null, sg.reason) : null,
                       sg.confidence ? h('span', null, `把握 ${Math.round(sg.confidence * 100)}%`) : null)),
                   h('div', { style: { display: 'flex', gap: 6, flex: 'none' } },
+                    h('button', { className: 'csb-btn csb-btn-s', onClick: () => (sgEdit?.id === sg.id ? setSgEdit(null) : openSgEdit(sg)) }, sgEdit?.id === sg.id ? '收起' : '编辑'),
                     h('button', { className: 'csb-btn csb-btn-s csb-btn-p', onClick: () => decideSuggestion(sg, true) }, '采纳'),
-                    h('button', { className: 'csb-btn csb-btn-s', onClick: () => decideSuggestion(sg, false) }, '驳回'))))))
+                    h('button', { className: 'csb-btn csb-btn-s', onClick: () => decideSuggestion(sg, false) }, '驳回')))))),
+            // 编辑面板：与列表平级，不嵌进卡片 —— 改动更小、也不会打乱既有括号结构
+            sgEdit
+              ? h('div', { className: 'csb-card', style: { marginTop: 10, padding: 12 } },
+                  h('div', { style: { fontWeight: 600, marginBottom: 6 } }, `编辑建议 ${sgEdit.id}`),
+                  h('textarea', {
+                    className: 'csb-input',
+                    rows: 4,
+                    value: sgEdit.content,
+                    onInput: (e) => setSgEdit({ ...sgEdit, content: e.target.value }),
+                    style: { width: '100%', fontFamily: 'inherit', marginBottom: 8 },
+                  }),
+                  sgEdit.kind === 'memory'
+                    ? h('div', { style: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 } },
+                        h('span', { style: { fontSize: 12 } }, '等级'),
+                        h('select', {
+                          className: 'csb-input',
+                          value: sgEdit.layer,
+                          onChange: (e) => setSgEdit({ ...sgEdit, layer: e.target.value }),
+                        },
+                          h('option', { value: '' }, '（不指定）'),
+                          h('option', { value: 'L1' }, 'L1 用户偏好'),
+                          h('option', { value: 'L2' }, 'L2 团队全局'),
+                          h('option', { value: 'L3' }, 'L3 项目 key'),
+                          h('option', { value: 'L4' }, 'L4 任务笔记'),
+                          h('option', { value: 'L5' }, 'L5 日札')))
+                    : h('div', { style: { fontSize: 12, opacity: 0.7, marginBottom: 8 } }, '（该类型没有等级可选）'),
+                  h('div', { style: { display: 'flex', gap: 6 } },
+                    h('button', { className: 'csb-btn csb-btn-s csb-btn-p', onClick: saveSgEdit }, '保存修改'),
+                    h('button', { className: 'csb-btn csb-btn-s', onClick: () => setSgEdit(null) }, '取消')))
+              : null)
           : null,
 
         // ── 注入效果 ──

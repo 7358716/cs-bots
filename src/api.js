@@ -4858,6 +4858,23 @@ export function installApi(ctx, { warn } = {}) {
         sendJson(response, 200, { ok: true, suggestion: applied })
         return
       }
+      // 修改待决建议（t-40）：内容 / 等级 / 类型都能改，改完仍是 pending。
+      // Boss：「用户应该可以修改完善并确定等级范围」——只给采纳/驳回，措辞不合意就只能驳回重等。
+      if (request.method === 'POST' && path === '/suggestions/edit') {
+        const body = (await readBody(request)) ?? {}
+        const item = await withService(services, 'suggest', (sg) => sg.edit({
+          id: body.id,
+          expectedRev: body.expectedRev,
+          kind: body.kind,
+          layer: body.layer,
+          title: body.title,
+          content: body.content,
+          payload: body.payload,
+          by: body.by ?? OWNER,
+        }))
+        sendJson(response, 200, { ok: true, suggestion: item })
+        return
+      }
       if (request.method === 'POST' && path === '/suggestions/reject') {
         const body = (await readBody(request)) ?? {}
         const item = await withService(services, 'suggest', (s) =>

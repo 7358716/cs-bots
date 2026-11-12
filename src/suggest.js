@@ -1041,6 +1041,115 @@ export function createSuggest(ctx, config = {}) {
   }
 
   /**
+   * 修改一条**待决**建议：内容 / 等级（layer）/ 标题标签都可以改（2026-11-12 t-40）。
+   *
+   * Boss 原话：「自动整理建议中，用户只能接纳和驳回，等级没办法选择、内容没办法修改，
+   * 用户应该可以修改完善并确定等级范围」
+   *
+   * 为什么必须有这个口子：模型归纳出来的文字几乎总是「意思是对的、措辞不是我的」。
+   * 只给「采纳/驳回」两个按钮，用户遇到措辞不合意的建议只能驳回再等它重新提一遍 ——
+   * 而驳回会让同类建议进冷却，等于把「差一点就对」的东西越推越远。
+   *
+   * 语义边界：
+   *   - **只能改 pending**：已采纳/已驳回是终态，改它等于篡改历史（要提新的就 propose）。
+   *   - **改完仍是 pending**：编辑不等于采纳，用户改完可以再想想。
+   *   - **等级仍走同一套白名单**：`layer` 只能是 MEMORY_LAYERS（L0 仍不可写）。
+   *   - **改类型（kind）时 payload 必须一起给**：记忆与技能的 payload 形状不同。
+   *   - **必须 CAS**：`expectedRev` 必填，防两人同时改互相覆盖。
+   *   - **审计留痕**：写 `edit` 事件，before/after 都在事件流里可查。
+   *
+   * @param {{ id: string, expectedRev: number, payload?: object, kind?: string,
+   *           layer?: string, title?: string, content?: string, by: string, now?: number }} input
+   * @returns {object} 修改后的建议（rev 已 +1）
+   */
+  function edit(input = {}) {
+    assertAlive('edit')
+    const { id, expectedRev, kind, title, content, by, now } = input ?? {}
+    let { payload } = input ?? {}
+    const suggestionId = requireString(id, 'id', 'edit')
+    const author = requireString(by, 'by', 'edit')
+    const at = normalizeNow(now, 'edit')
+    const current = requireSuggestion(suggestionId, 'edit')
+
+    if (current.status !== 'pending') {
+      throw new SuggestError(
+        `suggest.edit：建议 [id:${suggestionId}] 已是 ${current.status}（终态不可改）—— `
+        + '要改请重新提一条（propose）',
+        'SUGGEST_NOT_PENDING',
+        { id: suggestionId, status: current.status },
+      )
+    }
+    const rev = Number(expectedRev)
+    if (!Number.isFinite(rev)) {
+      throw new SuggestError(
+        'suggest.edit：expectedRev 必填（修改是覆盖性操作，必须带版本做 CAS）',
+        'SUGGEST_BAD_FIELD',
+        { id: suggestionId, field: 'expectedRev' },
+      )
+    }
+    if (rev !== current.rev) {
+      throw new SuggestError(
+        `suggest.edit：CAS 冲突（期望 rev=${rev}，实际 rev=${current.rev}）—— 有人先改过了，请刷新后重试`,
+        'SUGGEST_REV_CONFLICT',
+        { id: suggestionId, expectedRev: rev, actualRev: current.rev },
+      )
+    }
+
+    const before = clone(current)
+    const next = clone(current)
+    next.rev = current.rev + 1
+
+    const nextKind = kind === undefined || kind === null ? current.kind : requireString(kind, 'kind', 'edit')
+    if (!KINDS.includes(nextKind)) {
+      throw new SuggestError(
+        `suggest.edit：kind 只能是 ${KINDS.join(' | ')}，收到 ${JSON.stringify(nextKind)}`,
+        'SUGGEST_BAD_KIND',
+        { id: suggestionId, kind: nextKind },
+      )
+    }
+    if (nextKind !== current.kind && payload === undefined) {
+      throw new SuggestError(
+        `suggest.edit：改 kind（${current.kind} → ${nextKind}）必须同时给 payload —— `
+        + '记忆与技能的 payload 形状不同，只换类型会留下形状不匹配的脏数据',
+        'SUGGEST_KIND_REQUIRES_PAYLOAD',
+        { id: suggestionId, from: current.kind, to: nextKind },
+      )
+    }
+
+    if (payload === undefined && (title !== undefined || content !== undefined)) {
+      payload = { ...(current.payload ?? {}) }
+      if (title !== undefined) payload.title = title
+      if (content !== undefined) payload.content = content
+    }
+
+    if (payload !== undefined) {
+      const targetLayerForPayload = payload.layer ?? current.payload?.layer ?? null
+      next.payload = normalizePayload(nextKind, payload, 'edit', targetLayerForPayload)
+    }
+    next.kind = nextKind
+
+    if (input.layer !== undefined && input.layer !== null && input.layer !== '') {
+      if (!MEMORY_LAYERS.includes(input.layer)) {
+        throw new SuggestError(
+          `suggest.edit：layer 只能是 ${MEMORY_LAYERS.join(' | ')}（L0 人格仅人可写，不在此列），`
+          + `收到 ${JSON.stringify(input.layer)}`,
+          'SUGGEST_BAD_LAYER',
+          { id: suggestionId, layer: input.layer },
+        )
+      }
+      next.payload = { ...(next.payload ?? {}), layer: input.layer }
+    }
+
+    next.updatedAt = at
+    next.updatedBy = author
+    next.editedAt = at
+    next.editedBy = author
+    next.editCount = (Number(current.editCount) || 0) + 1
+
+    return commit('edit', at, author, before, next)
+  }
+
+  /**
    * 批量采纳：**部分失败不中断**（人点「全部采纳」时，一条撞错不该让其余全不处理），
    * 但失败必须逐条回报（`failed[]` 带 code + reason），绝不吞掉。
    *
@@ -1187,6 +1296,7 @@ export function createSuggest(ctx, config = {}) {
     getSuggestion,
     accept,
     reject,
+    edit,
     bulkAccept,
     stats,
     replay,
