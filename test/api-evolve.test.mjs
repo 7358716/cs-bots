@@ -569,6 +569,8 @@ test('E15 anchor 文案：无 longrun 时与既有格式逐字一致；有 longr
   // 基线：无 longrun、无补充说明 —— 必须与改造04/05 的固定格式**逐字一致**
   const before = await h.req('GET', `/tasks/brief?id=${task.id}`)
   assert.equal(before.status, 200)
+  // 2026-11-12 t-40 需求③：锚文本在「补充说明」前固定新增「成果」段（每轮要有 md 产出物）。
+  // 仍然成立的是**只加不改**：原有 8 行逐字不变，只在末尾前多出这一段。
   const expectedBase = [
     '【任务目标 · 原文锚定，禁止改写】',
     `任务 ${task.id}：锚定文案基线`,
@@ -577,9 +579,13 @@ test('E15 anchor 文案：无 longrun 时与既有格式逐字一致；有 longr
     '前置：（无）',
     '进度：0%',
     '已交付：（暂无）',
+    '成果（t-40 需求③）：本轮要有可点开的 md 产出物，不要只写进对话里 ——',
+    "  · 每轮结束都把结论写成 md 文件，再用 bot_task_update(action='complete', artifacts=[...]) 登记；",
+    '  · 中途轮次同样要留文件（过程记录也算成果），别等收尾才一次性补；',
+    '  · 没写文件就当没交付 —— 对话里的内容别人打不开、也追溯不了。',
     '补充说明（按时间，全部有效，不得忽略）：',
   ].join('\n')
-  assert.equal(before.json.text, expectedBase, '无 longrun 时不得多出任何一行')
+  assert.equal(before.json.text, expectedBase, '无 longrun 时不得多出任何一行（成果段是固定内容）')
 
   // 转长任务后再读：阶段段插入在「补充说明」之前，其余行原样不动
   await h.req('POST', '/tasks/evolve', {
@@ -590,11 +596,16 @@ test('E15 anchor 文案：无 longrun 时与既有格式逐字一致；有 longr
   const lines = after.json.text.split('\n')
   assert.equal(lines[0], '【任务目标 · 原文锚定，禁止改写】')
   assert.equal(lines[6], '已交付：（暂无）')
-  assert.equal(lines[7], '阶段（长任务，按序推进，不得跳步）：')
-  assert.equal(lines[8], '1. 定标准')
-  assert.equal(lines[9], '2. 实现')
-  assert.equal(lines[10], '补充说明（按时间，全部有效，不得忽略）：')
-  assert.match(lines[11], /^- \[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] 【转长任务】这次要分阶段/)
+  // 2026-11-12 t-40 需求③：阶段段之前固定插入「成果」段（4 行）。用**相对定位**
+  // 而不是写死行号 —— 行号断言每次加一段就碎一次，是脆弱的写法。
+  const iPhase = lines.indexOf('阶段（长任务，按序推进，不得跳步）：')
+  assert.ok(iPhase > 0, '必须有阶段段')
+  assert.equal(lines[iPhase + 1], '1. 定标准')
+  assert.equal(lines[iPhase + 2], '2. 实现')
+  // 实测渲染顺序：阶段段 → 成果段（4 行）→ 补充说明。按契约「只加不改」用相对定位。
+  assert.ok(lines[iPhase + 3].startsWith('成果（t-40 需求③）'), '阶段段之后是成果段标题')
+  assert.equal(lines[iPhase + 7], '补充说明（按时间，全部有效，不得忽略）：')
+  assert.match(lines[iPhase + 8], /^- \[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] 【转长任务】这次要分阶段/)
 
   // 每次唤醒的文案也带阶段清单（/tasks/note 唤醒路径）
   h.claimTask(task, 'bot-a')
@@ -603,7 +614,11 @@ test('E15 anchor 文案：无 longrun 时与既有格式逐字一致；有 longr
   const noted = await h.req('POST', '/tasks/note', { id: task.id, text: '继续推进' })
   assert.equal(noted.status, 200)
   assert.equal(calls.length, 1)
-  assert.match(calls[0].text, /阶段（长任务，按序推进，不得跳步）：\n1\. 定标准\n2\. 实现\n补充说明/)
+  // t-40 需求③：阶段段与补充说明之间固定插入「成果」段，故用 [\s\S] 跨过它
+  assert.match(
+    calls[0].text,
+    /阶段（长任务，按序推进，不得跳步）：\n1\. 定标准\n2\. 实现\n[\s\S]*?成果（t-40 需求③）[\s\S]*?补充说明/,
+  )
 })
 
 // ══════════════════════════════════════════════════════════════════════════

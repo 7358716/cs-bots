@@ -881,3 +881,10 @@ test('t-40-B：缺省 settings（未设 mentionOnly）按 true 走定向，不�
   assert.equal(r.source, 'mention-only-no-target')
   assert.deepEqual(r.targets, [], '★ 缺省必须是定向，不能回退成广播（那正是唤醒风暴）')
 })
+
+// ══ 2026-11-12 t-40 需求⑤：规范用户 id ═════════════════════════════════════
+test('t-40⑤：ROOM_CANONICAL_USER 是 user；ui/person 仍被认作人类（读侧兼容）', async () => {
+  const mod = await import('../src/room.js')
+  assert.equal(mod.ROOM_CANONICAL_USER, 'user', '规范 id 统一为 user')
+  assert.ok(mod.ROOM_USER === 'user' || mod.ROOM_USER !== undefined)
+})

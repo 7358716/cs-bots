@@ -179,6 +179,13 @@ test('brief：返回 anchor/notes/text，锚定文案逐行符合契约 §2.1', 
   assert.ok(text.includes('\n前置：（无）\n'))
   assert.ok(text.includes('\n进度：0%\n'))
   assert.ok(text.includes('\n已交付：（暂无）\n'))
+  // 2026-11-12 t-40 需求③：锚文本新增「成果」段（每轮都要有 md 产出物），
+  // 所以不再以「补充说明」结尾；改为断言它在补充说明之前、且内容到位。
+  assert.ok(text.includes('\n成果（t-40 需求③）：'), '必须包含成果要求段')
+  assert.ok(
+    text.indexOf('成果（t-40 需求③）') < text.indexOf('补充说明（按时间，全部有效，不得忽略）：'),
+    '成果段必须在补充说明之前',
+  )
   assert.ok(text.endsWith('补充说明（按时间，全部有效，不得忽略）：'))
   // 没有补充说明时不应凭空生成 bullet
   assert.ok(!/\n- \[/.test(text), '空补充说明不应出现列表项')

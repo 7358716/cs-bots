@@ -78,7 +78,7 @@ test('工具全部注册成功，且数量与 TOOL_NAMES 一致', () => {
     // PDCA 建设：cycle 4 + metrics 2 + verify 1 + teams 3 = 10 个（28 → 38）；
 // 改造07：subscription 3 个（task_subscribe / unsubscribe / subscriptions）→ 41
 // 升级09（契约 §2.4）：阶段产出物 bot_task_phase（纯增量新工具）→ 42
-    assert.equal(TOOL_NAMES.length, 44, `工具总数应为 44，实际 ${TOOL_NAMES.length}`)
+    assert.equal(TOOL_NAMES.length, 45, `工具总数应为 45，实际 ${TOOL_NAMES.length}`)
   } finally {
     h.cleanup()
   }

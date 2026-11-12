@@ -865,6 +865,16 @@ function buildTaskAnchorText(task, notes = [], longrun = null) {
     lines.push(...describeMandate(mandate))
   }
 
+  // ── 产出物要求（2026-11-12 t-40 需求③）─────────────────────────────────
+  // Boss：「成果，任务的产出物在此，每轮会话的都应该有 md 产出物」。
+  // 只靠 `complete` 强制 artifacts 不够 —— 那是**收尾时**才校验，
+  // 执行者中途几轮可以什么都不留下，等到最后一次性补一份，过程全丢。
+  // 所以把这条要求写进**每次唤醒**都会看到的锚文本里，每轮结束都留一份 md。
+  lines.push('成果（t-40 需求③）：本轮要有可点开的 md 产出物，不要只写进对话里 ——')
+  lines.push(`  · 每轮结束都把结论写成 md 文件，再用 bot_task_update(action='complete', artifacts=[...]) 登记；`)
+  lines.push('  · 中途轮次同样要留文件（过程记录也算成果），别等收尾才一次性补；')
+  lines.push('  · 没写文件就当没交付 —— 对话里的内容别人打不开、也追溯不了。')
+
   lines.push('补充说明（按时间，全部有效，不得忽略）：')
   for (const note of notes) {
     lines.push(`- [${formatAnchorTime(note?.at)}] ${note?.text ?? ''}`)
@@ -2255,10 +2265,29 @@ export function installApi(ctx, { warn } = {}) {
   }
   mountPhaseWrite(getServices(ctx))
 
+  // ── t-40 需求②：把「给任务开议事厅」挂到 services（供 bot_task_room 工具调用）──
+  // 与 HTTP `POST /tasks/room` 共用同一个实现，避免「页面能开、Bot 开不了」的漂移。
+  const openTaskRoom = async (services, taskId, by) => {
+    const task = await withService(services, 'board', (b) => b.get(taskId))
+    if (!task) return { ok: false, reason: `任务 ${taskId} 不存在` }
+    const who = task.assignee ?? task.ownerId ?? by
+    const got = await ensureTeamForBot(services, who, by)
+    if (!got?.team) return { ok: false, reason: '这个任务没有可用团队（没有负责人？）——先指派负责人再开议事厅' }
+    const r = await ensureRoomForTeam(services, got.team, by)
+    if (!r?.room) return { ok: false, reason: r?.reason ?? '建房失败' }
+    return { ok: true, roomId: r.room.id, name: r.room.name, created: r.created === true, teamId: got.team.id }
+  }
+  const mountTaskRoom = (services) => {
+    if (!services || typeof services !== 'object') return
+    services.openTaskRoom = (taskId, by) => openTaskRoom(services, taskId, by)
+  }
+  mountTaskRoom(getServices(ctx))
+
   const handler = async (request, response) => {
     const services = getServices(ctx)
     // 幂等重挂：services 若在 installApi 之后才注册，这里补上（写同一个 key）
     mountPhaseWrite(services)
+    mountTaskRoom(services)
     // 鉴权先于一切业务逻辑（连 URL 解析都不做，避免攻击面）
     const verdict = fence.judgeHttp(request)
     if (!verdict.ok) {
@@ -2328,7 +2357,8 @@ export function installApi(ctx, { warn } = {}) {
         const source = qp(url, 'source')
         const sort = qp(url, 'sort')
         const byId = qp(url, 'byId')
-        const opts = { status: status ?? undefined, attention: attention || undefined, priority: priority ?? undefined, source: source ?? undefined, sort: sort ?? undefined, byId }
+        const channel = qp(url, 'channel')
+        const opts = { status: status ?? undefined, attention: attention || undefined, priority: priority ?? undefined, source: source ?? undefined, channel: channel ?? undefined, sort: sort ?? undefined, byId }
         const tasks = await withService(services, 'board', (b) =>
           onlyReady ? b.ready() : b.list(opts),
         )
@@ -2633,6 +2663,28 @@ export function installApi(ctx, { warn } = {}) {
           }
         })
         sendJson(response, 200, { ok: true, bot: result })
+        return
+      }
+
+      // ── 任务开议事厅（t-40 需求②）────────────────────────────────────────
+      // Boss：「只有长任务默认建房间，其他短任务默认不建房间，防止房间爆炸，
+      //        在任务页有『开议事厅』按钮，用户需要的时候再建」
+      // 长任务在 /tasks 创建时已自动建；短任务走这个端点按需建，幂等（已有就复用）。
+      if (request.method === 'POST' && path === '/tasks/room') {
+        const body = (await readBody(request)) ?? {}
+        const by = body.byId ?? 'ui'
+        const taskId = String(body.id ?? '').trim()
+        if (!taskId) { sendJson(response, 400, { ok: false, reason: 'id 必填' }); return }
+        // 与 bot_task_room 工具共用 openTaskRoom 一份实现（不写两套）
+        const r = await openTaskRoom(services, taskId, by)
+        if (!r.ok) {
+          sendJson(response, r.reason?.includes('不存在') ? 404 : 409, { ok: false, reason: r.reason })
+          return
+        }
+        sendJson(response, 200, {
+          ...r,
+          note: r.created === true ? '议事厅已建好' : '该任务已有议事厅，直接复用',
+        })
         return
       }
 

@@ -94,6 +94,18 @@ const DEFS = [
         priority: { type: 'number', description: '优先级（数值越大越先）' },
         dueAt: { type: 'number', description: '截止时间（epoch ms）' },
         sourceSeq: { type: 'string', description: '幂等键：同键重复创建只产生一条' },
+        source: {
+          type: 'string',
+          enum: ['human', 'ai'],
+          description: '谁下的令：human=人（Boss）/ ai=智能体。不传则按调用者身份自动推断。',
+        },
+        channel: {
+          type: 'string',
+          enum: ['user', 'session', 'external'],
+          description:
+            '从哪个入口下的令（t-40 需求①）：user=用户在页面手工建 / session=会话里产出 / '
+            + 'external=外部渠道接入（预留）。不传则按 source 推断（人→user，智能体→session）。',
+        },
         expectedComplexity: {
           type: 'string',
           enum: ['T0', 'T1', 'T2', 'T3'],
@@ -144,7 +156,9 @@ const DEFS = [
   },
   {
     name: 'bot_task_list',
-    description: '列出 cs-bots 任务板上的任务。默认不含已删除（tombstone）；传 status 可只看某状态。',
+    description:
+      '列出 cs-bots 任务板上的任务。默认不含已删除（tombstone）；传 status 可只看某状态；'
+      + '传 source / channel 可按「谁下的令 / 从哪个入口下的令」筛选（t-40 需求①）。',
     parameters: {
       type: 'object',
       properties: {
@@ -153,12 +167,46 @@ const DEFS = [
           enum: ['pending', 'in_progress', 'completed', 'blocked', 'deleted'],
           description: '只看该状态',
         },
+        source: { type: 'string', enum: ['human', 'ai'], description: '只看该来源（人 / 智能体）' },
+        channel: {
+          type: 'string',
+          enum: ['user', 'session', 'external'],
+          description: '只看该渠道（用户手工 / 会话产出 / 外部接入）',
+        },
       },
       additionalProperties: false,
     },
     run: (s, a) => {
       if (!s.board) return failure('board-unavailable')
-      return success({ tasks: s.board.list(a?.status ? { status: a.status } : {}) })
+      // 只把**给了的**过滤条件传下去：给 undefined 会命中 `!== null` 分支造成误筛
+      const opts = {}
+      if (a?.status) opts.status = a.status
+      if (a?.source) opts.source = a.source
+      if (a?.channel) opts.channel = a.channel
+      return success({ tasks: s.board.list(opts) })
+    },
+  },
+  {
+    name: 'bot_task_room',
+    description:
+      '给任务开一个议事厅（群聊房间）。**长任务在建任务时就自动有了**，本工具用于：' +
+      '① 短任务按需开（Boss：「短任务默认不建房间，防止房间爆炸，需要时再建」）；' +
+      '② 长任务的议事厅丢了/想补一个。幂等：已有就复用，不会重复建。' +
+      '需要任务有负责人（没负责人就没有团队可挂）。',
+    parameters: {
+      type: 'object',
+      properties: { id: { type: 'string', description: '任务 id' } },
+      required: ['id'],
+      additionalProperties: false,
+    },
+    run: async (s, a, exec) => {
+      if (typeof s.openTaskRoom !== 'function') return failure('task-room-unavailable', { hint: '后端未注入 openTaskRoom' })
+      try {
+        const r = await s.openTaskRoom(String(a.id ?? ''), callerOf(exec))
+        return r.ok ? success(r) : failure('task-room-failed', { message: r.reason })
+      } catch (error) {
+        return failure(error?.code ?? 'task-room-failed', { message: String(error?.message ?? error) })
+      }
     },
   },
   {

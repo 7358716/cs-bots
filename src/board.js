@@ -362,6 +362,66 @@ function normalizeRequiresPaid(value, where) {
 }
 
 /** labels 归一：必须是字符串数组（可选；undefined ⇒ 不写字段）。 */
+/**
+ * 任务来源渠道（2026-11-12 t-40 需求①，「后续可以接其他任务来源」）。
+ *
+ * 为什么与 `source` 分成两个字段：
+ *   - `source` 回答「**谁**下的令」：`human`（人） / `ai`（智能体）——二分的归属问题；
+ *   - `channel` 回答「**从哪个入口**下的令」：UI 手工建 / 会话里产出 / 外部渠道接入……
+ * 两者正交：将来接「外部工单系统」时，它既是 `source:'external'` 也可能是人发起。
+ * 合成一个字段的话，每加一个渠道都要改 `source` 的判定，早晚把二分搞脏。
+ *
+ * 未知 channel 一律拒绝（`BOARD_BAD_CHANNEL`）而不是静默落一个拼错的值 ——
+ * 拼错的值会永久留在事件流里，之后所有按渠道统计都是错的。
+ */
+const TASK_CHANNELS = Object.freeze(['user', 'session', 'external'])
+
+/** 归一 `source`：显式给了就只接受 human/ai；没给就按 byId 推断（人是 ui/user/person）。 */
+function normalizeSource(value, byId, where) {
+  if (value === undefined || value === null || value === '') {
+    return isHumanId(byId) ? 'human' : 'ai'
+  }
+  if (value !== 'human' && value !== 'ai') {
+    const error = new Error(
+      `board.${where}：source 只能是 'human' 或 'ai'，收到 ${JSON.stringify(value)}`,
+    )
+    error.status = 400
+    error.code = 'BOARD_BAD_SOURCE'
+    throw error
+  }
+  return value
+}
+
+/**
+ * 归一 `channel`：没给就按来源推断 —— 人 → `user`，智能体 → `session`。
+ * `external` 留给「后续增加的其他渠道」显式声明（目前没有生产方，但字段与校验已就位）。
+ */
+function normalizeChannel(value, source, byId, where) {
+  if (value === undefined || value === null || value === '') {
+    return isHumanId(byId) || source === 'human' ? 'user' : 'session'
+  }
+  if (!TASK_CHANNELS.includes(value)) {
+    const error = new Error(
+      `board.${where}：channel 只能是 ${TASK_CHANNELS.join(' | ')}，收到 ${JSON.stringify(value)}`,
+    )
+    error.status = 400
+    error.code = 'BOARD_BAD_CHANNEL'
+    throw error
+  }
+  return value
+}
+
+/**
+ * 人类身份（与 room/teams 的 HUMAN_IDS 同口径）。
+ * 需求⑤：`ui`/`person` 都是历史写法，规范 id 统一为 `user`；这里仍全认（读侧兼容）。
+ */
+function isHumanId(id) {
+  return id === 'ui' || id === 'user' || id === 'person'
+}
+
+/** 规范用户 id（写侧一律用它）。 */
+const CANONICAL_USER = 'user'
+
 function normalizeLabels(value, where) {
   if (value === undefined || value === null) return undefined
   if (!Array.isArray(value)) {
@@ -877,6 +937,9 @@ export function createBoard(ctx, config = {}) {
       tasks.set(ev.taskId, t)
       events.push(clone(ev))
       idCounter = Math.max(idCounter, idNumber(ev.taskId))
+      // 老数据没有 channel（本字段 2026-11-12 才有）：回放时按 source 补默认值，
+      // 保证「读侧永远非空」，而不是让 UI 到处判空。
+      if (t && t.channel === undefined) t.channel = t.source === 'human' ? 'user' : 'session'
       if (t.sourceSeq) {
         sourceSeqIndex.set(t.sourceSeq, ev.taskId)
         idem.check(t.sourceSeq)
@@ -1002,7 +1065,7 @@ export function createBoard(ctx, config = {}) {
   }
 
   function list(options = {}) {
-    const { status, attention, priority, dueAt, source, sort, triaged } = options ?? {}
+    const { status, attention, priority, dueAt, source, channel, sort, triaged } = options ?? {}
     if (status !== undefined && status !== null) {
       if (!STATUSES.includes(status)) {
         throw new BoardError(
@@ -1031,6 +1094,10 @@ export function createBoard(ctx, config = {}) {
       }
       if (source !== undefined && source !== null) {
         if (t.source !== source) continue
+      }
+      // 需求①：按渠道过滤（user / session / external）——「后续接其他渠道」时无需改这里
+      if (channel !== undefined && channel !== null) {
+        if (t.channel !== channel) continue
       }
       if (triaged !== undefined && triaged !== null) {
         const want = triaged === true || triaged === '1' || triaged === 'true'
@@ -1086,15 +1153,17 @@ export function createBoard(ctx, config = {}) {
   function create(input = {}) {
     const {
       subject, description, blockedBy, writeScopes, priority, dueAt, byId, sourceSeq, now,
-      expectedComplexity, requiresPaid, source,
+      expectedComplexity, requiresPaid, source, channel,
       labels, milestone, cycle, estimate, assignee, reviewer, progress, triaged,
       mandate,
     } = input ?? {}
     const by = requireString(byId, 'byId', 'create')
-    // 来源判定：显式传了 source 就采信；否则按 byId 推断
-    // （'ui'/'user' → 人；其他（会话 ID/Bot ID）→ 智能体）
-    const src = source === 'human' || source === 'ai' ? source
-      : (by === 'ui' || by === 'user' ? 'human' : 'ai')
+    // 来源判定（2026-11-12 t-40 需求①）：
+    //   显式传了 source 就按白名单采信；否则**按 byId 推断**（'ui'/'user'/'person' → 人）。
+    //   新增 `channel` 字段承载「具体渠道」，source 仍是二分的「人/智能体」——
+    //   因为「谁下的令」与「从哪个入口下的令」是两个正交问题，混成一个字段必然打补丁。
+    const src = normalizeSource(source, by, 'create')
+    const chan = normalizeChannel(channel, src, by, 'create')
     const subj = requireString(subject, 'subject', 'create')
     const desc = normalizeDescription(description, 'create')
     const deps = stringList(blockedBy, 'blockedBy', 'create')
@@ -1116,6 +1185,7 @@ export function createBoard(ctx, config = {}) {
     const reviewerNorm = normalizeOptionalString(reviewer, 'reviewer', 'create')
     const progressNorm = normalizeProgress(progress, 'create')
     const triagedNorm = normalizeTriaged(triaged, 'create')
+    // 渠道归一（需求①：为「其他渠道」预留位置）
     // Mandate 授权留痕（可选；不给就是「未记录依据」，不伪造一个）
     const mandateNorm = normalizeMandate(mandate, 'create')
 
@@ -1152,7 +1222,7 @@ export function createBoard(ctx, config = {}) {
     /** @type {Record<string, unknown>} */
     const task = {
       id: taskId,
-      rev: 1, source: src,
+      rev: 1, source: src, channel: chan,
       subject: subj,
       description: desc,
       status: 'pending',

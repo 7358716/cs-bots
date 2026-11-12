@@ -162,9 +162,29 @@ const USER = 'user'
  * 缺省广播把 Boss 自己也算成唤醒目标，每次必失败一条。
  */
 const HUMAN_IDS = Object.freeze(['ui', 'user', 'person'])
-/** 是否为人类身份（房间转发一律跳过）。 */
+
+/**
+ * **规范用户 id**（2026-11-12 t-40 需求⑤）。
+ *
+ * Boss：「以后要统一一下名称……人=用户=boss=user=我」。
+ * 历史数据里同一个人有三种写法（`ui` 来自页面层、`user` 来自 API 层、`person` 来自早期约定），
+ * 于是「这是谁」在每一处都要判三遍，迟早漏一处。
+ *
+ * 采用**读兼容 + 写统一**，而不是一刀切改写历史：
+ *   - 读：`ui`/`person` 一律视为 `user`（`HUMAN_IDS` 仍然认它们，老数据不会失效）；
+ *   - 写：新写入一律用 `user`。
+ * 这样不破坏历史事件流（append-only，改历史等于伪造），又能让新数据只有一个写法。
+ */
+const CANONICAL_USER = 'user'
+
+/** 是否为人类身份（`ui`/`user`/`person` 都认 —— 读侧兼容）。 */
 function isHumanId(id) {
   return typeof id === 'string' && HUMAN_IDS.includes(id)
+}
+
+/** 把任意人类写法归一成规范 id `user`；非人类身份原样返回。 */
+function normalizeHumanId(id) {
+  return isHumanId(id) ? CANONICAL_USER : id
 }
 /** 房间事件类型集合（审计流可枚举）。 */
 const EVENTS = [
@@ -2391,5 +2411,6 @@ export const ROOM_DEFAULT_SETTINGS = Object.freeze({ ...DEFAULT_SETTINGS })
 
 /** 用户（人类）发送者 id（`from` 允许的特殊值）。 */
 export const ROOM_USER = USER
+export const ROOM_CANONICAL_USER = CANONICAL_USER
 
 export default createRoom

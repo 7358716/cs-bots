@@ -1027,3 +1027,58 @@ test('2026-11-09 回归（兜底）：分配 id 时跳过任何已存在的任�
   const next = await board2.create({ subject: 'next', byId: 'ui' })
   assert.equal(next.id, 't-10', `应顺延为 t-10，实际 ${next.id}`)
 })
+
+// ══ 2026-11-12 t-40 需求①：任务来源与渠道 ══════════════════════════════════
+//
+// Boss：「任务的增删改查，区分用户创建的任务、每次会话产出的任务、其他渠道给任务（后续增加）」
+// 两个正交字段：source（谁下的令，human/ai）+ channel（从哪个入口，user/session/external）
+
+test('t-40①：source 按 byId 推断，channel 随之推断（人→user，智能体→session）', (t) => {
+  const { board } = setup(t)
+  const byHuman = board.create({ subject: '人来建的', byId: 'ui' })
+  assert.equal(byHuman.source, 'human')
+  assert.equal(byHuman.channel, 'user', '人手工建 ⇒ user')
+
+  const byBot = board.create({ subject: '会话产的', byId: 'bot-abc' })
+  assert.equal(byBot.source, 'ai')
+  assert.equal(byBot.channel, 'session', '智能体产出 ⇒ session')
+})
+
+test('t-40①：source/channel 显式值优先，且非法值拒绝（不静默落拼错的值）', (t) => {
+  const { board } = setup(t)
+  const ext = board.create({ subject: '外部接入', byId: 'bot-x', source: 'ai', channel: 'external' })
+  assert.equal(ext.source, 'ai')
+  assert.equal(ext.channel, 'external', '为「后续接其他渠道」预留的档位可用')
+
+  assert.throws(
+    () => board.create({ subject: '拼错', byId: 'ui', channel: 'usr' }),
+    (e) => e.code === 'BOARD_BAD_CHANNEL',
+  )
+  assert.throws(
+    () => board.create({ subject: '拼错', byId: 'ui', source: 'robot' }),
+    (e) => e.code === 'BOARD_BAD_SOURCE',
+  )
+})
+
+test('t-40①：list 可按 channel / source 筛选', (t) => {
+  const { board } = setup(t)
+  board.create({ subject: 'u1', byId: 'ui' })
+  board.create({ subject: 's1', byId: 'bot-a' })
+  board.create({ subject: 'e1', byId: 'bot-a', channel: 'external' })
+
+  assert.equal(board.list({ channel: 'user' }).length, 1)
+  assert.equal(board.list({ channel: 'session' }).length, 1)
+  assert.equal(board.list({ channel: 'external' }).length, 1)
+  assert.equal(board.list({ source: 'human' }).length, 1)
+  assert.equal(board.list({ source: 'ai' }).length, 2)
+})
+
+// ══ 2026-11-12 t-40 需求⑤：人类身份归一（ui/user/person → user）════════════
+test('t-40⑤：ui / user / person 都算人，source 一律 human', (t) => {
+  const { board } = setup(t)
+  for (const who of ['ui', 'user', 'person']) {
+    const task = board.create({ subject: `由 ${who} 建`, byId: who })
+    assert.equal(task.source, 'human', `${who} 必须被判为人`)
+    assert.equal(task.channel, 'user', `${who} 建的任务渠道是 user`)
+  }
+})
