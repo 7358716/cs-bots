@@ -2636,6 +2636,20 @@ export function installApi(ctx, { warn } = {}) {
         return
       }
 
+      // 清理已退役 Bot（t-40）：retire 只是标记，这里把记录真正移出注册表。
+      // 只允许清 retired；不碰 cwd、不杀会话。
+      if (request.method === 'POST' && path === '/roster/purge') {
+        const body = (await readBody(request)) ?? {}
+        const result = await withService(services, 'roster', (r) => r.purge({
+          ids: body.ids,
+          allRetired: body.allRetired,
+          reason: body.reason,
+          byId: body.byId ?? 'ui',
+        }))
+        sendJson(response, 200, { ok: true, ...result })
+        return
+      }
+
       // ── 房间 ──────────────────────────────────────────────────────────────
       if (request.method === 'GET' && path === '/rooms') {
         // includeArchived=1 时连归档房一起返回（超级管理员的"回收站"视图）

@@ -100,6 +100,7 @@ const ACTIONS = [
   'create',
   'rename',
   'retire',
+  'purge',
   'set_cwd',
   'claim',
   'release',
@@ -517,6 +518,8 @@ export function createRoster(ctx, config = {}) {
         skipped += 1
         continue
       }
+      // purge 是终态：重放时把它从内存表移除，而不是复活成一条记录
+      if (ev.after.state === 'purged') { bots.delete(ev.botId); events.push(clone(ev)); continue }
       bots.set(ev.botId, clone(ev.after))
       events.push(clone(ev))
     }
@@ -961,6 +964,74 @@ export function createRoster(ctx, config = {}) {
     const committed = commit(botId, 'retire', by, at, before, next)
     info(`[cs-bots/roster] Bot ${botId}（「${current.name}」）已退役 —— 名字与槽位释放，可复用`)
     return committed
+  }
+
+  /**
+   * 清理（purge）已退役的 Bot —— **把记录从注册表里真正移走**（2026-11-12 t-40，Boss 要求）。
+   *
+   * 为什么 retire 不够：`retire` 只是把 `state` 置为 `retired`，**记录永远留在注册表里**
+   * （`listRetired()` 能查到、`roster.jsonl` 里一堆测试残留），时间一长注册表就被
+   * 一堆没用的测试 Bot 撑满，管理页看不清到底有哪些在役 Bot。
+   *
+   * 语义边界（必须守住的四条）：
+   *   1. **只能清已退役的** —— 在役 Bot 一律拒绝（`ROSTER_PURGE_ACTIVE`）。
+   *      退役是"我不用它了"，清理是"把这条记录抹掉"；两步分开，避免手滑删在役 Bot。
+   *   2. **只动注册表，绝不动 cwd 目录、绝不动会话** —— Bot 的工作目录里可能有真实产物
+   *      （实测 `/home/ubuntu/output/开发测试001` 里存着 t36 调研报告），
+   *      删目录是不可逆且越权的，本函数**不碰文件系统**。
+   *   3. **事件流仍留档**：往 `roster.jsonl` 追加一条 `purge` 事件（`after` = 清理后的状态），
+   *      重放时据此把该 Bot 从内存表里移除 —— 这样「谁在什么时候清了谁」可审计，
+   *      而不是把历史抹得干干净净。
+   *   4. **幂等**：已清理的再清一次直接跳过（计入 `skipped`），不抛错。
+   *
+   * @param {{ ids?: string[], allRetired?: boolean, reason?: string, byId: string, now?: number }} input
+   *        `ids` 指定要清的 Bot；`allRetired: true` 清全部已退役的（与 `ids` 二选一）
+   * @returns {{ purged: string[], skipped: string[], refused: Array<{id: string, reason: string}> }}
+   */
+  function purge(input = {}) {
+    const { ids, allRetired, reason, byId, now } = input ?? {}
+    const by = requireString(byId, 'byId', 'purge')
+    const note = optionalString(reason, 'reason', 'purge')
+    const at = normalizeNow(now, 'purge')
+
+    let targets = []
+    if (allRetired === true) {
+      for (const b of bots.values()) if (b.state === 'retired') targets.push(b.id)
+    } else if (Array.isArray(ids)) {
+      targets = ids.map((x, i) => requireString(x, `ids[${i}]`, 'purge'))
+    } else {
+      throw new RosterError(
+        'roster.purge：必须给 ids（数组）或 allRetired:true（二选一）—— 拒绝无目标清理',
+        'ROSTER_PURGE_NO_TARGET',
+        {},
+      )
+    }
+
+    const purged = []
+    const skipped = []
+    const refused = []
+    for (const botId of targets) {
+      const current = bots.get(botId)
+      if (!current) { skipped.push(botId); continue }
+      if (current.state !== 'retired') {
+        // 在役 Bot 绝不清理：这是本条 API 最重要的护栏
+        refused.push({ id: botId, reason: `在役（state=${current.state}）—— 先 retire 再 purge` })
+        continue
+      }
+      const before = clone(current)
+      const next = clone(current)
+      next.rev = current.rev + 1
+      next.state = 'purged'
+      next.purgedAt = at
+      next.purgedBy = by
+      if (note !== undefined) next.purgeReason = note
+      // 写事件而不是把它从 jsonl 里抠掉：留档「谁清的、何时清的」
+      commit(botId, 'purge', by, at, before, next)
+      bots.delete(botId)
+      purged.push(botId)
+      info(`[cs-bots/roster] Bot ${botId}（「${current.name}」）已清理出注册表`)
+    }
+    return { purged, skipped, refused }
   }
 
   /**
@@ -1495,6 +1566,7 @@ export function createRoster(ctx, config = {}) {
     hasSession,
     rename,
     retire,
+    purge,
     setPreset,
     setCwd,
     setPrepareCommand,

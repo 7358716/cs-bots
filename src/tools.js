@@ -429,6 +429,31 @@ const DEFS = [
     },
   },
   {
+    name: 'bot_roster_purge',
+    description:
+      '把**已退役**的 Bot 从注册表里真正清掉（retire 只是标记，记录会一直留着）。' +
+      '**只能清已退役的**：在役 Bot 一律拒绝。**不删工作目录、不杀会话** —— ' +
+      '只移除注册表记录，cwd 里的产物原样保留。清理动作在审计流里留档，可追溯。' +
+      'allRetired:true 一次清干净；或用 ids 指定。（**官方 roster 没有这个能力**）',
+    parameters: {
+      type: 'object',
+      properties: {
+        allRetired: { type: 'boolean', description: '清全部已退役的 Bot（与 ids 二选一）' },
+        ids: { type: 'array', items: { type: 'string' }, description: '指定要清的 Bot id 列表' },
+        reason: { type: 'string', description: '清理原因（写进审计流）' },
+      },
+      additionalProperties: false,
+    },
+    run: (s, a, exec) => {
+      if (!s.roster) return failure('roster-unavailable')
+      try {
+        return success(s.roster.purge({ ids: a.ids, allRetired: a.allRetired, reason: a.reason, byId: callerOf(exec) }))
+      } catch (error) {
+        return failure(error?.code ?? 'ROSTER_PURGE_FAILED', { message: String(error?.message ?? error) })
+      }
+    },
+  },
+  {
     name: 'bot_roster_manage',
     description:
       '管理已注册的 Bot（**官方 roster 做不到的能力**）：rename=改名（旧名随即释放）/ ' +

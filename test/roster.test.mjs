@@ -786,3 +786,49 @@ test('adoptSession：退役 Bot 占过的同名会话不阻止接管（终态释
   })
   assert.equal(second.sessionId, existing, '退役是终态，名额应释放，可被重新接管')
 })
+
+// ══ 2026-11-12 t-40：purge（清理已退役 Bot）══════════════════════════════
+//
+// retire 只是把 state 置为 retired，记录永远留着；Boss 要求「把已经退役的 bot 清理一下」。
+// 护栏：只能清 retired；不碰 cwd；审计流留档；幂等。
+
+test('t-40 purge：只清已退役，在役一律拒绝', async (t) => {
+  const { roster } = setup(t)
+  const alive = await roster.create({ name: 'alive-bot', cwd: '/tmp/alive', byId: 'ui' })
+  const dead = await roster.create({ name: 'dead-bot', cwd: '/tmp/dead', byId: 'ui' })
+  roster.retire({ id: dead.id, byId: 'ui' })
+
+  const r = roster.purge({ ids: [alive.id, dead.id], byId: 'ui' })
+  assert.deepEqual(r.purged, [dead.id], '只清退役的那个')
+  assert.equal(r.refused.length, 1, '在役的被拒绝')
+  assert.equal(r.refused[0].id, alive.id)
+  assert.match(r.refused[0].reason, /在役/)
+
+  assert.equal(roster.get(dead.id), undefined, '清理后查不到')
+  assert.ok(roster.get(alive.id), '在役的还在')
+})
+
+test('t-40 purge：allRetired 一次清干净，且幂等', async (t) => {
+  const { roster } = setup(t)
+  const a = await roster.create({ name: 'r1', cwd: '/tmp/r1', byId: 'ui' })
+  const b = await roster.create({ name: 'r2', cwd: '/tmp/r2', byId: 'ui' })
+  const keep = await roster.create({ name: 'keep', cwd: '/tmp/keep', byId: 'ui' })
+  roster.retire({ id: a.id, byId: 'ui' })
+  roster.retire({ id: b.id, byId: 'ui' })
+
+  const r1 = roster.purge({ allRetired: true, reason: '测试残留', byId: 'ui' })
+  assert.equal(r1.purged.length, 2)
+  assert.equal(roster.listRetired().length, 0, '没有任何退役记录了')
+  assert.ok(roster.get(keep.id), '在役的没被动')
+
+  const r2 = roster.purge({ allRetired: true, byId: 'ui' })
+  assert.equal(r2.purged.length, 0, '幂等：没有可清的')
+})
+
+test('t-40 purge：无目标一律拒绝（拒绝"清空一切"的误用）', (t) => {
+  const { roster } = setup(t)
+  assert.throws(
+    () => roster.purge({ byId: 'ui' }),
+    (e) => e.code === 'ROSTER_PURGE_NO_TARGET',
+  )
+})
