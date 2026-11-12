@@ -1330,3 +1330,39 @@ test('S11 来源跳转新增代码没有引入相对 require', () => {
   // 客户端不得使用 window.prompt/confirm/alert（CI 机械禁止）
   assert.equal([...SOURCE.matchAll(/window\.(prompt|confirm|alert)\(/g)].length, 0, '客户端不得用 prompt/confirm/alert')
 })
+
+// ── 2026-11-12 t-40：对话改为独立全屏页（抽屉不再越拉越长）──────────────
+test('t-40 对话全屏：fullscreen 模式展示全部消息（含 note 来源的用户发言）', async () => {
+  const h = loadClientStateful()
+  h.setResponder((url) => {
+    if (url.includes('/tasks/conversation')) {
+      return {
+        ok: true,
+        bot: { id: 'b-1', name: '开发主管', label: null },
+        sessionId: 'sess-1',
+        available: true,
+        total: 3,
+        messages: [
+          { role: 'assistant', kind: 'tool-call', toolName: 'bash', text: 'ls', at: 1762000000000 },
+          { role: 'user', kind: 'text', text: '任务栏要看到我说的话', at: 1762000100000, source: 'note' },
+          { role: 'assistant', kind: 'text', text: '已经改成独立页了', at: 1762000200000 },
+        ],
+      }
+    }
+    return EMPTY_RESPONSE()
+  })
+  try {
+    h.render({
+      Comp: h.exports.TaskConversationPanel,
+      props: { taskId: 't-9', task: { id: 't-9', rev: 1 }, bots: [], fullscreen: true },
+    })
+    await h.flush()
+    const text = allText(h.records.renders.at(-1))
+    assert.match(text, /任务栏要看到我说的话/, '★ 用户发言必须显示')
+    assert.match(text, /任务里/, 'note 来源要标注「任务里」，与执行者回复区分')
+    assert.match(text, /已经改成独立页了/, '执行者回复也要显示')
+    assert.match(text, /ls/, 'fullscreen 默认展示全部消息（含工具调用）')
+  } finally {
+    h.restore()
+  }
+})

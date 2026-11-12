@@ -2534,7 +2534,10 @@ window.__ModuleLoader__.load({
       // 复用房间消息那套样式（只读渲染，不新造 class）
       const isMe = (m) => m.role === 'user'
 
-      const visible = expanded ? messages : messages.filter((m) => m.kind === 'text' || m.role === 'user')
+      // fullscreen（独立页）默认展示全部文字消息；抽屉内联时才做折叠
+      const visible = (expanded || fullscreen)
+        ? messages
+        : messages.filter((m) => m.kind === 'text' || m.role === 'user')
 
       return h('div', null,
         h(Section, {
