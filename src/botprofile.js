@@ -23,7 +23,7 @@
  * **绝不改动用户在段外的任何内容**（人写的东西优先，我们不覆盖）。
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync, statSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, writeFileSync, statSync, rmSync } from 'node:fs'
 import { isAbsolute, join, resolve } from 'node:path'
 
 /** 托管段起止标记。 */
@@ -423,6 +423,64 @@ export function writeAgentsFile(cwd, profile) {
  * @param {string} cwd
  * @returns {{ path: string, exists: boolean, managed?: string, outside?: string }}
  */
+/**
+ * 把 `AGENTS.md` 从一个 cwd 搬到另一个（`roster.setCwd` 用）。
+ *
+ * ## 为什么需要它
+ *   实测（2026-11-13）：只改注册表 cwd 的话，`AGENTS.md` **留在旧目录**，
+ *   新目录里没有 —— Bot 下次读身份文件读不到，等于「失忆」；
+ *   同时旧目录里残留一份垃圾文件。这正是 t-46 缺陷#1 的同类问题的另一半。
+ *
+ * ## 策略：**新位置重写，旧位置清理**
+ *   不做文件搬移（`rename`），而是用当前 profile **在新位置重新渲染**一份：
+ *   - 托管段本来就该是「由 profile 生成」的，重新渲染比搬运更正确（能带上最新档案）
+ *   - 旧位置的托管段删掉（保留 `outside` 人工内容），文件空了就删文件
+ *
+ * ## 失败不抛
+ *   返回 `{ moved, reason? }`。搬不动不能阻断 setCwd 本体（注册表改动才是主目的），
+ *   但调用方必须 `warn` —— **绝不静默**。
+ *
+ * @param {string} fromCwd 旧目录
+ * @param {string} toCwd 新目录
+ * @param {object} profile 当前档案（用于在新位置渲染）
+ * @returns {{ moved: boolean, reason?: string }}
+ */
+export function migrateAgentsFile(fromCwd, toCwd, profile) {
+  if (typeof fromCwd !== 'string' || typeof toCwd !== 'string') {
+    return { moved: false, reason: 'cwd 不是字符串' }
+  }
+  if (fromCwd === toCwd) return { moved: false, reason: '新旧目录相同' }
+
+  // ① 新位置重写（目录不存在时 writeAgentsFile 会抛，这里转成 reason）
+  try {
+    writeAgentsFile(toCwd, profile ?? {})
+  } catch (error) {
+    return { moved: false, reason: `新目录写入失败：${error?.message ?? error}` }
+  }
+
+  // ② 旧位置清理：只删托管段，保留人工内容
+  try {
+    const oldFile = join(fromCwd, AGENTS_FILE)
+    if (existsSync(oldFile)) {
+      const text = readFileSync(oldFile, 'utf8')
+      const begin = text.indexOf(MARK_BEGIN)
+      const end = text.indexOf(MARK_END)
+      if (begin !== -1 && end !== -1 && end > begin) {
+        const outside = (text.slice(0, begin) + text.slice(end + MARK_END.length))
+          .replace(/\n{3,}/g, '\n\n')
+          .trim()
+        if (outside) writeFileSync(oldFile, `${outside}\n`, 'utf8')
+        else rmSync(oldFile, { force: true })
+      }
+      // 没有托管标记的文件不碰（可能是用户自己的 AGENTS.md）
+    }
+  } catch (error) {
+    // 旧文件清理失败不影响「新位置已经有身份文件」这个主结果
+    return { moved: true, reason: `新位置已写入，但旧文件清理失败：${error?.message ?? error}` }
+  }
+  return { moved: true }
+}
+
 export function readAgentsFile(cwd) {
   const dir = assertWritableCwd(cwd)
   const file = join(dir, AGENTS_FILE)

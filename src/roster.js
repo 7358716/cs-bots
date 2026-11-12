@@ -61,6 +61,7 @@ import * as kernel from './kernel.js'
 import {
   normalizeProfile,
   writeAgentsFile,
+  migrateAgentsFile,
   readAgentsFile,
   writeSkill,
   listSkills,
@@ -1342,7 +1343,29 @@ export function createRoster(ctx, config = {}) {
       `[cs-bots/roster] Bot ${current.id} 的注册表 cwd 由 ${current.cwd} 改为 ${dir}；`
       + `已建会话 ${current.sessionId} 的 cwd 是宿主 durable 数据，**不随之迁移**`,
     )
-    return commit(current.id, 'setCwd', by, at, before, next)
+
+    // ⚠️ AGENTS.md 必须跟着搬家（2026-11-13 实测缺陷修复）。
+    //
+    // 实测：只改注册表 cwd 的话，`AGENTS.md` **留在旧目录**，新目录里没有 ——
+    // Bot 下一次读身份文件读不到，等于「失忆」；同时旧目录里残留一份垃圾。
+    // 建 Bot 时若目录不存在，`writeAgentsFile` 会静默失败（`assertWritableCwd` 拦下），
+    // 所以这里也要**容错**：搬不动不能阻断 setCwd 本体（注册表改动是主目的），
+    // 但必须如实 warn，绝不静默。
+    let agentsMoved
+    try {
+      const moved = migrateAgentsFile(current.cwd, dir, {
+        ...(next.profile ?? {}), botName: next.name, preset: next.preset,
+      })
+      agentsMoved = moved
+      if (moved?.reason) {
+        warn(`[cs-bots/roster] setCwd：AGENTS.md 未迁移（${moved.reason}）—— 请检查新目录 ${dir} 是否存在且可写`)
+      }
+    } catch (error) {
+      warn(`[cs-bots/roster] setCwd：迁移 AGENTS.md 失败（${error?.message ?? error}）—— 新目录里将没有身份文件`)
+    }
+
+    const committed = commit(current.id, 'setCwd', by, at, before, next)
+    return agentsMoved?.moved ? { ...committed, agentsMoved: true } : committed
   }
 
   /**

@@ -15,6 +15,7 @@ import { join } from 'node:path'
 import {
   normalizeProfile,
   writeAgentsFile,
+  migrateAgentsFile,
   readAgentsFile,
   writeSkill,
   listSkills,
@@ -242,4 +243,48 @@ test('writeAgentsFile：档案无 identity ⇒ identityMissing=true（调用方�
   assert.equal(out.identityMissing, true, '空身份必须如实标记，否则覆盖别人也没人知道')
   const text = readFileSync(out.path, 'utf8')
   assert.match(text, /未填写身份描述/, '文件里仍是占位符（渲染行为不变）')
+})
+
+// ── 2026-11-13：setCwd 时 AGENTS.md 必须跟着搬家 ──────────────────────────
+// 实测缺陷：只改注册表 cwd 的话 AGENTS.md 留在旧目录 ⇒ Bot 失忆 + 旧目录残垃圾。
+
+test('migrateAgentsFile：新位置重写、旧位置清理（托管段删净）', (t) => {
+  const from = mkdtempSync(join(tmpdir(), 'bp-from-'))
+  const to = mkdtempSync(join(tmpdir(), 'bp-to-'))
+  t.after(() => {
+    try { rmSync(from, { recursive: true, force: true }) } catch { /* */ }
+    try { rmSync(to, { recursive: true, force: true }) } catch { /* */ }
+  })
+  writeAgentsFile(from, { identity: '我是老岗', botName: 'x' })
+  assert.equal(existsSync(join(from, 'AGENTS.md')), true)
+
+  const out = migrateAgentsFile(from, to, { identity: '我是新岗', botName: 'x' })
+  assert.equal(out.moved, true)
+  assert.equal(existsSync(join(to, 'AGENTS.md')), true, '新位置必须有身份文件')
+  assert.equal(existsSync(join(from, 'AGENTS.md')), false, '旧位置应被清理（只有托管段时整份删掉）')
+  assert.match(readFileSync(join(to, 'AGENTS.md'), 'utf8'), /我是新岗/, '内容应是新档案')
+})
+
+test('migrateAgentsFile：旧文件有托管段外的人工内容 ⇒ 保留人工部分', (t) => {
+  const from = mkdtempSync(join(tmpdir(), 'bp-f2-'))
+  const to = mkdtempSync(join(tmpdir(), 'bp-t2-'))
+  t.after(() => {
+    try { rmSync(from, { recursive: true, force: true }) } catch { /* */ }
+    try { rmSync(to, { recursive: true, force: true }) } catch { /* */ }
+  })
+  writeFileSync(join(from, 'AGENTS.md'), `# 我手写的说明\n\n${MARK_BEGIN}\n托管段\n${MARK_END}\n`, 'utf8')
+  const out = migrateAgentsFile(from, to, { identity: '新岗', botName: 'x' })
+  assert.equal(out.moved, true)
+  const left = readFileSync(join(from, 'AGENTS.md'), 'utf8')
+  assert.match(left, /我手写的说明/, '人工内容不能被删')
+  assert.doesNotMatch(left, /托管段/, '托管段应被清走')
+})
+
+test('migrateAgentsFile：新目录不存在 ⇒ 返回 reason，不抛（不能阻断 setCwd）', (t) => {
+  const from = mkdtempSync(join(tmpdir(), 'bp-f3-'))
+  t.after(() => { try { rmSync(from, { recursive: true, force: true }) } catch { /* */ } })
+  writeAgentsFile(from, { identity: 'x', botName: 'x' })
+  const out = migrateAgentsFile(from, join(from, 'no-such-subdir'), { identity: 'y', botName: 'x' })
+  assert.equal(out.moved, false)
+  assert.ok(out.reason, '必须有可读 reason —— 绝不静默')
 })
