@@ -1402,6 +1402,18 @@ export function createRoster(ctx, config = {}) {
       )
     }
 
+    // ⚠️ 目标目录必须存在且可写，否则 AGENTS.md 写不进去（实测：2026-11-14
+    //    归位时新目录尚未创建 ⇒ migrateAgentsFile 报「cwd 不存在或不可访问」，
+    //    Bot 迁移成功但身份文件没跟过去 = 失忆）。
+    //    `create({department})` 那条路径自己会 mkdir，而 setCwd 不会 ⇒ 在这里补。
+    if (!ensureDir(dir)) {
+      throw new RosterError(
+        `roster.setCwd：目标目录创建失败（${dir}）——请检查路径是否可写`,
+        'ROSTER_CWD_CREATE_FAILED',
+        { id: current.id, cwd: dir },
+      )
+    }
+
     const at = normalizeNow(now, 'setCwd')
     const before = clone(current)
     const next = clone(current)

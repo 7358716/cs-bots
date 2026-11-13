@@ -17,7 +17,7 @@ import { createRoom } from './room.js'
 import { createMemory } from './memory.js'
 import { installTools } from './tools.js'
 import { setServices } from './registry.js'
-import { service, stateDir as kernelStateDir, onLlmStream, sessionMeta, readSessionWatermark as kernelWatermark, capabilities } from './kernel.js'
+import { service, stateDir as kernelStateDir, attachToWorkspace, onLlmStream, sessionMeta, readSessionWatermark as kernelWatermark, capabilities } from './kernel.js'
 import { installLlmStreamHint } from './routing/hints.js'
 import { installApi } from './api.js'
 import { createDeliveryWatch, DEFAULT_GRACE_MS, DEFAULT_TICK_MS } from './delivery-watch.js'
@@ -144,6 +144,41 @@ function applyInner(ctx, config, { log, warn }) {
       metrics: () => services.metrics,
     })
     log(`[cs-bots] BoardService 就绪（stateDir=${services.board.paths?.stateDir ?? '?'}）`)
+
+    // ── 启动时把 Bot 会话重挂到「cwd 对应的工作区」（2026-11-14 修复）─────
+    //
+    // ## 为什么要有这一步
+    //   宿主把会话归组进 Workspace，而挂载的硬条件是
+    //   **「会话 header 的 cwd === workspace.path」**（`kernel.js` attachToWorkspace 注释）。
+    //   一旦 Bot 换了 cwd（归位到大楼、用户改目录），旧挂载就失效：
+    //   左侧栏里它仍待在**旧目录**分组下，新目录永远不出现 —— 表现为
+    //   「改了目录但左侧没变化」。实测 13 个 Bot 全部踩中。
+    //
+    // ## 为什么在启动时做
+    //   迁移是一次性动作，而重启是必然发生的。放在启动钩子里 ⇒ 用户改完目录、
+    //   重启一次就自动归位，不需要再去页面点「挂进工作区」。
+    //   幂等：已在正确 workspace 里的会话，`attachToWorkspace` 内部 resolveByPath 命中，
+    //   attach 是无副作用的重复绑定。
+    //
+    // ## 失败不阻塞
+    //   挂载是「锦上添花」（没挂上只是显示未分组）。全程 try/catch，
+    //   失败只 warn —— 绝不能让工作区问题拖垮插件启动。
+    if (services.roster && typeof attachToWorkspace === 'function') {
+      // 异步执行，不阻塞 apply 返回（宿主启动路径上不宜长跑）
+      void (async () => {
+        let ok = 0; let fail = 0
+        for (const bot of services.roster.list()) {
+          if (typeof bot.cwd !== 'string' || !bot.cwd.trim()) continue
+          try {
+            if (await attachToWorkspace(ctx, bot.cwd, bot.sessionId)) ok += 1
+            else fail += 1
+          } catch { fail += 1 }
+        }
+        if (ok > 0 || fail > 0) {
+          log(`[cs-bots] 会话工作区归位：成功 ${ok}，未挂上 ${fail}（未挂上通常是无 workspaceRegistry 或会话已归档）`)
+        }
+      })()
+    }
 
     // ── 宿主能力自检（t-40 · 插件安装场景）──────────────────────────────
     // 别人把 cs-bots 当插件装上去时，宿主不一定装配了全部能力。
