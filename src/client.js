@@ -4196,7 +4196,9 @@ window.__ModuleLoader__.load({
     function BotsTab() {
       const { data, loading, error, reload } = useApi('/roster?includeRetired=1')
       const { data: presetData } = useApi('/presets')
-      const [form, setForm] = useState({ name: '', cwd: '', preset: '' })
+      // 主目录 + 部门（2026-11-13 Boss 需求）：建 Bot 时选部门，目录自动派生。
+      const { data: setData, reload: reloadSettings } = useApi('/settings')
+      const [form, setForm] = useState({ name: '', cwd: '', preset: '', department: '' })
       const [picking, setPicking] = useState(false)
       const [busy, setBusy] = useState(false)
       const [err, setErr] = useState(null)
@@ -4220,17 +4222,33 @@ window.__ModuleLoader__.load({
       const defaultPreset = presetData?.defaultId ?? ''
       const bots = data?.bots ?? []
 
+      // 派生预览：与后端 botdirs.deriveBotCwd 同口径（前端只做展示，真值由后端算）
+      const dpts = setData?.values?.departments ?? []
+      const botRoot = setData?.values?.botWorkspaceRoot ?? ''
+      const dept = form.department || setData?.values?.defaultDepartment || (dpts[0]?.id ?? '')
+      const derivedCwd = (() => {
+        if (!botRoot || !dept || !form.name.trim()) return ''
+        const seg = form.name.trim().replace(/[/\\]/g, '').replace(/^[.\s]+|[.\s]+$/g, '')
+        return seg ? `${botRoot}/${dept}/${seg}` : ''
+      })()
+
       const create = async () => {
-        if (!form.name.trim() || !form.cwd.trim()) return setErr('名字和工作目录都要填')
+        if (!form.name.trim()) return setErr('名字要填')
+        // 有部门就用派生（推荐）；没部门才退回手填 cwd（兼容旧环境）
+        if (!dept && !form.cwd.trim()) return setErr('请先配置部门，或手填工作目录')
         setBusy(true)
         setErr(null)
         setWarn(null)
         try {
           const res = await call('/roster', {
             method: 'POST',
-            body: { name: form.name.trim(), cwd: form.cwd.trim(), ...(form.preset ? { preset: form.preset } : {}) },
+            body: {
+              name: form.name.trim(),
+              ...(dept ? { department: dept } : { cwd: form.cwd.trim() }),
+              ...(form.preset ? { preset: form.preset } : {}),
+            },
           })
-          setForm({ name: '', cwd: '', preset: '' })
+          setForm({ name: '', cwd: '', preset: '', department: '' })
           if (res.warnings?.length) setWarn(res.warnings.join('\n'))
           reload()
         } catch (e) {
@@ -4390,16 +4408,42 @@ window.__ModuleLoader__.load({
             value: form.name, onChange: (e) => setForm({ ...form, name: e.target.value }),
             ref: nameRef,
           })),
-        h('div', { className: 'csb-fld' },
-          h('label', null, '工作目录'),
-          h('div', { className: 'csb-bar', style: { marginBottom: 6 } },
-            h('input', {
-              className: 'csb-in csb-grow', placeholder: '点右边「选择目录」，或直接粘贴绝对路径',
-              value: form.cwd, onChange: (e) => setForm({ ...form, cwd: e.target.value }),
-            }),
-            h('button', { className: 'csb-btn', onClick: () => setPicking(true) }, '选择目录')),
-          h('div', { className: 'csb-fld-h' },
-            '这个目录就是它的「写入边界」：它只能改这里面的文件。建议每个 Bot 一个独立目录，避免互相覆盖。')),
+        // ── 部门（2026-11-13 Boss：「创建 bot 时指定部门，自动建目录」）──────
+        // 有部门字典就走「选部门 + 自动派生」，用户不用想路径、也不可能撞车。
+        // 没配置部门的环境（老安装）退回手填 cwd，不砸掉既有用法。
+        dpts.length > 0
+          ? h('div', { className: 'csb-fld' },
+            h('label', null, '部门'),
+            h('select', {
+              className: 'csb-sel', style: { maxWidth: 260 }, value: dept,
+              onChange: (e) => setForm({ ...form, department: e.target.value }),
+            }, dpts.map((d) => h('option', { key: d.id, value: d.id }, d.name))),
+            h('div', { className: 'csb-fld-h' },
+              '选部门后，工作目录自动放在该部门下，不用手填路径。部门在「设置」里增删。'))
+          : h('div', { className: 'csb-fld' },
+            h('label', null, '工作目录'),
+            h('div', { className: 'csb-bar', style: { marginBottom: 6 } },
+              h('input', {
+                className: 'csb-in csb-grow', placeholder: '点右边「选择目录」，或直接粘贴绝对路径',
+                value: form.cwd, onChange: (e) => setForm({ ...form, cwd: e.target.value }),
+              }),
+              h('button', { className: 'csb-btn', onClick: () => setPicking(true) }, '选择目录')),
+            h('div', { className: 'csb-fld-h' },
+              '尚未配置部门。这个目录就是它的「写入边界」，它只能改这里面的文件。')),
+        // 派生预览：只读展示，让用户确认「它会住哪」
+        dpts.length > 0
+          ? h('div', { className: 'csb-fld' },
+            h('label', null, '工作目录（自动）'),
+            h('div', {
+              className: 'csb-in csb-mono',
+              style: { background: 'var(--dsw-alias-bg-secondary, #f5f5f5)', cursor: 'default', userSelect: 'all' },
+              title: '由「主目录 / 部门 / 名字」自动拼出，不用填',
+            }, derivedCwd || '（填了名字后显示）'),
+            h('div', { className: 'csb-fld-h' },
+              botRoot
+                ? `主目录：${botRoot}（可在「设置」里改）`
+                : '还没设置主目录 —— 先去「设置 → Bot 主目录」指定一个'))
+          : null,
         h('div', { className: 'csb-fld' },
           h('label', null, '专家身份（预设）'),
           h('select', {
