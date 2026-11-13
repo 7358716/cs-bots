@@ -13,9 +13,35 @@
 
 import { readJson, writeJsonAtomic, ensureDir, statePath } from './store.js'
 import { resolve, sep, isAbsolute, join } from 'node:path'
+import { sanitizeDirSegment } from './botdirs.js'
 
 /** 设置项定义：默认值 + 校验。 */
 export const SETTING_SPECS = Object.freeze({
+  // ── 部门字典 + 默认部门（2026-11-13 Boss 需求）──────────────────────────
+  //
+  // ⚠️ 主目录**复用已有的 `botWorkspaceRoot`**（见文件末尾），不另设 `botsRoot`。
+  //    `botWorkspaceRoot` 的默认值正好是 `<$DSH_HOME 父目录>/cs-bots`，
+  //    即 Boss 说的「大楼」。重复造一个字段只会让两处配置漂移。
+  //
+  // 部门字典：`[{ id: 'dev', name: '开发部' }]`。
+  // `id` 用作目录名（英文、短、URL 安全），`name` 用作显示（中文）。
+  // 保序（用户可拖拽排序）⇒ 用数组不用对象。
+  departments: {
+    def: [
+      { id: 'dev', name: '开发部' },
+      { id: 'qa', name: '测试部' },
+      { id: 'ops', name: '综合部' },
+    ],
+    departments: true,
+    label: '部门',
+  },
+
+  // 新建 Bot 时预选的部门 id（必须是 departments 里存在的）
+  // 默认部门 id。**不写死白名单** —— 部门是用户可增删的字典，
+  // 写死 options 会导致「用户新增部门后设不成默认」。
+  // 「是否存在」由 `validateDepartmentsPatch` 交叉校验（见 validateSetting 末尾）。
+  defaultDepartment: { def: 'dev', departmentRef: true, label: '默认部门' },
+
   /** 任务默认占用时长（ms）：owner claim 后多久未心跳即视为失联。 */
   defaultLeaseMs: { def: 5 * 60_000, min: 10_000, max: 24 * 60 * 60_000, label: '任务占用默认时长（ms）' },
   /** 唤醒节流窗口（ms）：同一目标在窗内最多唤醒一次。 */
@@ -104,6 +130,43 @@ export function defaultSettings() {
 export function validateSetting(key, raw) {
   const spec = SETTING_SPECS[key]
   if (!spec) return { ok: false, reason: `未知设置项：${key}` }
+
+  // ── 部门字典类型：`[{ id, name }]`，id 必须唯一且是安全的目录名 ────────
+  if (spec.departments) {
+    if (!Array.isArray(raw)) return { ok: false, reason: `${key} 必须是数组` }
+    const out = []
+    const seen = new Set()
+    for (const item of raw) {
+      if (!item || typeof item !== 'object' || Array.isArray(item)) {
+        return { ok: false, reason: `${key} 的每一项必须是 { id, name }` }
+      }
+      const id = typeof item.id === 'string' ? item.id.trim() : ''
+      const name = typeof item.name === 'string' ? item.name.trim() : ''
+      if (!id || !name) return { ok: false, reason: `${key} 的每一项都必须有非空 id 与 name` }
+      // id 会**直接当目录名**用 ⇒ 必须过目录名安全检查（防 ../ 与路径分隔符）
+      const safe = sanitizeDirSegment(id)
+      if (safe !== id) {
+        return {
+          ok: false,
+          reason: `${key}.id=${JSON.stringify(id)} 不是安全的目录名（只允许字母数字中文与 - _，且不能是 . 或 ..）`
+            + `${safe ? `；建议改为 ${JSON.stringify(safe)}` : ''}`,
+        }
+      }
+      if (seen.has(id)) return { ok: false, reason: `${key} 里 id 重复：${id}` }
+      seen.add(id)
+      out.push({ id, name })
+    }
+    return { ok: true, value: out }
+  }
+
+  // 部门引用：非空字符串（存在性在跨字段校验里做，单独 validate 时无从得知字典）
+  if (spec.departmentRef) {
+    if (typeof raw !== 'string' || raw.trim() === '') {
+      return { ok: false, reason: `${key} 必须是非空部门 id 字符串` }
+    }
+    return { ok: true, value: raw.trim() }
+  }
+
   // options 类型：字符串值，必须在白名单里
   if (spec.options) {
     if (typeof raw !== 'string') return { ok: false, reason: `${key} 必须是字符串` }

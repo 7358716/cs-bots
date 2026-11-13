@@ -47,7 +47,9 @@
  */
 
 import { randomUUID } from 'node:crypto'
-import { isAbsolute, resolve, sep } from 'node:path'
+import { existsSync, mkdirSync, renameSync, writeFileSync } from 'node:fs'
+import { isAbsolute, join, resolve, sep } from 'node:path'
+import { deriveBotCwd, isManagedCwd } from './botdirs.js'
 
 import {
   appendJsonl,
@@ -698,10 +700,52 @@ export function createRoster(ctx, config = {}) {
    * @throws {RosterError} 缺字段 / 非法 cwd / 重名 / 会话创建失败 / 事件落盘失败
    */
   async function create(input = {}) {
-    const { name, cwd, label, model, instructions, preset, permission, profile, prepareCommand, byId, now, adoptSession } = input ?? {}
+    const { name, cwd, label, model, instructions, preset, permission, profile, prepareCommand, byId, now, adoptSession, department } = input ?? {}
     const by = requireString(byId, 'byId', 'create')
     const displayName = requireString(name, 'name', 'create')
-    const dir = assertBotCwd(cwd, 'create')
+
+    // ── 目录：两种给法（2026-11-13 Boss「选部门，自动建工作区」）────────────
+    //   ① 给 `department` ⇒ 从「主目录 + 部门 + Bot 名」派生（推荐）
+    //   ② 直接给 `cwd`     ⇒ 原样使用（高级/存量，向后兼容）
+    // 同时给且不一致 ⇒ 报错（静默择一会让人以为另一个生效了）。
+    let dir
+    if (department !== undefined && department !== null && department !== '') {
+      const derived = deriveBotCwd({
+        botsRoot: config?.botsRoot,
+        departments: config?.departments,
+        department,
+        botName: displayName,
+      })
+      if (!derived.ok) {
+        throw new RosterError(
+          `roster.create：无法为 Bot「${displayName}」派生工作目录 → ${derived.reason}`,
+          derived.code,
+          { name: displayName, department },
+        )
+      }
+      if (cwd !== undefined && cwd !== null && cwd !== '') {
+        const explicit = resolve(assertBotCwd(cwd, 'create'))
+        if (explicit !== derived.cwd) {
+          throw new RosterError(
+            `roster.create：department=${JSON.stringify(department)} 派生目录 ${derived.cwd} `
+            + `与显式 cwd=${explicit} 不一致 —— 两者只能给一个（或给一致的）`,
+            'ROSTER_CWD_CONFLICT',
+            { name: displayName, derived: derived.cwd, given: explicit },
+          )
+        }
+      }
+      dir = assertBotCwd(derived.cwd, 'create')
+      // ⚠️ 必须先建目录：实测 create 不做 mkdir，目录不存在时 writeAgentsFile 静默失败
+      if (!ensureDir(dir)) {
+        throw new RosterError(
+          `roster.create：Bot 工作目录创建失败（${dir}）——请检查主目录是否可写`,
+          'ROSTER_CWD_CREATE_FAILED',
+          { name: displayName, cwd: dir },
+        )
+      }
+    } else {
+      dir = assertBotCwd(cwd, 'create')
+    }
     const roleLabel = normalizeLabel(label, 'create')
     const mdl = optionalString(model, 'model', 'create')
     const inst = optionalString(instructions, 'instructions', 'create')
@@ -841,13 +885,28 @@ export function createRoster(ctx, config = {}) {
   }
 
   /**
-   * 改名（**官方 roster 做不到的能力**，见文件头 §1.1）。
+   * 改名 —— **受管 Bot 已禁用**（2026-11-13 Boss 决定：「可以不允许改名」）。
    *
-   * 生效即释放旧名：旧名立刻可被新 Bot 复用（唯一性只算未退役 Bot）。
+   * ## 为什么禁
+   *
+   *   在「主目录 + 部门 + Bot 名」模型下，目录名就是 Bot 名的镜像
+   *   （`cwd = <root>/<dept>/<name>`）。改名会立刻产生两种坏状态之一：
+   *     - 目录跟着变 ⇒ 旧路径失效（脚本/别的 Bot 的 notes/外部工具全断），
+   *       而且迁移不是原子的（改名成功、迁移失败 ⇒ 名字与目录脱节）
+   *     - 目录不变 ⇒ 「Bot 叫张三、目录叫李四」，人肉排查成本很高
+   *
+   *   Boss 的取舍：**直接不允许改名**，比「允许但埋一堆坑」干净。
+   *   要换名字 ⇒ 新建一个 Bot（旧的可退役，退役释放名字，见 §3.1）。
+   *
+   * ## 哪些 Bot 仍可改名
+   *
+   *   **不受管**的 Bot（cwd 不在 `<botsRoot>/<dept>/<name>` 结构里）——
+   *   比如存量手工指定 cwd 的 Bot、以及没设 botsRoot 的环境。
+   *   对它们，名字与目录本来就无关，改名不产生脱节。
    *
    * @param {{ id: string, name: string, expectedRev: number, byId: string, now?: number }} input
    * @returns {object} Bot
-   * @throws {RosterError} 同名占用 / 已退役 / CAS 冲突 / 缺字段
+   * @throws {RosterError} ROSTER_RENAME_DISABLED（受管 Bot）/ 同名占用 / 已退役 / CAS 冲突
    */
   function rename(input = {}) {
     const { name, byId, now } = input ?? {}
@@ -855,6 +914,17 @@ export function createRoster(ctx, config = {}) {
     const by = requireString(byId, 'byId', 'rename')
     const displayName = requireString(name, 'name', 'rename')
     assertNotRetired(current, 'rename', '改名')
+
+    // 受管 Bot 禁止改名（理由见上方注释）
+    if (isManagedCwd(config, current)) {
+      throw new RosterError(
+        `roster.rename：Bot「${current.name}」的工作目录受主目录管理（${current.cwd}），禁止改名——`
+        + '因为目录名就是名字的镜像，改名必然导致路径失效或名字与目录脱节。'
+        + `要换名字请新建一个 Bot（当前这个可以退役，退役会释放名字「${current.name}」）`,
+        'ROSTER_RENAME_DISABLED',
+        { id: current.id, name: current.name, cwd: current.cwd },
+      )
+    }
 
     const key = nameKey(displayName)
     assertNameFree(displayName, current.id, 'rename')

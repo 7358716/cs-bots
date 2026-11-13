@@ -442,7 +442,8 @@ const DEFS = [
       type: 'object',
       properties: {
         name: { type: 'string', description: '唯一名（大小写不敏感）' },
-        cwd: { type: 'string', description: '独立工作目录（绝对路径，必填）' },
+        cwd: { type: 'string', description: '独立工作目录（绝对路径）。与 department 二选一：给了 department 就自动派生，不用手填' },
+        department: { type: 'string', description: '部门 id（如 dev / qa / ops）。给了它 ⇒ 自动建 <主目录>/<部门>/<名字> 作为工作区，并自动创建目录' },
         label: { type: 'string', description: '角色标签（≤24）' },
         model: { type: 'string' },
         instructions: { type: 'string', description: '该 Bot 的职责说明' },
@@ -460,7 +461,7 @@ const DEFS = [
             '典型如 `git worktree add ../<name> main`。准备失败会让 claim 拒绝并记录原因。',
         },
       },
-      required: ['name', 'cwd'],
+      required: ['name'],   // cwd 与 department 二选一（以前 cwd 必填）
       additionalProperties: false,
     },
     run: async (s, a, exec) => {

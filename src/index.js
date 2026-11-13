@@ -116,7 +116,15 @@ function applyInner(ctx, config, { log, warn }) {
 
   // RosterService 先装配：K1 闸门需要它判定「哪些会话是 Bot」。
   try {
-    services.roster = createRoster(ctx, { stateDir: config.stateDir, leaseMs: settings.defaultLeaseMs })
+    services.roster = createRoster(ctx, {
+      stateDir: config.stateDir,
+      leaseMs: settings.defaultLeaseMs,
+      // Bot 目录模型（2026-11-13 Boss 需求）：主目录 + 部门字典。
+      // 两者都可能是 null / 默认值 —— 未设置主目录时 create({department}) 会明确报
+      // BOT_ROOT_UNSET，而不是悄悄建到某个地方。
+      botsRoot: settings.botWorkspaceRoot ?? null,
+      departments: settings.departments ?? [],
+    })
     log(`[cs-bots] RosterService 就绪（stateDir=${services.roster.paths?.stateDir ?? '?'}，durable=${services.roster.durable}）`)
   } catch (error) {
     warn(`[cs-bots] RosterService 装配失败 → 降级（Bot 注册表不可用，K1 保守放行）：${error?.message ?? error}`)
