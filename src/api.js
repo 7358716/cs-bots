@@ -2603,12 +2603,120 @@ export function installApi(ctx, { warn } = {}) {
         return
       }
 
+      // ── 重建 Bot 会话（2026-11-14 Boss 方案B）─────────────────────────────
+      //
+      // ## 为什么需要这个端点
+      //   宿主的 `attachSession` 硬校验「会话 header 的 cwd === workspace.path」
+      //   （`dsh-workspace/lib/index.js:122`），而**会话 header 的 cwd 创建即固定**。
+      //   ⇒ 改了 Bot 的 cwd 之后，那个会话永远挂不进新路径的 workspace。
+      //   想让左侧栏归位，只能让**会话本身**在新 cwd 下重新创建。
+      //
+      // ## 为什么必须是 HTTP 端点（不能是脚本）
+      //   实测：`roster.create` → `kernel.createSession` → `service(ctx,'agents')`。
+      //   `agents` 是**宿主注入的服务**，独立 Node 进程里拿不到
+      //   （报「agents.create 不可用」）。所以只能在运行中的实例内执行。
+      //
+      // ## 安全阀
+      //   - `confirm: true` 必须显式给 —— 这是不可逆操作（旧会话不再登记）
+      //   - `name` 给了就只重建那一个（小范围试错用）
+      //   - `keepSessions` 里的 sessionId 一律跳过（防手滑把自己退役掉）
+      //   - 每个 Bot 独立 try/catch，失败不影响其余；失败项**明确报告已退役未重建**
+      if (request.method === 'POST' && path === '/roster/rebuild') {
+        const body = (await readBody(request)) ?? {}
+        if (body.confirm !== true) {
+          sendJson(response, 400, {
+            ok: false, reason: 'ROSTER_REBUILD_NEEDS_CONFIRM',
+            hint: '这是不可逆操作（旧会话不再登记到 Bot 上）。确认请带 confirm:true。',
+          })
+          return
+        }
+        const only = typeof body.name === 'string' && body.name.trim() ? body.name.trim() : null
+        const keepIds = new Set([
+          ...(Array.isArray(body.keepSessions) ? body.keepSessions : []),
+          OWNER,
+          'ui', 'user', 'person',
+        ].filter((x) => typeof x === 'string'))
+
+        const out = await withService(services, 'roster', async (r) => {
+          const depts = Array.isArray(services.settings?.departments) ? services.settings.departments : []
+          const all = r.list()
+          const targets = all.filter((b) => {
+            if (keepIds.has(b.sessionId) || keepIds.has(b.id)) return false
+            if (only && b.name !== only) return false
+            if (!only) {
+              // 批量模式：只重建「住在主目录下」的 Bot —— 像插件发布管理员这种
+              // cwd 在别处的，它的会话归属本来就是对的，不该动。
+              const root = services.settings?.botWorkspaceRoot
+              if (typeof root !== 'string' || !root.trim()) return false
+              if (!String(b.cwd ?? '').startsWith(root.replace(/\/+$/, '') + '/')) return false
+              // 且必须能对上某个部门（对不上说明是手工目录，别猜）
+              const rel = String(b.cwd).slice(root.replace(/\/+$/, '').length + 1).split('/')[0]
+              if (!depts.some((d) => d?.id === rel)) return false
+            }
+            return true
+          })
+
+          const results = []
+          for (const b of targets) {
+            const profile = b.profile ?? {}
+            const oldSession = b.sessionId
+            const root = String(services.settings?.botWorkspaceRoot ?? '').replace(/\/+$/, '')
+            const dept = String(b.cwd ?? '').slice(root.length + 1).split('/')[0] || depts[0]?.id
+            try {
+              r.retire({ id: b.id, byId: 'ui', reason: '方案B：重建会话以修复工作区归属' })
+            } catch (error) {
+              results.push({ name: b.name, status: 'fail', reason: `退役失败：${error?.message ?? error}` })
+              continue
+            }
+            try {
+              const created = await r.create({
+                name: b.name,
+                department: dept,
+                byId: 'ui',
+                ...(b.preset ? { preset: b.preset } : {}),
+                ...(b.label ? { label: b.label } : {}),
+                ...(b.instructions ? { instructions: b.instructions } : {}),
+                ...(Object.keys(profile).length ? { profile } : {}),
+              })
+              results.push({
+                name: b.name, status: 'ok', department: dept,
+                from: oldSession, to: created.sessionId, cwd: created.cwd,
+              })
+            } catch (error) {
+              results.push({
+                name: b.name, status: 'fail', oldSession,
+                reason: `重建失败（**已退役但未重建**，需人工处理）：${error?.message ?? error}`,
+              })
+            }
+          }
+          return { total: targets.length, results }
+        })
+
+        const ok = out.results.filter((x) => x.status === 'ok').length
+        sendJson(response, 200, {
+          ok: out.results.length === 0 ? true : ok > 0,
+          total: out.total,
+          rebuilt: ok,
+          failed: out.total - ok,
+          results: out.results,
+          note: out.total === 0
+            ? '没有需要重建的 Bot（都已在主目录下且未被排除）'
+            : `重建 ${ok}/${out.total} 个。新会话会在**下次连接**时挂到新 cwd 的工作区。`,
+        })
+        return
+      }
+
       if (request.method === 'POST' && path === '/roster') {
         const body = (await readBody(request)) ?? {}
         // cwd 兜底（契约 bots06 §2.4）：未提供/空白时用 settings.botWorkspaceRoot；
         // 两者都空则保持原行为 —— roster 自己抛 400。
         const bodyWithFallback = { ...body }
-        if (typeof body.cwd !== 'string' || body.cwd.trim() === '') {
+        // ⚠️ 给了 `department` 就**不做 cwd 兜底**（2026-11-14 修）：
+        //   roster.create 里 department 与 cwd 二选一，两者同时给且不一致会抛
+        //   ROSTER_CWD_CONFLICT。而兜底会把 botWorkspaceRoot（主目录，不是部门目录）
+        //   塞进 cwd ⇒ 必然冲突、建 Bot 直接 400。
+        const hasDept = typeof body.department === 'string' && body.department.trim() !== ''
+        if (!hasDept && (typeof body.cwd !== 'string' || body.cwd.trim() === '')) {
           const fallback = services.settings?.botWorkspaceRoot
           if (typeof fallback === 'string' && fallback.trim() !== '') bodyWithFallback.cwd = fallback.trim()
         }
