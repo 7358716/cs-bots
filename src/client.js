@@ -72,6 +72,44 @@ window.__ModuleLoader__.load({
       if (!sessionId || typeof sessionId !== 'string') return false
       const svc = hostUiWorkspace
       if (!svc || typeof svc.openSession !== 'function') return false
+      // ── 尽量提前判可用性（2026-11-14 修复「前几天能跳现在不行」）──────────
+      //
+      // 实测当前宿主（dsh 0.2.2-rc.1）**没有** `sessionLinkState`，
+      // 所以不能依赖它。宿主真正会用的是 `sessions.retain(id, {source:'mainView'})`，
+      // 会话已归档 / 不存在时抛。
+      //
+      // 我们能拿到的最接近的信号：
+      //   - 宿主暴露了 `sessionLinkState` ⇒ 用它（未来版本可能补上）
+      //   - 否则：检查它在**当前会话列表**里（`sessions.list` 快照），
+      //     不在就明确说「可能已归档」，而不是扔一个看不懂的 retain 异常。
+      try {
+        const link = typeof svc.sessionLinkState === 'function' ? svc.sessionLinkState(sessionId) : undefined
+        if (link && link.archived === true) {
+          throw new Error('这个会话已归档，打不开 —— 去左侧栏「已归档」里恢复它，或换一个执行者')
+        }
+        if (link && link.known === false) {
+          throw new Error('这个会话不在当前会话列表里（可能已被清理）—— 去 Bot 页「全部启动」一次再试')
+        }
+        // 兜底：从会话列表快照里找。找不到多半是归档了。
+        const snap = svc.sessions?.list?.getSnapshot?.()
+        const rows = snap?.byId ?? snap?.items
+        if (rows && typeof rows === 'object' && !Array.isArray(rows)) {
+          const hit = rows[sessionId]
+          if (hit === undefined) {
+            throw new Error(
+              '这个会话不在当前会话列表里 —— 它可能已归档或被清理。'
+              + '去左侧栏「已归档」找找，或到 Bot 页确认执行者还在。',
+            )
+          }
+          if (hit.archived === true || hit.archivedAt) {
+            throw new Error('这个会话已归档，打不开 —— 去左侧栏「已归档」里恢复它')
+          }
+        }
+      } catch (error) {
+        // 我们主动抛的两条要原样传出去；查询能力缺失/内部结构不同则忽略（不阻断）
+        if (error instanceof Error && /已归档|不在当前会话列表/.test(error.message)) throw error
+      }
+
       try {
         // 官方约定：传字符串 id（不是 { sessionId }）
         const maybe = svc.openSession(sessionId)
@@ -3202,6 +3240,8 @@ window.__ModuleLoader__.load({
      * @param {{ onGoto?: Function, sourceFilter?: 'human'|'ai' }} props
      */
     function TasksTab({ onGoto, sourceFilter = 'human' }) {
+      // 「去对话」面板（2026-11-14 Boss：任务管理页顶部要有去对话按钮）
+      const [convOpen, setConvOpen] = useState(false)
       const [filter, setFilter] = useState('')
       const [subject, setSubject] = useState('')
       const [desc, setDesc] = useState('')
@@ -3364,8 +3404,75 @@ window.__ModuleLoader__.load({
         }
       }
 
+      /**
+       * 「去对话」面板（2026-11-14 Boss：每个任务管理页顶部要有去对话按钮）。
+       *
+       * ## 为什么不是「跳到某个任务的对话」而是一个列表
+       *   详情页里已经有针对**当前任务**的「去对话」（gotoOwner）。
+       *   顶部这个入口的用处是「我在看板上一眼看到一堆任务，想直接进某个执行者的会话」——
+       *   所以它列的是**当前筛选结果里、有可跳转会话的任务**，点一行就跳。
+       *
+       * ## 为什么先判候选再给按钮
+       *   没派活 / 负责人是平台伪身份（ui/user）的任务跳不了。
+       *   把它们列出来并**说明原因**，比「点了没反应」好。
+       */
+      const convRows = (() => {
+        const list = Array.isArray(tasks) ? tasks : []
+        return list
+          .filter((t) => t && t.status !== 'deleted')
+          .map((t) => {
+            const r = resolveOwnerBot({ task: t, ownerId: t.ownerId, bots })
+            return {
+              task: t,
+              bot: r.bot,
+              sid: r.bot ? (r.bot.sessionId || r.bot.id) : (r.candidates[0] ?? null),
+              reason: r.bot
+                ? null
+                : (r.candidates.length === 0
+                  ? '还没有执行者'
+                  : r.onlyPlatform ? '负责人是平台身份，没有 Bot 会话' : '负责人不在 Bot 注册表里'),
+            }
+          })
+      })()
+      const convPanel = convOpen
+        ? h(Modal, {
+          title: '去对话',
+          onClose: () => setConvOpen(false),
+          footer: [h('button', { key: 'c', className: 'csb-btn', onClick: () => setConvOpen(false) }, '关闭')],
+        },
+        h('div', { className: 'csb-set-d', style: { marginBottom: 8 } },
+          '选一个任务，直接跳到它执行者的会话。跳不了的会写明原因。'),
+        convRows.length === 0
+          ? h(Empty, { icon: '💬', title: '当前没有任务', hint: '先建一个任务，或者换个筛选条件' })
+          : h('div', { style: { maxHeight: 420, overflow: 'auto' } },
+            convRows.map((r) => h('div', {
+              key: r.task.id,
+              className: 'csb-bar',
+              style: { padding: '6px 0', borderBottom: '1px solid var(--dsw-alias-border-secondary, #eee)', alignItems: 'center' },
+            },
+            h('div', { style: { flex: 1, minWidth: 0 } },
+              h('div', { style: { fontSize: 13, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } },
+                r.task.subject || r.task.id),
+              h('div', { className: 'csb-set-d', style: { fontSize: 11.5 } },
+                r.bot ? `执行者：${r.bot.name}` : r.reason)),
+            r.sid
+              ? h('button', {
+                className: 'csb-btn csb-btn-s',
+                onClick: async () => {
+                  try {
+                    const ok = await tryOpenSession(r.sid)
+                    if (ok) setConvOpen(false)
+                  } catch (e) {
+                    setErr(e.message)
+                  }
+                },
+              }, '去对话')
+              : h('span', { className: 'csb-set-d' }, '不可跳转')))))
+        : null
+
       const isAi = sourceFilter === 'ai'
       return h('div', { className: 'csb-wrap' },
+        convPanel,
         h(Section, {
           // 契约 §1：顶层保留两个子页签（任务栏 / 智能体任务），页内不再有「看全部 / 只看需要管」切换。
           title: isAi ? '智能体任务' : '任务栏',
@@ -3396,6 +3503,12 @@ window.__ModuleLoader__.load({
           ),
           h('button', { className: 'csb-btn csb-btn-s', onClick: () => setShowAdv((v) => !v) }, showAdv ? '收起' : '更多字段'),
           h('button', { className: 'csb-btn csb-btn-p', disabled: busy || !subject.trim(), onClick: create }, '创建任务'),
+          // 去对话（2026-11-14）：顶部常驻入口 —— 不用先点开某个任务才能进它的会话
+          h('button', {
+            className: 'csb-btn csb-btn-s',
+            title: '选一个任务，直接跳到它的执行者会话',
+            onClick: () => setConvOpen(true),
+          }, '💬 去对话'),
           h('select', { className: 'csb-sel', style: { width: 116 }, value: filter, onChange: (e) => setFilter(e.target.value) },
             h('option', { value: '' }, '全部状态'),
             h('option', { value: 'pending' }, '待办'),

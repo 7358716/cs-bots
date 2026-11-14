@@ -39,3 +39,20 @@ test('部门化：前端派生与后端同口径（去掉分隔符与首尾点�
   assert.ok(washSep, '前端要洗掉路径分隔符（与 botdirs.sanitizeDirSegment 同口径）')
   assert.ok(trimDots, '前端要剥首尾点号与空白')
 })
+
+// ── 2026-11-14 Boss：任务管理页顶部要有「去对话」按钮 ──────────────────────
+
+test('去对话： TasksTab 顶部有常驻「去对话」入口（不用先点开任务）', () => {
+  assert.match(SOURCE, /'💬 去对话'/, '顶部要有去对话按钮')
+  assert.match(SOURCE, /title: '选一个任务，直接跳到它的执行者会话'/, '要有说明它干什么')
+})
+
+test('去对话：面板列出可跳转任务，跳不了的写明原因（不是「点了没反应」）', () => {
+  assert.match(SOURCE, /'还没有执行者'/, '没派活要说清')
+  assert.match(SOURCE, /'负责人是平台身份，没有 Bot 会话'/, '平台伪装身份要说清')
+  assert.match(SOURCE, /'负责人不在 Bot 注册表里'/, '注册表查不到要说清')
+})
+
+test('去对话：跳转走 tryOpenSession（传字符串 id，不是对象）', () => {
+  assert.match(SOURCE, /await tryOpenSession\(r\.sid\)/, '必须用统一封装，避免 2026-11-09 那个传对象的 bug')
+})
