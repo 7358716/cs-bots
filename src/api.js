@@ -2689,9 +2689,17 @@ export function installApi(ctx, { warn } = {}) {
         }
 
         // ② 选出要删的
+        //
+        // ⚠️ 默认的「旧 Bot 父目录」**不能写死成 Linux 路径**
+        //    （原先是 '/home/ubuntu/output/' —— 在 Windows 上完全无效，
+        //      stale 模式会一个都匹配不到，等于整理不动）。
+        //    ⇒ 用主目录的**父级**推导：`<parent>/output` 就是这类散落目录的典型位置。
+        //      Windows 上主目录是 `C:\\Users\\x\\cs-bots` 时，父级是 `C:\\Users\\x`。
+        //    也接受调用方显式传 legacyPrefixes（完全自定义）。
+        const rootParent = root.slice(0, Math.max(root.lastIndexOf('/'), root.lastIndexOf('\\'))) || root
         const legacy = Array.isArray(body.legacyPrefixes) && body.legacyPrefixes.length
           ? body.legacyPrefixes
-          : ['/home/ubuntu/output/']
+          : [`${rootParent}${pathSep}output${pathSep}`]
         const records = listWorkspaceRecords()
         const target = records.filter((w) => {
           const p = w.path

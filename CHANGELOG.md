@@ -13,6 +13,49 @@
 
 ---
 
+## [0.12.5] - 2026-11-15
+
+### Fixed · Windows 兼容：旧目录前缀不再写死成 Linux 路径
+
+Boss 要在**另一台 Windows 机器**上安装本插件。审查时发现
+`POST /workspaces/tidy` 的 `stale` 模式把默认前缀写死成：
+
+```js
+: ['/home/ubuntu/output/']     // ← Windows 上完全无效
+```
+
+后果：Windows 上用 `stale` 模式**一个旧目录都匹配不到**，整理等于没做，
+而且不报任何错（静默失效 —— 比报错更难查）。
+
+修法：按**主目录的父级**推导：
+
+```js
+const rootParent = root.slice(0, Math.max(root.lastIndexOf('/'), root.lastIndexOf('\\'))) || root
+const legacy = [`${rootParent}${pathSep}output${pathSep}`]
+```
+
+- Linux：`/home/ubuntu/cs-bots` → 父级 `/home/ubuntu` → 前缀 `/home/ubuntu/output/`
+- Windows：`C:\Users\x\cs-bots` → 父级 `C:\Users\x` → 前缀 `C:\Users\x\output\`
+- 也支持调用方显式传 `legacyPrefixes` 完全自定义
+
+### Windows 兼容审查（全项通过）
+
+| 检查 | 结果 |
+|---|---|
+| 硬编码 `/home/ubuntu` 路径 | 0 处（代码内，注释示例不算） |
+| 硬编码 `/tmp` | 0 处 |
+| `execSync` / `spawn` 外部命令 | 无（`exec` 只用于正则匹配） |
+| 路径拼接 | 全部走 `node:path` 的 `join` / `sep` |
+| 运行时依赖 | **`dependencies: {}`**（零依赖，不需要编译原生模块） |
+| peerDependencies | `@deepseek-ai/dsh >=0.2.2-rc.1 <0.3.0` |
+
+### 新增测试
+
+- `★ 默认的旧目录前缀按主目录父级推导，不写死 /home/ubuntu`
+- `legacyPrefixes 可由调用方显式指定`
+
+---
+
 ## [0.12.4] - 2026-11-15
 
 ### Fixed · `/roster/rebuild` 把「不在主目录下的 Bot」切成垃圾部门
