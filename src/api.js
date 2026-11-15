@@ -15,7 +15,7 @@
 import { readFileSync, readdirSync, statSync, existsSync, writeFileSync, renameSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { join, resolve, sep as pathSep } from 'node:path'
-import { registerRoute, listPresets, defaultPreset, getAgent, resumeSession, readSessionMessages, attachToWorkspace, readSessionWatermark, sessionMeta, capabilities } from './kernel.js'
+import { registerRoute, listPresets, ensureWorkspaceDir, listWorkspaceRecords, removeWorkspaceByPath, defaultPreset, getAgent, resumeSession, readSessionMessages, attachToWorkspace, readSessionWatermark, sessionMeta, capabilities } from './kernel.js'
 import { createLibrary } from './library.js'
 import { createDirBrowser } from './dirbrowse.js'
 import { getServices } from './registry.js'
@@ -2589,6 +2589,92 @@ export function installApi(ctx, { warn } = {}) {
           note: okCount > 0
             ? `已把 ${okCount} 个 Bot 的会话挂进各自工作目录对应的工作区，刷新左侧栏即可看到`
             : '没有需要补挂的（或宿主版本过旧不支持工作区）',
+        })
+        return
+      }
+
+      // ── 工作区整理（2026-11-15 Boss：「工作区这里只有一个 CS-bots」）──────────
+      //
+      // ## 为什么要这个端点
+      //   宿主左侧栏是**平铺**的：每个 Bot 一个 cwd ⇒ 每个 cwd 一个 workspace 分组。
+      //   历史上 13 个 Bot 散在 /home/ubuntu/output/*，加上核心目录，一共 12 条，
+      //   把左侧栏占满。Boss 要的是「一个 CS-bots，里面向下展开」。
+      //
+      // ## 靠什么实现分层
+      //   宿主 `owningParentFolder()` 会把「路径在某个已登记 Workspace 之下」的
+      //   Workspace **自动嵌套**进父分组 ⇒ 只要登记 <botsRoot>，它下面的
+      //   <botsRoot>/<部门>/<Bot> 就自动折进这一个分组（见 kernel.ensureWorkspaceDir）。
+      //
+      // ## 这个端点做两件事
+      //   ① 登记 <botsRoot>（幂等）
+      //   ② 按 mode 删掉多余的工作区**登记**（`workspaceController.delete`
+      //      官方语义：只删登记，**保留文件与会话**）
+      //
+      //      mode='stale'（默认，安全）：只删「落在旧 Bot 父目录下的」
+      //         —— 那些目录里的 Bot 已经迁走了，分组是死的
+      //      mode='all'（彻底）：除 <botsRoot> 外全删
+      //         —— 会话不丢，只是变成「未分组」；Boss 说「以前的数据不管了」时用
+      //
+      // ## 安全阀
+      //   - 必须 `confirm:true`
+      //   - **永不删 <botsRoot> 本身**，也**永不删它下面的子目录**（那是要展开的内容）
+      //   - 逐条 try/catch，一条失败不影响其余；结果如实返回
+      if (request.method === 'POST' && path === '/workspaces/tidy') {
+        const body = (await readBody(request)) ?? {}
+        if (body.confirm !== true) {
+          sendJson(response, 400, {
+            ok: false, reason: 'WORKSPACES_TIDY_NEEDS_CONFIRM',
+            hint: '会移除工作区登记（保留文件与会话）。确认请带 confirm:true。',
+          })
+          return
+        }
+        const mode = body.mode === 'all' ? 'all' : 'stale'
+        const root = String(services.settings?.botWorkspaceRoot ?? '').replace(/\/+$/, '')
+        if (!root) {
+          sendJson(response, 400, { ok: false, reason: 'BOT_ROOT_UNSET', hint: '先在设置里指定 Bot 主目录' })
+          return
+        }
+
+        // ① 先登记主目录（这一步失败就没法分层，直接报）
+        const ens = await ensureWorkspaceDir(ctx, root)
+
+        // ② 选出要删的
+        const legacy = Array.isArray(body.legacyPrefixes) && body.legacyPrefixes.length
+          ? body.legacyPrefixes
+          : ['/home/ubuntu/output/']
+        const records = listWorkspaceRecords()
+        const target = records.filter((w) => {
+          const p = w.path
+          if (p === root) return false                                  // 主目录本身
+          if (p.startsWith(`${root}/`)) return false                     // 子目录（要展开的内容）
+          if (mode === 'all') return true
+          // stale：只动旧 Bot 父目录下的（含父目录本身），且该目录已不是任何在用 Bot 的 cwd
+          const underLegacy = legacy.some((pre) => p === pre.replace(/\/+$/, '') || p.startsWith(pre))
+          return underLegacy
+        })
+
+        const results = []
+        for (const w of target) {
+          const r = await removeWorkspaceByPath(ctx, w.path)
+          results.push({
+            path: w.path, sessions: w.sessionIds.length,
+            ok: r.ok, removed: r.removed === true, ...(r.reason ? { reason: r.reason } : {}),
+          })
+        }
+
+        const removedCount = results.filter((x) => x.removed).length
+        sendJson(response, 200, {
+          ok: ens.ok || removedCount > 0,
+          mode,
+          root,
+          rootRegistered: { ok: ens.ok, created: ens.created === true, ...(ens.reason ? { reason: ens.reason } : {}) },
+          considered: target.length,
+          removed: removedCount,
+          failed: results.filter((x) => !x.ok).length,
+          results,
+          note: ens.ok
+            ? `已登记主目录 ${root}；移除 ${removedCount} 个多余分组。刷新左侧栏即可看到分层。`
+            : `主目录登记失败（${ens.reason ?? '未知'}），仅移除了 ${removedCount} 个分组`,
         })
         return
       }

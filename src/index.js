@@ -201,17 +201,35 @@ function applyInner(ctx, config, { log, warn }) {
     if (typeof ensureWorkspaceDir === 'function') {
       const root = settings.botWorkspaceRoot
       if (typeof root === 'string' && root.trim()) {
+        // ⚠️ **必须重试**（2026-11-15 实测）：`workspaceRegistry` 是**宿主服务**，
+        //    在 cs-bots 的 apply 跑的时候它可能**还没装配好**
+        //    （宿主侧 workspace 域要等 registry/session 都就绪才 provide）。
+        //    直接调一次 ⇒ 拿到 undefined ⇒ 返回 `{ok:false, reason:'宿主未提供 workspaceRegistry'}`
+        //    ⇒ 左侧栏永远平铺。实测就是这么失败的：重启后 workspace.json 的 mtime
+        //    还停在重启前，说明那次调用根本没成功写过任何东西。
+        //
+        //    处置：有限次重试（最多 10 次 × 500ms ≈ 5s），拿到就停；
+        //    全程串行、单次注册（不循环 Bot、不碰 session），不会重演 0.10.2 的并发事故。
         void (async () => {
-          try {
-            const r = await ensureWorkspaceDir(ctx, root.trim())
-            if (r.ok) {
-              if (r.created) log(`[cs-bots] 已把 Bot 主目录注册为 Workspace 分组：${root.trim()}`)
-            } else {
-              warn(`[cs-bots] 未能注册 Bot 主目录分组（${root.trim()}）：${r.reason} —— 左侧栏会平铺显示，其他功能不受影响`)
+          for (let attempt = 0; attempt < 10; attempt += 1) {
+            try {
+              const r = await ensureWorkspaceDir(ctx, root.trim())
+              if (r.ok) {
+                if (r.created) log(`[cs-bots] 已把 Bot 主目录注册为 Workspace 分组：${root.trim()}`)
+                return
+              }
+              // 只在「registry 还没就绪」时重试；其它原因（如 create 报错）直接放弃，别死循环
+              if (!/未提供 workspaceRegistry|registry 无 create/.test(String(r.reason ?? ''))) {
+                warn(`[cs-bots] 未能注册 Bot 主目录分组（${root.trim()}）：${r.reason} —— 左侧栏会平铺显示`)
+                return
+              }
+            } catch (error) {
+              warn(`[cs-bots] 注册 Bot 主目录分组异常：${error?.message ?? error}`)
+              return
             }
-          } catch (error) {
-            warn(`[cs-bots] 注册 Bot 主目录分组异常：${error?.message ?? error}`)
+            await new Promise((resolve) => { setTimeout(resolve, 500) })
           }
+          warn('[cs-bots] 等待 workspaceRegistry 超时（5s）—— 左侧栏会平铺显示；重启后通常可恢复')
         })()
       }
     }

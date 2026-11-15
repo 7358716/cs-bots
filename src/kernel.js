@@ -24,7 +24,8 @@
 //
 // 惰性的另一收益：**不构造消息的调用路径完全不依赖宿主包** —— 单元测试因此可离线跑。
 import { createRequire } from 'node:module'
-import { existsSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
+import { join } from 'node:path'
 
 const HOST_LLM = '@deepseek-ai/dsh-llm'
 const HOST_AGENT = '@deepseek-ai/dsh-agent'
@@ -597,6 +598,78 @@ export async function attachToWorkspace(ctx, cwd, sessionId) {
   if (!workspace || typeof workspace.attachSession !== 'function') return false
   await workspace.attachSession(sessionId)
   return true
+}
+
+/**
+ * 按路径删掉一个 Workspace 的**登记**（保留文件与会话）。
+ *
+ * ## 官方语义（`dsh-api-workspace-controller/lib/types/index.d.ts:57`）
+ *   > Remove one Workspace registration while retaining files and Sessions.
+ *
+ *   ⇒ 只删「左侧栏分组」这一层，磁盘目录不动、会话不动（会话变成「未分组」）。
+ *   这正是「左侧栏太乱」该用的手段 —— 比删目录安全得多。
+ *
+ * ## 需要两个服务
+ *   - `workspaceRegistry.resolveByPath(path)` 拿 id（实体有 `readonly id`）
+ *   - `workspaceController.delete({ workspaceId })` 执行删除
+ *
+ * 两者缺一就返回 `{ok:false, reason}`，绝不抛。
+ *
+ * @param {object} ctx
+ * @param {string} dir
+ * @returns {Promise<{ok: boolean, removed?: boolean, reason?: string}>}
+ */
+export async function removeWorkspaceByPath(ctx, dir) {
+  if (typeof dir !== 'string' || !dir.trim()) return { ok: false, reason: 'dir 为空' }
+  const registry = service(ctx, 'workspaceRegistry')
+  const controller = service(ctx, 'workspaceController')
+  if (!registry) return { ok: false, reason: '宿主未提供 workspaceRegistry' }
+  if (!controller || typeof controller.delete !== 'function') {
+    return { ok: false, reason: '宿主未提供 workspaceController.delete' }
+  }
+  try {
+    const ws = await registry.resolveByPath?.(dir)
+    if (!ws || typeof ws.id !== 'string') return { ok: true, removed: false }  // 本来就没登记
+    await controller.delete({ workspaceId: ws.id })
+    return { ok: true, removed: true }
+  } catch (error) {
+    return { ok: false, reason: `删除 Workspace 登记失败：${error?.message ?? error}` }
+  }
+}
+
+/**
+ * 列出宿主当前登记的全部 Workspace（路径 + id + 会话数）。
+ *
+ * 为什么不用 `workspaceController` 的 list：它只暴露 feed 订阅，没有同步读接口。
+ * 而 `workspaceRegistry.entities` 是内部 Map —— 不可靠。这里改从
+ * 注册表的公开能力拿：逐个 `resolveByPath` 太慢，所以**直接读持久化文件**。
+ *
+ * ⚠️ 读文件只用于**展示与决策**，不作为真相源（宿主内存态才是）。
+ * 真正执行删除时仍走 `removeWorkspaceByPath`（它内部 resolveByPath 取 id）。
+ *
+ * @param {string} [dir] 省略则按 `$DSH_HOME` 推导
+ * @returns {Array<{id: string, path: string, sessionIds: string[], createdAt?: number}>}
+ */
+export function listWorkspaceRecords(dir) {
+  try {
+    // 默认按 DSH_HOME 推导（`stateDir()` = `$DSH_HOME/cs-bots`，上一级就是宿主数据根）
+    const base = typeof dir === 'string' && dir.trim() ? dir.trim() : stateDir()
+    const file = join(base, '..', 'storages', 'workspace.json')
+    const raw = readFileSync(file, 'utf8')
+    const j = JSON.parse(raw)
+    const table = j?.tables?.workspaces ?? {}
+    const rows = Array.isArray(table) ? table : Object.entries(table).map(([id, v]) => ({ id, ...v }))
+    return rows
+      .filter((w) => w && typeof w.path === 'string')
+      .map((w) => ({
+        id: String(w.id ?? ''),
+        path: w.path,
+        sessionIds: Array.isArray(w.sessionIds) ? w.sessionIds : [],
+        createdAt: typeof w.createdAt === 'number' ? w.createdAt : undefined,
+      }))
+  } catch {
+    return []
+  }
 }
 
 /**

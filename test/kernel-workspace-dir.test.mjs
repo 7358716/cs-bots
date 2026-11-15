@@ -80,3 +80,29 @@ test('ensureWorkspaceDir：dir 为空 ⇒ ok:false（不拿空路径去 create�
   assert.equal((await ensureWorkspaceDir(ctxWith(f.registry), null)).ok, false)
   assert.deepEqual(f.created, [])
 })
+
+// ── 2026-11-15 实测：workspaceRegistry 在 apply 时可能还没就绪 ─────────────
+// 症状：重启后 workspace.json 的 mtime 停在重启前 —— 说明那次注册根本没成功写过。
+// 调用方必须**有限次重试**，等宿主把 registry provide 出来。
+
+test('ensureWorkspaceDir：registry 未就绪时返回可识别的 reason（调用方据此重试）', async () => {
+  const r = await ensureWorkspaceDir(ctxWith(undefined), '/home/ubuntu/cs-bots')
+  assert.equal(r.ok, false)
+  assert.match(r.reason, /未提供 workspaceRegistry/, 'reason 必须可识别，否则调用方无从判断该不该重试')
+})
+
+test('ensureWorkspaceDir：先未就绪、后就绪 ⇒ 第二次调用成功（模拟重试）', async () => {
+  let ready = false
+  const f = fakeRegistry()
+  const ctx = {
+    get: (k) => (k === 'workspaceRegistry' && ready ? f.registry : undefined),
+  }
+  const first = await ensureWorkspaceDir(ctx, '/home/ubuntu/cs-bots')
+  assert.equal(first.ok, false, '第一次 registry 还没就绪')
+
+  ready = true
+  const second = await ensureWorkspaceDir(ctx, '/home/ubuntu/cs-bots')
+  assert.equal(second.ok, true, 'registry 就绪后重试必须成功')
+  assert.equal(second.created, true)
+  assert.deepEqual(f.created, ['/home/ubuntu/cs-bots'], '只建一次，不重复')
+})

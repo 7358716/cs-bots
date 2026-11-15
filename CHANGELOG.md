@@ -13,6 +13,45 @@
 
 ---
 
+## [0.12.0] - 2026-11-15
+
+### Added · 工作区整理：左侧栏只留一个 CS-bots，可向下展开
+
+Boss：「我希望在工作区这里能够只有一个 CS-bots，对工作区这里进行改动或者在上面直接新增一个，
+下级可以向下展开的」。
+
+**机制（用宿主自己的嵌套能力，不改 sidebar 一行代码）**
+宿主 `owningParentFolder()`（`dsh-client-ui-workspace/lib/client.js:1234`）会把
+「路径在某个已登记 Workspace 之下」的 Workspace **自动嵌套**进父分组
+⇒ 登记 `<botsRoot>` 一条，它下面的 `<botsRoot>/<部门>/<Bot>` 就自动折进去。
+
+**新端点 `POST /workspaces/tidy`**
+- ① 登记 `<botsRoot>`（幂等，靠 0.11.1 的 registry 就绪重试）
+- ② 移除多余的工作区**登记** —— 官方语义
+  「Remove one Workspace registration while **retaining files and Sessions**」
+  ⇒ 只摘掉左侧栏分组，磁盘和会话都在
+- 两种范围：`stale`（默认，只清旧 Bot 父目录）/ `all`（除主目录外全清）
+- **安全阀**：必须 `confirm:true`；**永不删 `<botsRoot>` 本身**；
+  **永不删它下面的子目录**（那是要展开的内容）；逐条 try/catch + 如实返回
+
+**UI**：部门页「🗂 整理工作区」→ 选范围 → 开始整理 → 逐条列出被移除的分组与会话数。
+
+### Fixed · 左侧栏分组注册失败（0.11.1 的重试修复，本次一并上线）
+
+0.11.0 上线后实测：`workspace.json` 的 mtime 停在重启前 ⇒ 那次注册根本没成功。
+根因：`workspaceRegistry` 是**宿主服务**，cs-bots 的 `apply` 跑时它可能还没 provide
+⇒ 拿到 `undefined` ⇒ 直接放弃。
+
+修法：有限次重试（10 次 × 500ms ≈ 5s），**只在「registry 未就绪」时重试**，
+其它错误直接放弃不死循环。仍然只建 1 个、串行、不碰 session。
+
+### 新增 kernel 能力
+
+- `removeWorkspaceByPath(ctx, dir)` —— 按路径删登记（先 resolveByPath 取 id）
+- `listWorkspaceRecords([dir])` —— 读持久化文件列出记录（仅用于展示与决策，不作真相源）
+
+---
+
 ## [0.11.0] - 2026-11-15
 
 ### Added · 部门管理（Boss：「按部门管理」）
