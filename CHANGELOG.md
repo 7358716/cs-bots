@@ -13,6 +13,54 @@
 
 ---
 
+## [0.10.2] - 2026-11-15
+
+### Fixed · 禁用启动期自动重挂工作区（**严重**）
+
+**现象**：宿主 `workspace` 域反复初始化失败，连锁导致 5 个组件未激活
+（`session-controller` / `workspace-controller` / `ui-deliverables` / `cot-translation`），
+左侧栏工作区分组、会话列表全部不工作。
+
+```
+workspace (@deepseek-ai/dsh-workspace): Error: workspace domain is inconsistent:
+  path '/home/ubuntu/cs-bots/dev/X' is claimed by both workspace 'A' and workspace 'B'
+dsh: warning: 5 entries did not activate
+```
+
+**根因**：0.10.0 引入的「启动时对 14 个 Bot 并发调 `attachToWorkspace`」。
+那段是 `void (async () => {...})()` —— **不 await，脱离启动节奏**；
+而 `attachToWorkspace` 内部是「先 `resolveByPath` 查 → 查不到就 `registry.create`」，
+**查与建之间没有事务保护**。在 workspace 域本身还没就绪时，
+`resolveByPath` 走 catch 返回 `undefined` ⇒ 直接 create ⇒ 同一路径注册两次。
+
+**决定性证据**：2026-11-15 当天有人修 `workspace.json` **6 次**
+（09:35 / 09:41 / 09:43 / 12:57×2 / 13:00），**每次重启后又坏**。
+启动钩子里唯一碰 workspace 的就是这段。
+
+**处置**：整段移除。手动入口保留（Bot 页 →「把会话挂进工作区」，
+`POST /roster/attach-workspaces`）—— 手动是串行、按需的，不会在启动窗口并发打 registry。
+
+**将来要恢复自动化，必须满足**：
+① 串行且每步 await 到底；② 每步前检查 workspace 域健康，拿不到 registry 就整段跳过；
+③ 或直接依赖宿主在新会话创建时自己挂载，不再由插件补挂。
+
+### 已排查并排除的其他自动脚本
+
+| 脚本 | 碰 workspace？ | 结论 |
+|---|---|---|
+| cron `upgrade-run.sh` ×2 | 否 | `--stage` 不重启主服务；上次运行 11-13 |
+| `guard-bootdog.sh` | 否 | 只唤醒会话，不碰 registry |
+| `restart-guard.sh` | 否 | 是触发器（引起启动），不是污染源 |
+| systemd unit | — | 无 `ExecStartPre/Post` |
+
+### 其他
+
+- `POST /roster` 的 cwd 兜底修：给了 `department` 就不再塞 `botWorkspaceRoot`
+  （否则 `ROSTER_CWD_CONFLICT` 直接 400）
+- 新增 `POST /roster/rebuild`（在实例内重建 Bot 会话，含 confirm/keepSessions 安全阀）
+
+---
+
 ## [0.10.1] - 2026-11-14
 
 ### Added
