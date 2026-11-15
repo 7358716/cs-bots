@@ -40,32 +40,39 @@ import { probeHost, formatReport } from './compat.js'
 export const name = 'cs-bots'
 
 /**
- * 插件依赖声明（2026-11-15 Windows 实测：缺这个会导致左侧栏分组永远登记不上）。
+ * 插件依赖声明 —— **故意留空**。
  *
- * ## 为什么必须声明
+ * ## 血泪史（2026-11-15，Win 上连错三次才定位）
  *
- *   Cordis 的插件可以声明 `inject`，宿主会**等这些服务就绪**才调 `apply`。
- *   不声明 ⇒ `apply` 在宿主服务还没装配好时就被调用 ⇒
- *   `ctx.get('workspaceRegistry')` 拿到 `undefined`。
+ *   ❌ 尝试1：不声明 inject
+ *      ⇒ apply 在宿主服务就绪前跑，`ctx.get('workspaceRegistry')` 恒 undefined
  *
- *   我们用了 `ctx.inject(['workspaceRegistry'], cb)` 想「等就绪」，
- *   但 **`ctx.inject` 依赖父 fiber 处于活跃状态**；如果 apply 本身跑在
- *   一个「服务缺失」的上下文里，它的回调可能永远不触发
- *   （实测：Linux 上侥幸能跑，Windows 上分组始终不出现）。
+ *   ❌ 尝试2：`ctx.inject([...], cb)` 等就绪
+ *      ⇒ 依赖父 fiber 活跃；apply 在服务缺失上下文里时回调可能永不触发
  *
- * ## 声明了就一定等到
+ *   ❌ 尝试3（**最严重**）：`export const inject = { required: [], optional: ['workspaceRegistry'] }`
+ *      ⇒ Cordis **不认这个形状**（`cordis/lib/index.js:1565`）：
+ *        ```js
+ *        if (Array.isArray(inject)) for (const name of inject) result[name] = null
+ *        else for (const name of Object.keys(inject)) result[name] = inject[name] ?? null
+ *        ```
+ *        它把 `required` 和 `optional` 当成**两个服务名**去等
+ *        ⇒ 插件永远 `pending (waiting for services: required, optional)`
+ *        ⇒ 插件根本没启动 ⇒ **所有 `/cs-bots/api/*` 全 404/405**
+ *        ⇒ 页面全崩（选目录 404、保存 405）
  *
- *   宿主 `dsh-workspace` 自己就是这么写的（`lib/index.js:355`）：
- *     `static inject = ["storageDomain", "sessionPersistence"]`
+ * ## 现在：什么都不声明
  *
- *   ⇒ 这里声明软依赖。**用 `optional` 语义**：即便某个宿主版本没提供
- *   workspaceRegistry，插件也要能起来（左侧栏少个分组，但任务板/房间照常可用）——
- *   所以不用硬 inject 而是继续保留 `ctx.inject` 的容错路径。
+ *   插件**必须在宿主服务缺失时也能启动**（任务板/房间/记忆都不依赖 workspaceRegistry）。
+ *   唯一需要 workspaceRegistry 的是「左侧栏分组登记」，那是锦上添花：
+ *   在 apply 里用 `ctx.get()` 探测，**拿不到就跳过并 warn**，不阻塞启动。
+ *
+ *   ⇒ 用运行时探测代替编译期依赖声明。这样：
+ *     · 宿主没这个服务 ⇒ 少一个左侧栏分组，其它功能全正常
+ *     · 宿主有 ⇒ 正常登记
+ *     · 任何版本都不会因为等服务而 pending
  */
-export const inject = {
-  required: [],
-  optional: ['workspaceRegistry'],
-}
+// （不导出 inject —— 见上方说明）
 
 /**
  * Bot 会话中必须从工具表移除的工具（K1）。
@@ -246,29 +253,58 @@ function applyInner(ctx, config, { log, warn }) {
     //   · 只建 **1 个** Workspace（主目录本身）
     //   · **不碰任何 session**
     //   · 失败只 warn，不影响插件其他功能
-    if (typeof ensureWorkspaceDir === 'function' && typeof ctx.inject === 'function') {
+    // ── 左侧栏分组：运行时探测 + 有限次重试（**不用 inject 声明**）────────────
+    //
+    // 为什么不用 `ctx.inject` / `export const inject`：
+    //   见文件头 inject 注释里的三次失败记录。核心结论：
+    //   **插件必须在宿主服务缺失时也能启动**，不能因为「等一个可选服务」而 pending。
+    //
+    // 现在的做法：
+    //   · 用 `service(ctx,'workspaceRegistry')` 探测（拿不到就算了）
+    //   · 拿不到就**有限次重试**（10 × 500ms ≈ 5s），宿主通常在这窗口内装配好
+    //   · 全程串行单次，只建 1 个分组、不碰任何 session
+    //   · 失败只 warn —— 左侧栏少个分组，其它功能一切正常
+    if (typeof ensureWorkspaceDir === 'function') {
       const root = settings.botWorkspaceRoot
       if (typeof root === 'string' && root.trim()) {
         const wsRoot = root.trim()
-        try {
-          ctx.inject(['workspaceRegistry'], (scoped) => {
-            void (async () => {
-              try {
-                const r = await ensureWorkspaceDir(scoped ?? ctx, wsRoot)
-                if (r.ok) {
-                  if (r.created) log(`[cs-bots] 已把 Bot 主目录注册为 Workspace 分组：${wsRoot}`)
-                } else {
-                  warn(`[cs-bots] 未能注册 Bot 主目录分组（${wsRoot}）：${r.reason} —— 左侧栏会平铺显示`)
-                }
-              } catch (error) {
-                warn(`[cs-bots] 注册 Bot 主目录分组异常：${error?.message ?? error}`)
-              }
-            })()
-          })
-        } catch (error) {
-          // inject 本身失败（老宿主没有该 API 等）⇒ 降级，不阻碍插件启动
-          warn(`[cs-bots] 无法等待 workspaceRegistry 就绪：${error?.message ?? error} —— 左侧栏会平铺显示`)
+        // ⚠️ 用**模块级互斥锁**保证全局串行（2026-11-15 测试抓到并发峰值 2）。
+        //    场景：启动时后台轮询登记 与 `POST /workspaces/tidy` 同时在建目录
+        //    ⇒ 同一路径可能被注册两次 ⇒ 正是 domain inconsistent 的成因。
+        //    这个锁横跨 index.js（启动）与 api.js（tidy），所以挂在 globalThis 上。
+        const LOCK = '__csBotsWorkspaceRegLock'
+        const withLock = async (fn) => {
+          const prev = globalThis[LOCK] ?? Promise.resolve()
+          let release
+          globalThis[LOCK] = new Promise((r) => { release = r })
+          try {
+            await prev
+            return await fn()
+          } finally {
+            release()
+          }
         }
+        void (async () => {
+          for (let attempt = 0; attempt < 10; attempt += 1) {
+            try {
+              const r = await withLock(() => ensureWorkspaceDir(ctx, wsRoot))
+              if (r.ok) {
+                if (r.created) log(`[cs-bots] 已把 Bot 主目录注册为 Workspace 分组：${wsRoot}`)
+                return
+              }
+              // 只有「服务还没就绪」值得重试；别的错误（如建目录失败）立刻放弃
+              if (!/未提供 workspaceRegistry|registry 无 create/.test(String(r.reason ?? ''))) {
+                warn(`[cs-bots] 未能注册 Bot 主目录分组（${wsRoot}）：${r.reason} —— 左侧栏会平铺显示，其它功能不受影响`)
+                return
+              }
+            } catch (error) {
+              warn(`[cs-bots] 注册 Bot 主目录分组异常：${error?.message ?? error}`)
+              return
+            }
+            await new Promise((resolve) => { setTimeout(resolve, 500) })
+          }
+          warn('[cs-bots] 等待 workspaceRegistry 超时（5s）—— 左侧栏会平铺显示；重启后通常可恢复')
+        })()
       }
     }
 

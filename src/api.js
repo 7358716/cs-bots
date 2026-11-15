@@ -2668,8 +2668,23 @@ export function installApi(ctx, { warn } = {}) {
           return
         }
 
+        // 与 index.js 启动时的后台登记共用同一把锁 —— 保证全局串行。
+        // （2026-11-15 测试抓到并发峰值 2：启动轮询 与 tidy 同时建目录）
+        const LOCK = '__csBotsWorkspaceRegLock'
+        const withLock = async (fn) => {
+          const prev = globalThis[LOCK] ?? Promise.resolve()
+          let release
+          globalThis[LOCK] = new Promise((r) => { release = r })
+          try {
+            await prev
+            return await fn()
+          } finally {
+            release()
+          }
+        }
+
         // ① 先登记主目录（这一步失败就没法分层，直接报）
-        const ens = await ensureWorkspaceDir(ctx, root)
+        const ens = await withLock(() => ensureWorkspaceDir(ctx, root))
 
         // ①-b 再登记「部门」与每个 Bot 的目录 —— 这样左侧栏能展开成三级：
         //       cs-bots → 部门 → Bot
@@ -2700,7 +2715,7 @@ export function installApi(ctx, { warn } = {}) {
             try {
               // 目录存在才能被 realpath 归一化（registry.create 要求真实目录）
               if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
-              const r = await ensureWorkspaceDir(ctx, dir)
+              const r = await withLock(() => ensureWorkspaceDir(ctx, dir))
               if (r.ok) hierarchy.depts += 1
               else hierarchy.failed.push({ path: dir, reason: r.reason })
             } catch (error) {
@@ -2712,7 +2727,7 @@ export function installApi(ctx, { warn } = {}) {
             if (!cwd || !cwd.startsWith(`${root}/`)) continue
             try {
               if (!existsSync(cwd)) mkdirSync(cwd, { recursive: true })
-              const r = await ensureWorkspaceDir(ctx, cwd)
+              const r = await withLock(() => ensureWorkspaceDir(ctx, cwd))
               if (r.ok) hierarchy.bots += 1
               else hierarchy.failed.push({ path: cwd, reason: r.reason })
             } catch (error) {

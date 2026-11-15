@@ -27,11 +27,16 @@ test('引导页：选择结果要写回输入框', () => {
   assert.match(CLIENT, /onChange: \(p\) => setRootDraft\(p\)/, '选完目录要填进 rootDraft')
 })
 
-test('引导页：默认值有三层兜底，不能为空', () => {
-  // diagnostics.defaultRoot → values.botWorkspaceRoot → 前端按平台猜
+test('引导页：默认值来自后端真实路径，前端不瞎猜', () => {
+  // Boss：「默认是自动获取系统安装目录，不是 C:\\Users\\你\\.dsh\\cs-bots」
+  // ⇒ 前端不该出现 "你" 这种占位符，真实路径只有后端知道（它有 process.env）。
   assert.match(CLIENT, /settingsQ\.data\?\.diagnostics\?\.defaultRoot\s*\n?\s*\?\?\s*settingsQ\.data\?\.values\?\.botWorkspaceRoot/,
     '要有诊断值→设置值的兜底链')
-  assert.match(CLIENT, /\/Windows\/i\.test\(ua\)/, '还要有按平台的前端兜底')
+  // 只看**代码里还返回**的假路径（注释里提到历史问题不算）
+  assert.ok(
+    !/return 'C:\\\\Users\\\\你/.test(CLIENT),
+    '不该再 return 含 "你" 的假路径',
+  )
 })
 
 test('后端：拿不到 stateDir 时也必须返回完整 diagnostics（否则引导页没默认值）', () => {

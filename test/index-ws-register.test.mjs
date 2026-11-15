@@ -74,20 +74,64 @@ function boot() {
   }
 }
 
-test('装配：插件会 inject workspaceRegistry（而不是靠 get 硬拿）', async () => {
-  const h = boot()
-  try {
-    const names = h.injectCallbacks.flatMap((x) => x.names)
-    assert.ok(names.includes('workspaceRegistry'), '必须声明依赖 —— 否则 apply 时它还没就绪')
-  } finally { h.cleanup() }
+/**
+ * 第二个夹具：模拟「运行时探测」——`ctx.get('workspaceRegistry')` 直接可用，
+ * 不走 inject 回调。这是 0.13.3 之后的真实模型。
+ */
+function boot2({ registryAvailable = true } = {}) {
+  const base = mkdtempSync(join(tmpdir(), 'cs-bots-wsreg2-'))
+  const dshHome = join(base, '.dsh')
+  const botsRoot = join(base, 'cs-bots')
+  mkdirSync(join(dshHome, 'cs-bots'), { recursive: true })
+  mkdirSync(botsRoot, { recursive: true })
+  writeFileSync(join(dshHome, 'cs-bots', 'settings.json'), JSON.stringify({
+    botWorkspaceRoot: botsRoot, departments: [{ id: 'dev', name: '开发部' }],
+  }))
+  const prevHome = process.env.DSH_HOME
+  process.env.DSH_HOME = dshHome
+
+  const created = []
+  const registry = {
+    async resolveByPath() { return undefined },
+    async create(p) { created.push(p); return { workspace: { id: `ws-${p}`, path: p }, created: true } },
+  }
+  const ctx = {
+    logger: { info() {}, warn() {} },
+    get: (k) => {
+      if (k === 'workspaceRegistry') return registryAvailable ? registry : undefined
+      if (k === 'tools') return { register: () => () => {}, guard: () => () => {}, schemas: () => [] }
+      if (k === 'webServer') return { register: () => () => {} }
+      return undefined
+    },
+    on() {}, effect() {}, off() {},
+  }
+  apply(ctx, { stateDir: join(dshHome, 'cs-bots') })
+
+  return {
+    botsRoot, created,
+    cleanup() {
+      if (prevHome === undefined) delete process.env.DSH_HOME
+      else process.env.DSH_HOME = prevHome
+      try { rmSync(base, { recursive: true, force: true }) } catch { /* */ }
+    },
+  }
+}
+
+test('装配：插件**不**声明 inject（声明会导致 pending，见 index.js 注释）', async () => {
+  // 2026-11-15 三次失败的结论：用 inject 会让插件 pending
+  //   `inject = { required: [], optional: [...] }` 被 Cordis 当成服务名
+  //   ⇒ 永远 waiting for services: required, optional ⇒ 插件不启动 ⇒ API 全 404。
+  // 正确做法是**运行时探测 + 有限次重试**，不阻塞启动。
+  const mod = await import('../src/index.js')
+  assert.equal(mod.inject, undefined, '不应导出 inject（会阻塞插件启动）')
 })
 
-test('装配：服务就绪后会把 Bot 主目录登记成 Workspace 分组', async () => {
-  const h = boot()
+test('装配：服务可用后会把 Bot 主目录登记成 Workspace 分组（运行时探测模型）', async () => {
+  const h = boot2({ registryAvailable: true })
   try {
-    assert.deepEqual(h.created, [], '服务没就绪前不该建任何东西')
-    await h.releaseServices()
-    assert.deepEqual(h.created, [h.botsRoot], '就绪后应正好登记主目录一条')
+    // 轮询最多 10×500ms，这里等 1.2s 足够
+    await new Promise((r) => setTimeout(r, 1200))
+    assert.deepEqual(h.created, [h.botsRoot], `应正好登记主目录一条，实际 ${JSON.stringify(h.created)}`)
   } finally { h.cleanup() }
 })
 

@@ -135,7 +135,18 @@ window.__ModuleLoader__.load({
       try {
         data = await res.json()
       } catch {
-        throw new Error(`接口返回非 JSON（HTTP ${res.status}）`)
+        // ⚠️ 不能说「接口返回非 JSON」就完了（2026-11-15 Win 实测踩坑）：
+        //    真实原因通常是**插件服务端根本没启动**（比如 `inject` 声明写错导致
+        //    插件 pending），此时 `/cs-bots/api/*` 全部 404/405，返回的是 HTML 错误页。
+        //    用户看到「接口返回非 JSON（HTTP 404）」完全不知道该怎么办。
+        if (res.status === 404 || res.status === 405) {
+          throw new Error(
+            `插件后端未就绪（HTTP ${res.status}）—— /cs-bots/api 路由不存在。`
+            + '常见原因：插件未启动/加载失败。请到「插件」页查看 cs-bots 状态，'
+            + '若显示 pending 或「未激活」，重启 dsh-web 后重试。',
+          )
+        }
+        throw new Error(`接口返回非 JSON（HTTP ${res.status}）—— 可能是插件未启动或网关错误`)
       }
       if (!data || data.ok === false) {
         const err = new Error(data?.reason ?? data?.message ?? `HTTP ${res.status}`)
@@ -8656,15 +8667,11 @@ window.__ModuleLoader__.load({
       //   → 前端按平台猜一个（保证**永不为空**）
       const defaultRoot = settingsQ.data?.diagnostics?.defaultRoot
         ?? settingsQ.data?.values?.botWorkspaceRoot
-        ?? (() => {
-          // 纯前端兜底：Windows 用 .dsh 的下级；其它平台同理。
-          // 拿不到真实 HOME，就用占位提示，但**输入框里一定有东西**可点确认。
-          try {
-            const ua = String(globalThis.navigator?.userAgent ?? '')
-            if (/Windows/i.test(ua)) return 'C:\\Users\\你\\.dsh\\cs-bots'
-          } catch { /* */ }
-          return ''
-        })()
+        // ⚠️ 不再用前端瞎猜（之前会显示 `C:\Users\你\...` 那个假路径，
+        //    Boss 反馈「默认应该是自动获取系统安装目录，不是这个」）。
+        //    真实路径只有后端知道（它跑在用户机器上，有 process.env）。
+        //    若后端没给，就留空并提示去点「选择目录」。
+        ?? ''
       const [rootDraft, setRootDraft] = useState(null)
       const [onboardBusy, setOnboardBusy] = useState(false)
       const [onboardErr, setOnboardErr] = useState(null)

@@ -13,6 +13,49 @@
 
 ---
 
+## [0.13.3] - 2026-11-15
+
+### Fixed · 插件 pending 导致整个后端 404（**我上轮引入的严重回归**）
+
+Boss 截图：`cs-bots (cs-bots): pending (waiting for services: required, optional)`
+
+**根因**：0.13.1 我写的
+```js
+export const inject = { required: [], optional: ['workspaceRegistry'] }
+```
+**Cordis 不认这个形状**（`cordis/lib/index.js:1565`）：
+```js
+if (Array.isArray(inject)) for (const name of inject) result[name] = null
+else for (const name of Object.keys(inject)) result[name] = inject[name] ?? null
+```
+它把 `required` 和 `optional` 当成**两个服务名**去等 ⇒ 永远 pending
+⇒ 插件不启动 ⇒ **所有 `/cs-bots/api/*` 全 404/405** ⇒ 选目录、保存全崩。
+
+**修法：不声明 inject，改运行时探测 + 有限次重试（10×500ms）**。
+插件必须在宿主服务缺失时也能启动；拿不到 `workspaceRegistry` 只是少个左侧栏分组。
+
+### Fixed · 并发注册（测试抓到的真问题）
+
+启动时后台轮询登记 与 `POST /workspaces/tidy` 会同时建目录
+⇒ 并发峰值 **2** ⇒ 同一路径可能注册两次（`domain inconsistent` 的成因）。
+
+修法：`globalThis.__csBotsWorkspaceRegLock` 模块级互斥锁，横跨 index.js 与 api.js。
+
+### Fixed · 「默认是自动获取系统安装目录，不是 C:\Users\你\...」
+
+前端曾用 `C:\Users\你\.dsh\cs-bots` 这种**假占位路径**兜底 —— 那个「你」不是真用户名。
+
+真实路径只有后端知道（它有 `process.env`）。已移除前端瞎猜，改用
+`diagnostics.defaultRoot`（后端按 `DSH_HOME → USERPROFILE → HOME → os.homedir()` 算出）。
+
+### Fixed · 404 的错误提示看不出问题
+
+旧：`接口返回非 JSON（HTTP 404）` —— 用户完全不知道怎么办。
+新：`插件后端未就绪（HTTP 404）—— /cs-bots/api 路由不存在。常见原因：插件未启动/加载失败。
+请到「插件」页查看 cs-bots 状态，若显示 pending 或「未激活」，重启 dsh-web 后重试。`
+
+---
+
 ## [0.13.2] - 2026-11-15
 
 ### Fixed · 引导页不能选目录、默认值为空（Boss 截图反馈）
