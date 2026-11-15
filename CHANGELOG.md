@@ -13,6 +13,18 @@
 
 ---
 
+## [0.10.1] - 2026-11-14
+
+### Added
+
+- `POST /roster/rebuild`：在运行实例内重建 Bot 会话（独立进程拿不到宿主 `agents` 服务，
+  必须在实例内经 HTTP 触发）
+
+### Fixed
+
+- `POST /roster` 的 cwd 兜底：给了 `department` 就不再塞 `botWorkspaceRoot`，
+  否则 `ROSTER_CWD_CONFLICT` 直接 400
+
 ## [0.10.0] - 2026-11-14
 
 > 新增：Bot 主目录+部门模型（彻底解决 Bot 工作区归位问题）。
