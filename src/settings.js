@@ -14,6 +14,7 @@
 import { readJson, writeJsonAtomic, ensureDir, statePath } from './store.js'
 import { resolve, sep, isAbsolute, join } from 'node:path'
 import { sanitizeDirSegment } from './botdirs.js'
+import { homedir } from 'node:os'
 
 /** 设置项定义：默认值 + 校验。 */
 export const SETTING_SPECS = Object.freeze({
@@ -112,8 +113,42 @@ export const SETTING_SPECS = Object.freeze({
  * @returns {string} 归一化绝对路径
  */
 export function defaultBotWorkspaceRoot() {
-  const home = resolve(process.env.DSH_HOME || `${process.env.HOME ?? '.'}/.dsh`)
-  return join(resolve(home, '..'), 'cs-bots')
+  return join(resolve(dshHomeDir(), '..'), 'cs-bots')
+}
+
+/**
+ * 定位 `$DSH_HOME`（宿主数据目录）。
+ *
+ * ## ⚠️ 跨平台（2026-11-15 Windows 实测踩坑）
+ *
+ *   原实现是 `process.env.DSH_HOME || `${process.env.HOME ?? '.'}/.dsh``。
+ *   **Windows 上没有 `HOME` 环境变量**（用的是 `USERPROFILE`），
+ *   于是退化成 `'.'` ⇒ `resolve('.', '.dsh')` = **当前工作目录下的 .dsh**，
+ *   跟着启动目录乱跑 ⇒ 默认主目录算错 ⇒ 左侧栏分组登记到不存在的地方。
+ *
+ *   ⇒ 按平台优先级逐个试：DSH_HOME → USERPROFILE（Win）→ HOME（*nix）→ os.homedir() → '.'。
+ *
+ * @returns {string} 绝对路径
+ */
+function dshHomeDir() {
+  const explicit = process.env.DSH_HOME
+  if (typeof explicit === 'string' && explicit.trim()) return resolve(explicit.trim())
+  const candidates = [
+    process.env.USERPROFILE,     // Windows
+    process.env.HOMEDRIVE && process.env.HOMEPATH
+      ? `${process.env.HOMEDRIVE}${process.env.HOMEPATH}`   // Windows 旧式
+      : '',
+    process.env.HOME,            // macOS / Linux
+  ]
+  for (const c of candidates) {
+    if (typeof c === 'string' && c.trim()) return resolve(c.trim(), '.dsh')
+  }
+  // 最后兜底：Node 自己知道用户主目录（跨平台，Win 上是 C:\Users\<你>）
+  try {
+    const h = homedir()
+    if (typeof h === 'string' && h.trim()) return resolve(h, '.dsh')
+  } catch { /* 继续 */ }
+  return resolve('.dsh')
 }
 
 /** 默认设置。 */

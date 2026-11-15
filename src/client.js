@@ -3256,10 +3256,6 @@ window.__ModuleLoader__.load({
       // 部门管理（2026-11-15 Boss：「给我一个管理页面或者新增按钮」）
       const [manageOpen, setManageOpen] = useState(false)
       const [deptDraft, setDeptDraft] = useState([])
-      // 工作区整理（2026-11-15 Boss：「工作区这里只有一个 CS-bots，可向下展开」）
-      const [tidyOpen, setTidyOpen] = useState(false)
-      const [tidyMode, setTidyMode] = useState('stale')
-      const [tidyResult, setTidyResult] = useState(null)
 
       const depts = data?.departments ?? []
       const active = depts.find((d) => d.id === activeId) ?? depts[0] ?? null
@@ -3331,25 +3327,6 @@ window.__ModuleLoader__.load({
         }
       }
 
-      // 整理工作区：登记主目录分组 + 移除多余的工作区登记（保留文件与会话）
-      const tidyWorkspaces = async () => {
-        setBusy(true)
-        setTidyResult(null)
-        try {
-          const r = await call('/workspaces/tidy', { method: 'POST', body: { confirm: true, mode: tidyMode } })
-          setTidyResult(r)
-          setMsg({
-            kind: r.rootRegistered?.ok ? 'ok' : 'err',
-            text: r.note ?? '已整理',
-          })
-          reload()
-        } catch (e) {
-          setMsg({ kind: 'err', text: `整理工作区失败：${e.message}` })
-        } finally {
-          setBusy(false)
-        }
-      }
-
       // 保存部门清单（增/删/改名都走这一个端点，它自带「有 Bot 不许删」保护）
       const saveDepts = async (list) => {
         setBusy(true)
@@ -3388,13 +3365,7 @@ window.__ModuleLoader__.load({
             h('button', {
               className: 'csb-btn csb-btn-s',
               onClick: () => { setDeptDraft(depts.map((d) => ({ id: d.id, name: d.name }))); setManageOpen(true) },
-            }, '⚙ 管理部门'),
-            // 左侧栏整理：把 <主目录> 登记成一个可展开的分组，并清掉多余分组
-            h('button', {
-              className: 'csb-btn csb-btn-s',
-              title: '让左侧栏只保留一个 CS-bots（可向下展开），并清掉旧 Bot 的空分组',
-              onClick: () => { setTidyResult(null); setTidyOpen(true) },
-            }, '🗂 整理工作区')),
+            }, '⚙ 管理部门')),
           h('div', { style: { marginTop: 10 } },
             depts.map((d) => h('div', {
               key: d.id,
@@ -3460,48 +3431,6 @@ window.__ModuleLoader__.load({
               h('div', { className: 'csb-fld-h', style: { marginTop: 4 } },
                 '「＋ 安排工作」把这句话直接变成任务，派给本部门的 Bot —— 说话与派活一步完成。'))
             : null),
-        // 工作区整理弹窗
-        tidyOpen
-          ? h(Modal, {
-            title: '整理工作区（左侧栏）',
-            onClose: () => setTidyOpen(false),
-            footer: [
-              h('button', { key: 'c', className: 'csb-btn', onClick: () => setTidyOpen(false) }, '关闭'),
-              h('button', {
-                key: 'ok', className: 'csb-btn csb-btn-p', disabled: busy, onClick: tidyWorkspaces,
-              }, busy ? '整理中…' : '开始整理'),
-            ],
-          },
-          h('div', { className: 'csb-set-d', style: { marginBottom: 10 } },
-            '宿主左侧栏是平铺的：每个 Bot 一个目录就等于多一条分组。'
-            + '整理会把「Bot 主目录」登记成一个**可向下展开**的父分组，'
-            + '并移除多余的分组登记 —— **文件与会话都不删**，只是不再占左侧栏。'),
-          h('div', { className: 'csb-fld' },
-            h('label', null, '整理范围'),
-            h('label', { className: 'csb-bar', style: { gap: 6, cursor: 'pointer', marginBottom: 4 } },
-              h('input', {
-                type: 'radio', name: 'tidymode', checked: tidyMode === 'stale',
-                onChange: () => setTidyMode('stale'),
-              }),
-              h('span', null, '只清旧 Bot 目录（推荐）—— 保留 output2026 等项目目录')),
-            h('label', { className: 'csb-bar', style: { gap: 6, cursor: 'pointer' } },
-              h('input', {
-                type: 'radio', name: 'tidymode', checked: tidyMode === 'all',
-                onChange: () => setTidyMode('all'),
-              }),
-              h('span', null, '全部清掉，只留 CS-bots —— 会话会变成「未分组」，但不会丢'))),
-          tidyResult
-            ? h('div', { style: { marginTop: 10, maxHeight: 220, overflow: 'auto' } },
-              h('div', { className: 'csb-set-d' },
-                `登记主目录：${tidyResult.rootRegistered?.ok ? '✅' : '❌' + (tidyResult.rootRegistered?.reason ?? '')}`
-                + ` · 移除 ${tidyResult.removed ?? 0} 个分组`
-                + (tidyResult.failed ? ` · 失败 ${tidyResult.failed}` : '')),
-              (tidyResult.results ?? []).map((x, i) => h('div', {
-                key: i, className: 'csb-set-d', style: { fontSize: 11.5, padding: '2px 0' },
-              }, `${x.removed ? '🗑' : '·'} ${x.path}${x.sessions ? `（${x.sessions} 会话）` : ''}${x.reason ? ' — ' + x.reason : ''}`)))
-            : null)
-          : null,
-
         // 部门管理弹窗
         manageOpen
           ? h(Modal, {
@@ -3596,10 +3525,6 @@ window.__ModuleLoader__.load({
     function TasksTab({ onGoto, sourceFilter = 'human' }) {
       // 「去对话」面板（2026-11-14 Boss：任务管理页顶部要有去对话按钮）
       const [convOpen, setConvOpen] = useState(false)
-      // 建 Bot 时就地新增部门（2026-11-15 Boss：部门下拉里没有新增入口）
-      const [newDeptOpen, setNewDeptOpen] = useState(false)
-      const [newDept, setNewDept] = useState({ id: '', name: '' })
-      const [newDeptBusy, setNewDeptBusy] = useState(false)
       const [filter, setFilter] = useState('')
       const [subject, setSubject] = useState('')
       const [desc, setDesc] = useState('')
@@ -4665,6 +4590,12 @@ window.__ModuleLoader__.load({
     // ── Bot ─────────────────────────────────────────────────────────────────
 
     function BotsTab() {
+      // ⚠️ 2026-11-15 修：这三个状态原先被误放在 TasksTab 里，
+      //    而真正用它们的是 BotsTab ⇒ 页面报 `newDeptOpen is not defined`。
+      //    教训：加状态时先确认**它属于哪个组件**，别按「我最后改到哪」放。
+      const [newDeptOpen, setNewDeptOpen] = useState(false)
+      const [newDept, setNewDept] = useState({ id: '', name: '' })
+      const [newDeptBusy, setNewDeptBusy] = useState(false)
       const { data, loading, error, reload } = useApi('/roster?includeRetired=1')
       const { data: presetData } = useApi('/presets')
       // 主目录 + 部门（2026-11-13 Boss 需求）：建 Bot 时选部门，目录自动派生。

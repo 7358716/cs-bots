@@ -13,6 +13,39 @@
 
 ---
 
+## [0.12.7] - 2026-11-15
+
+### Fixed · Windows 上「没有左侧栏 CS-BOTS」（主目录退化到当前工作目录）
+
+`defaultBotWorkspaceRoot()` 原来这样找 DSH_HOME：
+
+```js
+const home = resolve(process.env.DSH_HOME || `${process.env.HOME ?? '.'}/.dsh`)
+```
+
+**Windows 没有 `HOME`**（用 `USERPROFILE`）⇒ 退化成 `'.'`
+⇒ `resolve('.', '.dsh')` = **当前工作目录下的 .dsh**
+⇒ 默认主目录跟着启动目录乱跑 ⇒ 左侧栏分组登记到不确定的位置 ⇒ **Win 上看不到 CS-bots 分组**。
+
+修法：按平台优先级逐个试
+`DSH_HOME` → `USERPROFILE`（Win）→ `HOMEDRIVE+HOMEPATH` → `HOME`（*nix）→ `os.homedir()`。
+
+### Fixed · 「团队/Bot 档案」页报 `newDeptOpen is not defined`
+
+状态声明被误放在 `TasksTab`，而真正用它们的是 `BotsTab` ⇒ 渲染 BotsTab 时标识符不在作用域。
+
+**教训**：加状态时先确认它属于哪个组件，别按「我最后改到哪」放。
+
+新增静态测试 `test/client-scope.test.mjs`：把每个组件函数体切出来，
+断言用到的状态必须在**同一组件内**声明。变异验证过（还原 bug ⇒ 3 条全红）。
+
+### Removed · 「🗂 整理工作区」UI 入口
+
+Boss：「整理工作区不需要」。移除按钮与弹窗。
+后端 `POST /workspaces/tidy` 保留（运维可用，不影响 UI）。
+
+---
+
 ## [0.12.5] - 2026-11-15
 
 ### Fixed · Windows 兼容：旧目录前缀不再写死成 Linux 路径
