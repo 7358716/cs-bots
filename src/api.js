@@ -2923,7 +2923,16 @@ export function installApi(ctx, { warn } = {}) {
             const profile = b.profile ?? {}
             const oldSession = b.sessionId
             const root = String(services.settings?.botWorkspaceRoot ?? '').replace(/\/+$/, '')
-            const dept = String(b.cwd ?? '').slice(root.length + 1).split('/')[0] || depts[0]?.id
+            // ⚠️ 只有当 cwd **真的在 root 之下**时才能用 department 派生。
+            //    实测踩过：插件发布管理员的 cwd 是 /home/ubuntu/output2026/butlers/dev/cs-bots
+            //    （刻意留在插件源码目录发布用），按 root 切片切出 "26" ⇒
+            //    「部门 "26" 不存在」⇒ 重建失败，而退役已经执行了 ⇒ 必须人工救。
+            //    ⇒ 不在 root 下的，直接用**原 cwd** 重建，不碰 department。
+            const botCwd = String(b.cwd ?? '').replace(/\/+$/, '')
+            const underRoot = botCwd.startsWith(`${root}/`)
+            const dept = underRoot
+              ? (botCwd.slice(root.length + 1).split('/')[0] || depts[0]?.id)
+              : null
             try {
               r.retire({ id: b.id, byId: 'ui', reason: '方案B：重建会话以修复工作区归属' })
             } catch (error) {
@@ -2933,7 +2942,8 @@ export function installApi(ctx, { warn } = {}) {
             try {
               const created = await r.create({
                 name: b.name,
-                department: dept,
+                // 二选一：在 root 下用 department 派生；不在 root 下沿用原 cwd
+                ...(dept ? { department: dept } : { cwd: botCwd }),
                 byId: 'ui',
                 ...(b.preset ? { preset: b.preset } : {}),
                 ...(b.label ? { label: b.label } : {}),

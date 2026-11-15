@@ -138,3 +138,38 @@ test('rebuild：批量模式只动「住在主目录下且能对上部门」的 
     assert.ok(!names.includes('手工目录岗'), '手工 cwd 的不该被批量重建')
   } finally { h.cleanup() }
 })
+
+test('rebuild：★ cwd 不在主目录下的 Bot，按原 cwd 重建（不能切成 "26" 这种垃圾部门）', async () => {
+  // 实测踩过：插件发布管理员的 cwd 是 /home/ubuntu/output2026/butlers/dev/cs-bots
+  // （刻意留在插件源码目录发布用）。旧实现按 root.length 切片 ⇒ 切出 "26"
+  // ⇒ 「部门 "26" 不存在」⇒ 重建失败，而退役已执行 ⇒ 必须人工救。
+  const h = boot()
+  try {
+    const outside = join(h.stateDir, 'outside-plugin-src')
+    const c = await h.req('POST', '/roster', { name: '源码目录岗', cwd: outside, byId: 'ui' })
+    assert.equal(c.status, 200, JSON.stringify(c.json))
+    const oldSid = c.json.bot.sessionId
+    assert.equal(c.json.bot.cwd, outside, '前提：cwd 确实不在主目录下')
+
+    const r = await h.req('POST', '/roster/rebuild', { confirm: true, name: '源码目录岗' })
+    assert.equal(r.status, 200, JSON.stringify(r.json))
+    assert.equal(r.json.rebuilt, 1, `应重建成功，实际：${JSON.stringify(r.json.results)}`)
+    const row = r.json.results[0]
+    assert.equal(row.status, 'ok')
+    assert.notEqual(row.to, oldSid, '应换新会话')
+    assert.equal(row.cwd, outside, 'cwd 必须沿用原来的，不能被改到别处')
+    assert.equal(row.department, null, '不在主目录下的不该有部门')
+  } finally { h.cleanup() }
+})
+
+test('rebuild：在主目录下的 Bot 仍按 department 派生（不受上面修复影响）', async () => {
+  const h = boot()
+  try {
+    const c = await h.req('POST', '/roster', { name: '部门内岗', department: 'dev', byId: 'ui' })
+    const r = await h.req('POST', '/roster/rebuild', { confirm: true, name: '部门内岗' })
+    assert.equal(r.json.rebuilt, 1)
+    const row = r.json.results[0]
+    assert.equal(row.department, 'dev')
+    assert.ok(String(row.cwd).includes('/dev/'), `cwd 应在部门下，实际 ${row.cwd}`)
+  } finally { h.cleanup() }
+})

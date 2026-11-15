@@ -13,6 +13,29 @@
 
 ---
 
+## [0.12.4] - 2026-11-15
+
+### Fixed · `/roster/rebuild` 把「不在主目录下的 Bot」切成垃圾部门
+
+实测：`插件发布管理员` 的 cwd 是 `/home/ubuntu/output2026/butlers/dev/cs-bots`
+（刻意留在插件源码目录发布用，不在 `/home/ubuntu/cs-bots` 下）。
+
+旧实现按 `root.length` 切片取部门 ⇒ `"26"` ⇒
+「部门 "26" 不存在（可选：dev | qa | ops）」⇒ **重建失败**，
+而**退役已经执行了** ⇒ Bot 变成「已退役但未重建」，必须人工救。
+
+修法：
+```js
+const underRoot = botCwd.startsWith(`${root}/`)
+const dept = underRoot ? botCwd.slice(root.length + 1).split('/')[0] : null
+// 在 root 下 → 用 department 派生；不在 → 沿用原 cwd
+```
+
+测试钉住两种情况（在 root 下 / 不在 root 下），并断言后者
+`cwd` 保持不变、`department` 为 `null`。
+
+---
+
 ## [0.12.3] - 2026-11-15
 
 ### Fixed · 部门字典外的目录没有文件夹（Bot 会挂在根下）
