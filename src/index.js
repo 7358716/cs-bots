@@ -40,6 +40,34 @@ import { probeHost, formatReport } from './compat.js'
 export const name = 'cs-bots'
 
 /**
+ * 插件依赖声明（2026-11-15 Windows 实测：缺这个会导致左侧栏分组永远登记不上）。
+ *
+ * ## 为什么必须声明
+ *
+ *   Cordis 的插件可以声明 `inject`，宿主会**等这些服务就绪**才调 `apply`。
+ *   不声明 ⇒ `apply` 在宿主服务还没装配好时就被调用 ⇒
+ *   `ctx.get('workspaceRegistry')` 拿到 `undefined`。
+ *
+ *   我们用了 `ctx.inject(['workspaceRegistry'], cb)` 想「等就绪」，
+ *   但 **`ctx.inject` 依赖父 fiber 处于活跃状态**；如果 apply 本身跑在
+ *   一个「服务缺失」的上下文里，它的回调可能永远不触发
+ *   （实测：Linux 上侥幸能跑，Windows 上分组始终不出现）。
+ *
+ * ## 声明了就一定等到
+ *
+ *   宿主 `dsh-workspace` 自己就是这么写的（`lib/index.js:355`）：
+ *     `static inject = ["storageDomain", "sessionPersistence"]`
+ *
+ *   ⇒ 这里声明软依赖。**用 `optional` 语义**：即便某个宿主版本没提供
+ *   workspaceRegistry，插件也要能起来（左侧栏少个分组，但任务板/房间照常可用）——
+ *   所以不用硬 inject 而是继续保留 `ctx.inject` 的容错路径。
+ */
+export const inject = {
+  required: [],
+  optional: ['workspaceRegistry'],
+}
+
+/**
  * Bot 会话中必须从工具表移除的工具（K1）。
  *
  * 一手依据（ds-bot 已踩过此坑，`ds-bot/src/host/tools.js:708-713` 注释原文）：

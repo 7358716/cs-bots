@@ -15,7 +15,7 @@
 import { readFileSync, readdirSync, statSync, existsSync, writeFileSync, renameSync, mkdirSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { join, resolve, sep as pathSep } from 'node:path'
-import { registerRoute, listPresets, ensureWorkspaceDir, listWorkspaceRecords, removeWorkspaceByPath, defaultPreset, getAgent, resumeSession, readSessionMessages, attachToWorkspace, readSessionWatermark, sessionMeta, capabilities } from './kernel.js'
+import { registerRoute, service, listPresets, ensureWorkspaceDir, listWorkspaceRecords, removeWorkspaceByPath, defaultPreset, getAgent, resumeSession, readSessionMessages, attachToWorkspace, readSessionWatermark, sessionMeta, capabilities } from './kernel.js'
 import { createLibrary } from './library.js'
 import { createDirBrowser } from './dirbrowse.js'
 import { getServices } from './registry.js'
@@ -2364,7 +2364,40 @@ export function installApi(ctx, { warn } = {}) {
         } catch (error) {
           host = { error: String(error?.message ?? error) }
         }
-        const out = { ok: true, services: {}, compat: services.compat ?? null, host }
+        // ── 工作区分组诊断（2026-11-15 Windows 实测：分组不显示，远程无法排查）───
+        //
+        // 之前 Boss 在 Win 上报「左侧栏没有 CS-BOTS」，我只能靠猜。
+        // 这里把**判断所需的全部事实**一次报出来，一条 GET /status 即可定位。
+        let workspaceGroup = null
+        try {
+          const root = String(services.settings?.botWorkspaceRoot ?? '').trim()
+          const reg = (() => { try { return service(ctx, 'workspaceRegistry') } catch { return undefined } })()
+          const records = listWorkspaceRecords()
+          const hit = root ? records.find((w) => w.path === root) : undefined
+          let resolveOk = null
+          if (reg && root) {
+            try { resolveOk = Boolean(await reg.resolveByPath(root)) } catch { resolveOk = false }
+          }
+          workspaceGroup = {
+            root,
+            registryAvailable: Boolean(reg),
+            hasCreate: Boolean(reg && typeof reg.create === 'function'),
+            // ★ 这三个是判断「为什么没显示」的关键
+            listedInFile: Boolean(hit),        // 磁盘记录里有
+            resolvable: resolveOk,             // 宿主认得（内存态）
+            dirExists: root ? existsSync(root) : false,
+            totalRecords: records.length,
+            hint: !root ? '主目录为空 —— 设置没读到'
+              : !reg ? '宿主未提供 workspaceRegistry —— 插件拿不到建分组的服务'
+                : !existsSync(root) ? '主目录不存在 —— create 会抛，所以分组建不出来'
+                  : !hit ? '磁盘记录里没有这一条 —— 说明登记从未成功写过'
+                    : '看起来正常',
+          }
+        } catch (error) {
+          workspaceGroup = { error: String(error?.message ?? error) }
+        }
+
+        const out = { ok: true, services: {}, compat: services.compat ?? null, host, workspaceGroup }
         // 状态面要覆盖**全部**域服务：新增模块若不上报，页面「系统体检」就会
         // 显示「一切正常」而实际某功能没装配 —— 那是本平台最忌讳的静默失败。
         const SERVICE_KEYS = [

@@ -13,6 +13,47 @@
 
 ---
 
+## [0.13.1] - 2026-11-15
+
+### Fixed · 声明插件 `inject`（左侧栏分组在 Win 上始终不出现的根因）
+
+cs-bots **一直没有声明 `inject`**。Cordis 里不声明依赖 ⇒ `apply` 会在宿主服务
+装配好之前就被调用 ⇒ `ctx.get('workspaceRegistry')` 恒为 `undefined`。
+
+我们曾用 `ctx.inject(['workspaceRegistry'], cb)` 试图「等就绪」，但
+`ctx.inject` 依赖父 fiber 处于活跃状态；若 `apply` 跑在服务缺失的上下文里，
+它的回调**可能永远不触发** —— Linux 上侥幸能跑，Windows 上分组始终不出现。
+
+对照宿主自己的写法（`dsh-workspace/lib/index.js:355`）：
+```js
+static inject = ["storageDomain", "sessionPersistence"]
+```
+
+修法：在插件导出上声明**软依赖**（不硬卡，缺了也能起来）：
+```js
+export const inject = { required: [], optional: ['workspaceRegistry'] }
+```
+
+### Added · `GET /status` 增加工作区分组诊断
+
+Boss 在 Win 上报「左侧栏没有 CS-BOTS」时，远程只能靠猜。现在一条请求报出全部判断依据：
+
+```json
+"workspaceGroup": {
+  "root": "C:\\Users\\你\\.dsh\\cs-bots",
+  "registryAvailable": true,
+  "hasCreate": true,
+  "listedInFile": false,     // 磁盘记录里有没有
+  "resolvable": null,        // 宿主认不认
+  "dirExists": false,        // 目录存不存在
+  "hint": "主目录不存在 —— create 会抛，所以分组建不出来"
+}
+```
+
+`hint` 直接给出下一步动作，不用再反复试。
+
+---
+
 ## [0.13.0] - 2026-11-15
 
 ### Changed · 主目录默认改成 `$DSH_HOME` 的下级（Boss 定）
