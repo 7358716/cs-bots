@@ -17,7 +17,7 @@ import { createRoom } from './room.js'
 import { createMemory } from './memory.js'
 import { installTools } from './tools.js'
 import { setServices } from './registry.js'
-import { service, stateDir as kernelStateDir, onLlmStream, sessionMeta, readSessionWatermark as kernelWatermark, capabilities } from './kernel.js'
+import { service, stateDir as kernelStateDir, ensureWorkspaceDir, onLlmStream, sessionMeta, readSessionWatermark as kernelWatermark, capabilities } from './kernel.js'
 import { installLlmStreamHint } from './routing/hints.js'
 import { installApi } from './api.js'
 import { createDeliveryWatch, DEFAULT_GRACE_MS, DEFAULT_TICK_MS } from './delivery-watch.js'
@@ -180,6 +180,41 @@ function applyInner(ctx, config, { log, warn }) {
     // 需求出处：Boss 2026-11-15「先禁用，另外排查所有重启后的自动脚本」。
 
     // （原 auto-attach 代码已移除；需要时从 git 历史 3d980e4 找回）
+
+    // ── 左侧栏分层：把 Bot 主目录注册成一个 Workspace 分组（2026-11-15）──────
+    //
+    // ## 做什么
+    //   把 `<botWorkspaceRoot>`（默认 /home/ubuntu/cs-bots）注册成一个 Workspace。
+    //   宿主 `owningParentFolder()` 会自动把**它下面**的 Workspace 嵌套进这个分组
+    //   ⇒ 左侧栏从「每个 Bot 一条」变成「1 个 cs-bots 可展开」。
+    //
+    // ## 与上次事故的区别（这次为什么安全）
+    //   2026-11-15 的事故是：启动时对 14 个 Bot **并发** attachSession，
+    //   在 workspace 域未就绪时把同一路径注册两次 ⇒ domain inconsistent。
+    //   这次：
+    //     · **只建 1 个** Workspace（主目录本身），不碰任何 session
+    //     · **串行单次**，不循环
+    //     · 失败只 warn，不影响插件其他功能
+    //
+    // ## 幂等
+    //   `ensureWorkspaceDir` 内部先 resolveByPath，已存在就复用。
+    if (typeof ensureWorkspaceDir === 'function') {
+      const root = settings.botWorkspaceRoot
+      if (typeof root === 'string' && root.trim()) {
+        void (async () => {
+          try {
+            const r = await ensureWorkspaceDir(ctx, root.trim())
+            if (r.ok) {
+              if (r.created) log(`[cs-bots] 已把 Bot 主目录注册为 Workspace 分组：${root.trim()}`)
+            } else {
+              warn(`[cs-bots] 未能注册 Bot 主目录分组（${root.trim()}）：${r.reason} —— 左侧栏会平铺显示，其他功能不受影响`)
+            }
+          } catch (error) {
+            warn(`[cs-bots] 注册 Bot 主目录分组异常：${error?.message ?? error}`)
+          }
+        })()
+      }
+    }
 
     // ── 宿主能力自检（t-40 · 插件安装场景）──────────────────────────────
     // 别人把 cs-bots 当插件装上去时，宿主不一定装配了全部能力。

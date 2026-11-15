@@ -600,6 +600,58 @@ export async function attachToWorkspace(ctx, cwd, sessionId) {
 }
 
 /**
+ * 确保某个目录被注册成一个 Workspace（**不挂任何 session**）。
+ *
+ * ## 为什么需要它（2026-11-15 左侧栏分层）
+ *
+ *   宿主 `dsh-client-ui-workspace` 的 `owningParentFolder()`（lib/client.js:1234）
+ *   会把「路径在某个已注册 Workspace 之下」的 Workspace **自动嵌套**进父分组：
+ *   ```js
+ *   const owner = owningParentFolder(child.path, parents)   // 最近的已注册祖先
+ *   ```
+ *   ⇒ 只要把 `<botsRoot>`（如 `/home/ubuntu/cs-bots`）注册成一个 Workspace，
+ *   它下面的 `<botsRoot>/dev/xxx`、`<botsRoot>/qa/yyy` 就会自动折进这一个分组里，
+ *   左侧栏从「N 个 Bot 各自一条」变成「1 个 cs-bots 可展开」。
+ *
+ *   **不需要改宿主 sidebar 的任何代码** —— 用的是宿主自己的嵌套能力。
+ *
+ * ## 为什么不顺手 attachSession
+ *
+ *   2026-11-15 事故：启动时对 14 个 Bot **并发**调 `attachToWorkspace`，
+ *   在 workspace 域未就绪时把同一路径注册了两次，导致
+ *   `workspace domain is inconsistent`、5 个组件未激活。
+ *   ⇒ 本函数**只建分组容器、只挂 0 个会话**，且由调用方**串行、单次**调用。
+ *   会话归属交给宿主在新会话创建时自己处理。
+ *
+ * ## 幂等与容错
+ *
+ *   - 已存在就复用（`resolveByPath` 命中）
+ *   - 拿不到 `workspaceRegistry`（老宿主/域未就绪）⇒ 返回 `{ ok:false, reason }`，
+ *     **绝不抛**，调用方据此降级（左侧栏少一层分组，但插件照常工作）
+ *
+ * @param {object} ctx
+ * @param {string} dir 绝对目录路径（必须已存在）
+ * @returns {Promise<{ok: boolean, created?: boolean, reason?: string}>}
+ */
+export async function ensureWorkspaceDir(ctx, dir) {
+  if (typeof dir !== 'string' || !dir.trim()) return { ok: false, reason: 'dir 为空' }
+  const registry = service(ctx, 'workspaceRegistry')
+  if (!registry) return { ok: false, reason: '宿主未提供 workspaceRegistry' }
+  try {
+    let existed
+    if (typeof registry.resolveByPath === 'function') {
+      existed = await registry.resolveByPath(dir)
+    }
+    if (existed) return { ok: true, created: false }
+    if (typeof registry.create !== 'function') return { ok: false, reason: 'registry 无 create' }
+    await registry.create(dir)
+    return { ok: true, created: true }
+  } catch (error) {
+    return { ok: false, reason: `建 Workspace 失败：${error?.message ?? error}` }
+  }
+}
+
+/**
  * 在既有持久会话上恢复 Agent（重启后复活会话用）。
  *
  * ⚠️ resume 也必须传 `setup`（2026-11-09 同源修复）。

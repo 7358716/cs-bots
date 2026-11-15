@@ -13,6 +13,52 @@
 
 ---
 
+## [0.11.0] - 2026-11-15
+
+### Added · 部门管理（Boss：「按部门管理」）
+
+- **部门增删改**：`POST /departments/save`
+  - **有 Bot 的部门不许删** —— 否则那些 Bot 的 cwd 指向字典里不存在的部门，
+    下次派生路径会 `BOT_DEPT_UNKNOWN`。返回 400 并逐条列出「哪些 Bot 需要先迁走」。
+  - **改名同步团队名** —— `depttree` 用「团队名 = 部门名」查找，不同步就对不上。
+- **两个入口**：部门页「⚙ 管理部门」；建 Bot 表单的部门下拉底部固定「＋ 新增部门…」
+  （就地填 id + 显示名，保存后自动选中，不用先跑去别的页面）。
+
+### Added · 部门群聊 + 「在群聊里安排工作」（Boss 设计初衷）
+
+`src/depttree.js`：
+- `ensureDeptTeam`：部门 → 团队（`type=big`, `kind=human`）
+- `ensureDeptRoom`：部门 → 群聊房间（**`everyone` 模式**，全员可发言）
+- `buildDeptTree`：三层树（部门 → Bot），**只读**，缺的如实告警不静默
+
+**房间就是群聊**（`room.js` 文件头：「房间与群聊」）—— 不是两个概念。
+区别只在 `mode`：`everyone` 全员可发言（部门群聊用这个），`admin` 只有群主。
+
+UI「部门」子页签：左列部门、右侧该部门 Bot + 群聊消息 +
+**「＋ 安排工作」**（把当前这句话直接变成任务派给本部门 Bot，并在群里留痕）。
+
+### Added · 左侧栏分层（Boss：「左侧栏 Csbots 一个页面」）
+
+`kernel.ensureWorkspaceDir`：把 `<botWorkspaceRoot>` 注册成一个 Workspace。
+宿主 `owningParentFolder()`（`dsh-client-ui-workspace/lib/client.js:1234`）会把
+它下面的 Workspace **自动嵌套**进这个分组 ⇒ 左侧栏从「每个 Bot 一条」
+变成「1 个 cs-bots 可展开」。**不需要改宿主 sidebar 任何代码。**
+
+⚠️ 与 0.10.2 事故的区别（这次为什么安全）：
+- 0.10.2 移除的那段是「启动时对 14 个 Bot **并发** attachSession」，
+  在 workspace 域未就绪时把同一路径注册两次 → `domain inconsistent`
+- 这次：**只建 1 个** Workspace（主目录本身）、**串行单次**、**不碰任何 session**、
+  失败只 warn。测试专门钉住「不挂 session」这条。
+
+### 踩到并修掉的三个真实约束
+
+① `teams.create` 的 `leadId` **必填** —— 部门刚建没 Bot 时会 400 ⇒ 用 Boss 兜底
+② `leadId` **不能**同时出现在 `memberIds`（「会形成自引用」）⇒ 建团队前剔除负责人
+③ `ensureDeptRoom` 返回的 `team` 是建团队时的**旧快照**（那时还没有 roomId）
+   ⇒ 改为返回刷新后的团队，否则调用方读到 `roomId === undefined`
+
+---
+
 ## [0.10.2] - 2026-11-15
 
 ### Fixed · 禁用启动期自动重挂工作区（**严重**）
