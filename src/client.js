@@ -8640,6 +8640,22 @@ window.__ModuleLoader__.load({
 
     function Workbench() {
       const [tab, setTab] = useState('workspace')
+
+      // ── 首次引导：必须先选工作区才能进其它页（2026-11-15 Boss 要求）────────
+      //
+      // Boss 原话：「首次进入 cs-bots 协作管理页面提示选定工作区，
+      //            选择完成后再进行下一步工作，默认 C:\Users\你\.dsh 的下级」
+      //
+      // 判据来自后端 `diagnostics.needsOnboarding`（用户从没在设置文件里写过主目录）。
+      // **不能用「默认值是否为空」判断** —— 默认值永远非空，那样永远判断不出来。
+      const settingsQ = useApi('/settings')
+      const onboarded = settingsQ.data?.diagnostics?.needsOnboarding === false
+      const defaultRoot = settingsQ.data?.diagnostics?.defaultRoot
+        ?? settingsQ.data?.values?.botWorkspaceRoot ?? ''
+      const [rootDraft, setRootDraft] = useState(null)
+      const [onboardBusy, setOnboardBusy] = useState(false)
+      const [onboardErr, setOnboardErr] = useState(null)
+      const rootValue = rootDraft ?? defaultRoot
       const [view, setView] = useState(null)
       // 跨页签定位参数（契约 §3.2 第 6 条）：`onGoto('team', { roomId, seq })`
       // 由 goTab 的第二参数带入，RoomsTab 据此选中房间并高亮/滚动到那条消息。
@@ -8650,6 +8666,22 @@ window.__ModuleLoader__.load({
       const views = viewsOf(current)
       const activeView = views.find((v) => v.id === view) ?? views[0]
       const Comp = activeView.Comp
+
+      // 选好工作区（写盘）后才放行
+      const confirmRoot = async () => {
+        const v = String(rootValue ?? '').trim()
+        if (!v) { setOnboardErr('请填写一个绝对路径'); return }
+        setOnboardBusy(true)
+        setOnboardErr(null)
+        try {
+          await call('/settings', { method: 'POST', body: { botWorkspaceRoot: v } })
+          settingsQ.reload()
+        } catch (e) {
+          setOnboardErr(`保存失败：${e.message}`)
+        } finally {
+          setOnboardBusy(false)
+        }
+      }
 
       // 切主页签时把子视图重置为该页签的第一个
       const goTab = (id, opts) => {
@@ -8674,6 +8706,52 @@ window.__ModuleLoader__.load({
           tasks: 'workspace', bots: 'team', rooms: 'team', teams: 'team', artifacts: 'workspace',
         })[id] ?? id
         goTab(mapped, opts)
+      }
+
+      // ── 首次引导：没有显式选过工作区 ⇒ 拦住，只显示引导页 ──────────────
+      // 加载中不闪引导（否则每次进页面都闪一下）
+      if (settingsQ.loading && !settingsQ.data) {
+        return h('div', { className: 'csb' }, h(Skeleton, { n: 3 }))
+      }
+      if (!onboarded) {
+        return h('div', { className: 'csb' },
+          h('div', { className: 'csb-head' },
+            h('div', { className: 'csb-hrow' },
+              h('h2', null, '开始使用 · 选定工作区'),
+              h('span', { className: 'csb-hint' }, '第一步，之后才能建 Bot、派活'))),
+          h(Section, {
+            title: '先选一个工作区',
+            desc: '这是所有 Bot 的落地目录。Bot 会在这里按「部门 / 名字」各自建子目录。',
+          }),
+          h('div', { className: 'csb-fld', style: { marginTop: 12 } },
+            h('label', null, '工作区根目录（绝对路径）'),
+            h('input', {
+              className: 'csb-in', style: { width: '100%', maxWidth: 620 },
+              value: rootValue,
+              placeholder: defaultRoot || '例如 C:\\Users\\你\\.dsh\\cs-bots',
+              onChange: (e) => setRootDraft(e.target.value),
+              onKeyDown: (e) => e.key === 'Enter' && confirmRoot(),
+            }),
+            h('div', { className: 'csb-fld-h' },
+              defaultRoot
+                ? `默认：${defaultRoot}（选它直接点下面的按钮即可）`
+                : '填一个你希望 Bot 落地的绝对路径')),
+          h('div', { className: 'csb-bar', style: { marginTop: 12 } },
+            h('button', {
+              className: 'csb-btn csb-btn-p',
+              disabled: onboardBusy || !String(rootValue ?? '').trim(),
+              onClick: confirmRoot,
+            }, onboardBusy ? '保存中…' : '就用这个，开始使用'),
+            defaultRoot && rootValue !== defaultRoot
+              ? h('button', {
+                className: 'csb-btn',
+                onClick: () => setRootDraft(defaultRoot),
+              }, '恢复默认')
+              : null),
+          onboardErr ? h('div', { className: 'csb-err', style: { marginTop: 8 } }, onboardErr) : null,
+          h('div', { className: 'csb-fld-h', style: { marginTop: 14 } },
+            '选定后会写进设置（`botWorkspaceRoot`）。之后可在「设置」页随时改。'
+            + '注意：改根目录不会自动搬迁已有 Bot 的文件。'))
       }
 
       return h('div', { className: 'csb' },

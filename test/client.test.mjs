@@ -228,8 +228,29 @@ test('B1 真实渲染 Workbench（需 jsdom+react，缺则 SKIP）', async (t) =
   const prevDocument = globalThis.document
   globalThis.window = dom.window
   globalThis.document = dom.window.document
-  // 让 fetch 可控：直接失败也无所谓，Tab 应显示错误而不是白屏
-  dom.window.fetch = () => Promise.reject(new Error('no-network-in-test'))
+  // 让 fetch 可控：**只给 /settings 一个「已引导完成」的响应**，
+  // 其它请求直接失败也无所谓，Tab 应显示错误而不是白屏。
+  //
+  // 为什么必须这么造：2026-11-15 加了「首次进入先选工作区」的引导页，
+  // 未引导时整个 Workbench 只渲染引导页（这是对的）。本测试要验证的是
+  // 「引导完成后各个页签都在」，所以得把引导标记成已完成。
+  dom.window.fetch = (url) => {
+    const u = String(url ?? '')
+    if (u.includes('/settings')) {
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          ok: true,
+          values: { botWorkspaceRoot: '/home/ubuntu/cs-bots' },
+          effective: { botWorkspaceRoot: '/home/ubuntu/cs-bots' },
+          specs: {},
+          diagnostics: { file: '', source: 'file', badKeys: [], needsOnboarding: false, defaultRoot: '/home/ubuntu/cs-bots' },
+        }),
+      })
+    }
+    return Promise.reject(new Error('no-network-in-test'))
+  }
   globalThis.fetch = dom.window.fetch
 
   let captured = null

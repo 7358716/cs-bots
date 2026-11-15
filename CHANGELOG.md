@@ -13,6 +13,41 @@
 
 ---
 
+## [0.13.0] - 2026-11-15
+
+### Changed · 主目录默认改成 `$DSH_HOME` 的下级（Boss 定）
+
+Boss：「以后都不用同级目录，在 `C:\Users\你\.dsh` 的下级也可以…
+默认 `C:\Users\你\.dsh` 的下级，目录名称也是 cs-bots」
+
+| | 旧 | 新 |
+|---|---|---|
+| Windows | `C:\Users\你\cs-bots` | **`C:\Users\你\.dsh\cs-bots`** |
+| Linux | `/home/ubuntu/cs-bots` | **`/home/ubuntu/.dsh/cs-bots`** |
+
+### Changed · 取消「不得落在 $DSH_HOME 内」的限制
+
+旧限制的理由是「别让 Bot 写坏宿主数据」。但现在**默认值本身就在 `.dsh` 里**，
+再禁就等于「默认值自己不合法」。既然 `.dsh\cs-bots` 是和 `sessions/`、`storages/`
+平级的**专用子目录**，尊重这个选择。
+
+**仍然强制**：必须是绝对路径、非空。
+
+### Added · 首次引导：先选工作区才能继续
+
+Boss：「首次进入 cs-bots 协作管理页面提示选定工作区，选择完成后再进行下一步工作」
+
+- 判据来自 `loadSettings` 新增的 `diagnostics.needsOnboarding`
+  —— **看设置文件里有没有写 `botWorkspaceRoot` 这个键**，
+  不能看值是否为空（它有默认值，永远非空，那样永远判断不出「没选过」）
+- 未引导时整个 Workbench 只渲染引导页，其它页签全部拦住
+- 引导页预填默认路径，一键「就用这个，开始使用」，也可手填
+- 保存后写盘 → `needsOnboarding` 变 false → 放行
+
+测试覆盖：无文件 / 有文件但没写该键 / 已写该键 / 写在 `.dsh` 下级 四种情况。
+
+---
+
 ## [0.12.8] - 2026-11-15
 
 ### Fixed · Windows 首次安装时左侧栏完全不显示 CS-BOTS（致命）

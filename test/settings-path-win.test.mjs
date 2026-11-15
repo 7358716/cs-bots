@@ -28,9 +28,9 @@ function computeWith(env) {
   }).trim()
 }
 
-test('默认主目录：DSH_HOME 显式设置时按其父级算', () => {
+test('默认主目录：DSH_HOME 显式设置时取它的**下级** cs-bots（2026-11-15 Boss 定）', () => {
   const out = computeWith({ DSH_HOME: '/opt/mydsh' })
-  assert.equal(out, '/opt/cs-bots')
+  assert.equal(out, '/opt/mydsh/cs-bots', '不再用同级目录，改为 .dsh 的下级')
 })
 
 test('★ Windows：没有 HOME 但有 USERPROFILE 时，不能退化成 "."', () => {
@@ -42,12 +42,12 @@ test('★ Windows：没有 HOME 但有 USERPROFILE 时，不能退化成 "."', (
   assert.ok(!/^\/cs-bots$/.test(out), '绝不能算成根下的 /cs-bots（那就是 "." 退化的结果）')
 })
 
-test('Linux/macOS：有 HOME 时按其父级算（原有行为不变）', () => {
+test('Linux/macOS：有 HOME 时取 .dsh 的下级', () => {
   const out = computeWith({ HOME: '/home/alice' })
-  assert.equal(out, '/home/alice/cs-bots', '.dsh 是 /home/alice/.dsh，父级是 /home/alice')
+  assert.equal(out, '/home/alice/.dsh/cs-bots', '.dsh 的下级，名字仍叫 cs-bots')
 })
 
 test('DSH_HOME 优先级最高（即使同时有 USERPROFILE/HOME）', () => {
   const out = computeWith({ DSH_HOME: '/explicit/dsh', USERPROFILE: '/fake/win', HOME: '/home/alice' })
-  assert.equal(out, '/explicit/cs-bots')
+  assert.equal(out, '/explicit/dsh/cs-bots')
 })

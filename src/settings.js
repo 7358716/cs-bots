@@ -113,7 +113,11 @@ export const SETTING_SPECS = Object.freeze({
  * @returns {string} 归一化绝对路径
  */
 export function defaultBotWorkspaceRoot() {
-  return join(resolve(dshHomeDir(), '..'), 'cs-bots')
+  // 2026-11-15 Boss 定：**不再用同级目录，改为 $DSH_HOME 的下级**
+  //   旧：`<DSH_HOME 的父级>/cs-bots`   → C:\Users\你\cs-bots
+  //   新：`<DSH_HOME>/cs-bots`          → C:\Users\你\.dsh\cs-bots
+  // 目录名仍是 `cs-bots`。
+  return join(resolve(dshHomeDir()), 'cs-bots')
 }
 
 /**
@@ -228,8 +232,14 @@ export function validateSetting(key, raw) {
     return { ok: true, value: { ...raw } }
   }
   if (spec.path) {
-    // 工作区目录：必须是绝对路径，且不得落在 $DSH_HOME 子树内
-    //（那是宿主数据/凭据目录，Bot 写进去就是数据污染 —— 与 roster.js 的 cwd 校验同口径）。
+    // 工作区目录：必须是绝对路径。
+    //
+    // ⚠️ 2026-11-15 Boss 定：**取消「不得落在 $DSH_HOME 内」这条限制**。
+    //   原因：默认值本身就改成 `<DSH_HOME>/cs-bots` 了，再禁 $DSH_HOME 子树
+    //   就等于「默认值自己不合法」。
+    //   旧限制的担心（宿主数据/凭据被 Bot 写坏）依然成立，但既然用户主动选了
+    //   `.dsh\cs-bots` 这个专用子目录，就尊重这个选择 —— 它跟 sessions/storages
+    //   是平级隔离的，不是混在同一处。
     if (typeof raw !== 'string' || raw.trim() === '') {
       return { ok: false, reason: '工作区必须是非空字符串' }
     }
@@ -237,12 +247,7 @@ export function validateSetting(key, raw) {
     if (!isAbsolute(rawTrim)) {
       return { ok: false, reason: '工作区必须是绝对路径' }
     }
-    const dir = resolve(rawTrim)
-    const home = resolve(process.env.DSH_HOME || `${process.env.HOME ?? '.'}/.dsh`)
-    if (dir === home || dir.startsWith(home + sep)) {
-      return { ok: false, reason: '工作区必须是 $DSH_HOME 之外的绝对路径' }
-    }
-    return { ok: true, value: dir }
+    return { ok: true, value: resolve(rawTrim) }
   }
   const n = Number(raw)
   if (!Number.isFinite(n)) return { ok: false, reason: `${key} 必须是数字` }
@@ -272,6 +277,19 @@ export function loadSettings(stateDir) {
   } else if (stored !== undefined) {
     diagnostics.source = 'invalid'
   }
+
+  // ── 首次引导标记（2026-11-15 Boss：首次进入要提示选定工作区）──────────────
+  //
+  // 判据：设置文件里**没有写 botWorkspaceRoot 这个键** ⇒ 说明用户从没选过。
+  //   注意不能只看 `values.botWorkspaceRoot` —— 它有默认值，永远非空，
+  //   那样永远判断不出「没选过」。
+  //   也不能只看 diagnostics.source（用户可能改过别的设置、但没动主目录）。
+  const hasExplicitRoot = Boolean(
+    stored && typeof stored === 'object'
+    && typeof stored.botWorkspaceRoot === 'string' && stored.botWorkspaceRoot.trim() !== '',
+  )
+  diagnostics.needsOnboarding = !hasExplicitRoot
+  diagnostics.defaultRoot = values.botWorkspaceRoot
   return { values, diagnostics }
 }
 

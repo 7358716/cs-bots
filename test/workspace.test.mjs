@@ -165,21 +165,25 @@ test('settings：validateSetting(botWorkspaceRoot) 合法/非法边界', () => {
   assert.equal(nonString.ok, false)
 })
 
-test('settings：botWorkspaceRoot 不得落在 $DSH_HOME 内（含子树）', () => {
+test('settings：botWorkspaceRoot 允许落在 $DSH_HOME 内（2026-11-15 Boss 改规则）', () => {
+  // Boss 定：默认值就是 `<DSH_HOME>/cs-bots`，所以必须允许 .dsh 子树，
+  // 否则「默认值自己不合法」。旧限制（不得在 $DSH_HOME 内）已取消。
   const dshHome = resolve(process.env.DSH_HOME || `${process.env.HOME ?? '.'}/.dsh`)
-  const bad1 = validateSetting('botWorkspaceRoot', dshHome)
-  assert.equal(bad1.ok, false)
-  assert.equal(bad1.reason, '工作区必须是 $DSH_HOME 之外的绝对路径')
 
-  const bad2 = validateSetting('botWorkspaceRoot', join(dshHome, 'cs-bots', 'x'))
-  assert.equal(bad2.ok, false)
-  assert.equal(bad2.reason, '工作区必须是 $DSH_HOME 之外的绝对路径')
+  const sub = validateSetting('botWorkspaceRoot', join(dshHome, 'cs-bots'))
+  assert.equal(sub.ok, true, `.dsh 的下级应合法：${join(dshHome, 'cs-bots')}`)
+  assert.equal(sub.value, join(dshHome, 'cs-bots'))
 
-  // 与 DSH_HOME 平级的目录合法
+  const deeper = validateSetting('botWorkspaceRoot', join(dshHome, 'cs-bots', 'x'))
+  assert.equal(deeper.ok, true, '.dsh 的更深子树也应合法')
+
+  // 平级目录仍合法
   const sibling = resolve(dshHome, '..', 'CS-BOTS')
-  const ok = validateSetting('botWorkspaceRoot', sibling)
-  assert.equal(ok.ok, true, `平级目录应合法：${sibling}`)
-  assert.ok(!ok.value.startsWith(dshHome + sep))
+  assert.equal(validateSetting('botWorkspaceRoot', sibling).ok, true, `平级目录应合法：${sibling}`)
+
+  // **仍然必须**是绝对路径 + 非空
+  assert.equal(validateSetting('botWorkspaceRoot', '').ok, false)
+  assert.equal(validateSetting('botWorkspaceRoot', 'relative/path').ok, false)
 })
 
 test('settings：loadSettings 对非法值退回默认且记入 badKeys；不静默', () => {
@@ -187,7 +191,7 @@ test('settings：loadSettings 对非法值退回默认且记入 badKeys；不静
   try {
     const dshHome = resolve(process.env.DSH_HOME || `${process.env.HOME ?? '.'}/.dsh`)
     writeFileSync(join(stateDir, 'settings.json'), JSON.stringify({
-      botWorkspaceRoot: join(dshHome, 'illegal'),
+      botWorkspaceRoot: 'not-an-absolute-path',   // 真正非法：相对路径（.dsh 子树现在合法了）
       wipLimitPerBot: 99,
     }), 'utf8')
     const { values, diagnostics } = loadSettings(stateDir)
@@ -201,16 +205,24 @@ test('settings：loadSettings 对非法值退回默认且记入 badKeys；不静
   }
 })
 
-test('settings：saveSettings 拒绝 $DSH_HOME 内的工作区（不写半坏配置）', () => {
+test('settings：saveSettings 拒绝相对路径（不写半坏配置）；.dsh 子树现在允许', () => {
   const stateDir = mkdtempSync(join(tmpdir(), 'cs-bots-settings-save-'))
   try {
     const dshHome = resolve(process.env.DSH_HOME || `${process.env.HOME ?? '.'}/.dsh`)
-    const bad = saveSettings(stateDir, { botWorkspaceRoot: join(dshHome, 'x') })
+
+    // ① 相对路径仍必须拒绝
+    const bad = saveSettings(stateDir, { botWorkspaceRoot: 'relative/path' })
     assert.equal(bad.ok, false)
-    assert.equal(bad.reason, '工作区必须是 $DSH_HOME 之外的绝对路径')
+    assert.match(bad.reason, /绝对路径/)
     // 拒绝后不应落盘该键
     const { values } = loadSettings(stateDir)
     assert.equal(values.botWorkspaceRoot, SETTING_SPECS.botWorkspaceRoot.def)
+
+    // ② .dsh 的下级**现在允许**（2026-11-15 Boss 改规则，默认值就在这儿）
+    const inDsh = join(dshHome, 'cs-bots')
+    const okInDsh = saveSettings(stateDir, { botWorkspaceRoot: inDsh })
+    assert.equal(okInDsh.ok, true, `.dsh 的下级应可保存：${inDsh}`)
+    assert.equal(loadSettings(stateDir).values.botWorkspaceRoot, inDsh)
 
     const dir = mkdtempSync(join(tmpdir(), 'cs-bots-ws-ok-'))
     try {
