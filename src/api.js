@@ -2608,6 +2608,85 @@ export function installApi(ctx, { warn } = {}) {
         return
       }
 
+      // ── 部门增删改（2026-11-15 Boss：「给我一个管理页面或者新增按钮」）──────
+      //
+      // 部门存在 `settings.departments` 里，所以增删改本质是「改设置」。
+      // 但直接让人去改 settings 有两个坑，所以单独开一个端点：
+      //   ① **删部门时若还有 Bot，必须拒绝**（否则那些 Bot 的 cwd 会指向一个
+      //      字典里不存在的部门，下次派生路径时 BOT_DEPT_UNKNOWN）
+      //   ② 改部门名时，团队名（= 部门名）要一起改，否则「部门树」里对不上
+      if (request.method === 'POST' && path === '/departments/save') {
+        const { saveSettings } = await import('./settings.js')
+        const body = (await readBody(request)) ?? {}
+        const services = getServices(ctx)
+        const dir = services.board?.paths?.stateDir ?? services.roster?.paths?.stateDir
+        const current = Array.isArray(services.settings?.departments) ? services.settings.departments : []
+        const next = Array.isArray(body.departments) ? body.departments : null
+        if (!next) {
+          sendJson(response, 400, { ok: false, reason: 'DEPT_BAD_BODY', hint: 'departments 必须是数组' })
+          return
+        }
+
+        // ① 保护：被删掉的部门下面不能还有 Bot
+        const root = String(services.settings?.botWorkspaceRoot ?? '').replace(/\/+$/, '')
+        const bots = services.roster?.list?.() ?? []
+        const keptIds = new Set(next.map((d) => d?.id).filter(Boolean))
+        const removed = current.filter((d) => d && !keptIds.has(d.id))
+        const orphaned = []
+        for (const d of removed) {
+          if (!root) continue
+          const inDept = bots.filter((b) => typeof b?.cwd === 'string' && b.cwd.startsWith(`${root}/${d.id}/`))
+          if (inDept.length > 0) orphaned.push({ name: d.name, bots: inDept.map((b) => b.name) })
+        }
+        if (orphaned.length > 0) {
+          sendJson(response, 400, {
+            ok: false,
+            reason: 'DEPT_HAS_BOTS',
+            detail: orphaned,
+            hint: orphaned
+              .map((o) => `部门「${o.name}」还有 ${o.bots.length} 个 Bot（${o.bots.join('、')}），请先迁走或退役`)
+              .join('；'),
+          })
+          return
+        }
+
+        // ② 改名要同步团队名（团队名 = 部门名的约定，见 depttree.js）
+        const renames = []
+        for (const d of next) {
+          const old = current.find((x) => x && x.id === d?.id)
+          if (old && old.name !== d.name) renames.push({ id: d.id, from: old.name, to: d.name })
+        }
+
+        const saved = saveSettings(dir, { departments: next })
+        if (!saved.ok) {
+          sendJson(response, 400, { ok: false, reason: saved.reason })
+          return
+        }
+        // 内存态同步（不重启也能立刻看到新部门）
+        if (services.settings) services.settings.departments = next
+
+        const renameErrors = []
+        for (const r of renames) {
+          try {
+            const teams = services.teams?.list?.({ type: 'big' }) ?? []
+            const hit = teams.find((t) => t && t.name === r.from && t.status !== 'closed')
+            if (hit && typeof services.teams?.rename === 'function') {
+              services.teams.rename({ id: hit.id, name: r.to, expectedRev: hit.rev, by: body.by ?? 'ui' })
+            }
+          } catch (error) {
+            renameErrors.push(`团队改名失败（${r.from} → ${r.to}）：${error?.message ?? error}`)
+          }
+        }
+
+        sendJson(response, 200, {
+          ok: true,
+          departments: saved.values?.departments ?? next,
+          renames,
+          ...(renameErrors.length ? { warnings: renameErrors } : {}),
+        })
+        return
+      }
+
       // `POST /departments/ensure` —— 确保某部门的团队与群聊存在（幂等）
       //
       // 这是「进入部门群聊」时调的：先确保有，再打开。

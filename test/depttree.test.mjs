@@ -147,3 +147,22 @@ test('buildDeptTree：部门群聊建好后，树的 roomId 可查且 warnings �
   assert.ok(after.warnings.length < before, '建好一个部门后警告应变少')
   assert.ok(after.departments.find((d) => d.id === 'dev')?.roomId, 'dev 的 roomId 应可查')
 })
+
+// ── 部门管理：保护「有 Bot 的部门不许删」────────────────────────────────────
+
+test('部门管理：删部门前必须检查该部门下是否还有 Bot（cwd 前缀判定）', async (t) => {
+  const { services, depts, root } = setup(t)
+  await services.roster.create({ name: '开发执行岗', department: 'dev', byId: 'ui' })
+
+  const bots = services.roster.list()
+  const inDev = bots.filter((b) => typeof b?.cwd === 'string' && b.cwd.startsWith(`${root}/dev/`))
+  assert.equal(inDev.length, 1, 'dev 部门下应有 1 个 Bot')
+  // 这正是 /departments/save 用来决定「能不能删」的判据
+  assert.ok(inDev[0].cwd.includes('/dev/'))
+})
+
+test('部门管理：改名后部门名与团队名应保持一致（depttree 用名字查团队）', async (t) => {
+  const { services, depts } = setup(t)
+  const r = await ensureDeptTeam(services, depts[0], 'ui')
+  assert.equal(r.team.name, depts[0].name, '团队名 = 部门名，这是 depttree 的查找约定')
+})

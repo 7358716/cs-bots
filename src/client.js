@@ -3253,6 +3253,9 @@ window.__ModuleLoader__.load({
       // 「安排工作」弹窗
       const [assignOpen, setAssignOpen] = useState(false)
       const [assignForm, setAssignForm] = useState({ subject: '', assignee: '', longrun: false })
+      // 部门管理（2026-11-15 Boss：「给我一个管理页面或者新增按钮」）
+      const [manageOpen, setManageOpen] = useState(false)
+      const [deptDraft, setDeptDraft] = useState([])
 
       const depts = data?.departments ?? []
       const active = depts.find((d) => d.id === activeId) ?? depts[0] ?? null
@@ -3324,6 +3327,23 @@ window.__ModuleLoader__.load({
         }
       }
 
+      // 保存部门清单（增/删/改名都走这一个端点，它自带「有 Bot 不许删」保护）
+      const saveDepts = async (list) => {
+        setBusy(true)
+        setMsg(null)
+        try {
+          const r = await call('/departments/save', { method: 'POST', body: { departments: list, by: 'ui' } })
+          if (r.warnings?.length) setMsg({ kind: 'err', text: r.warnings.join('；') })
+          else setMsg({ kind: 'ok', text: '部门已保存' })
+          setManageOpen(false)
+          reload()
+        } catch (e) {
+          setMsg({ kind: 'err', text: `保存部门失败：${e.message}` })
+        } finally {
+          setBusy(false)
+        }
+      }
+
       if (loading) return h(Skeleton, { n: 3 })
       if (error) return h('div', { className: 'csb-err' }, error)
       if (depts.length === 0) {
@@ -3336,7 +3356,16 @@ window.__ModuleLoader__.load({
       return h('div', { style: { display: 'flex', gap: 16, alignItems: 'flex-start' } },
         // ── 左：部门列表 ──
         h('div', { style: { width: 240, flex: 'none' } },
-          h(Section, { title: '部门', desc: `${depts.length} 个部门 · ${data?.total?.bots ?? 0} 个 Bot` }),
+          h(Section, {
+            title: '部门',
+            desc: `${depts.length} 个部门 · ${data?.total?.bots ?? 0} 个 Bot`,
+          }),
+          // 管理入口（Boss 要的「管理页面 / 新增按钮」）
+          h('div', { className: 'csb-bar', style: { marginTop: 8 } },
+            h('button', {
+              className: 'csb-btn csb-btn-s',
+              onClick: () => { setDeptDraft(depts.map((d) => ({ id: d.id, name: d.name }))); setManageOpen(true) },
+            }, '⚙ 管理部门')),
           h('div', { style: { marginTop: 10 } },
             depts.map((d) => h('div', {
               key: d.id,
@@ -3402,6 +3431,49 @@ window.__ModuleLoader__.load({
               h('div', { className: 'csb-fld-h', style: { marginTop: 4 } },
                 '「＋ 安排工作」把这句话直接变成任务，派给本部门的 Bot —— 说话与派活一步完成。'))
             : null),
+        // 部门管理弹窗
+        manageOpen
+          ? h(Modal, {
+            title: '管理部门',
+            onClose: () => setManageOpen(false),
+            footer: [
+              h('button', { key: 'c', className: 'csb-btn', onClick: () => setManageOpen(false) }, '取消'),
+              h('button', {
+                key: 'ok', className: 'csb-btn csb-btn-p', disabled: busy,
+                onClick: () => saveDepts(deptDraft),
+              }, busy ? '保存中…' : '保存'),
+            ],
+          },
+          h('div', { className: 'csb-set-d', style: { marginBottom: 8 } },
+            '部门决定 Bot 的工作目录层级（<主目录>/<部门>/<Bot名>）。'
+            + '删除部门前必须先把它下面的 Bot 迁走或退役 —— 否则会被拒绝。'),
+          deptDraft.map((d, i) => h('div', { key: i, className: 'csb-bar', style: { marginBottom: 6 } },
+            h('input', {
+              className: 'csb-in', style: { width: 110 }, value: d.id, placeholder: 'id（英文）',
+              onChange: (e) => {
+                const next = [...deptDraft]
+                next[i] = { ...next[i], id: e.target.value.replace(/[/\\.]/g, '') }
+                setDeptDraft(next)
+              },
+            }),
+            h('input', {
+              className: 'csb-in csb-grow', value: d.name, placeholder: '显示名（如 开发部）',
+              onChange: (e) => {
+                const next = [...deptDraft]
+                next[i] = { ...next[i], name: e.target.value }
+                setDeptDraft(next)
+              },
+            }),
+            h('button', {
+              className: 'csb-btn csb-btn-s csb-btn-d',
+              onClick: () => setDeptDraft(deptDraft.filter((_, j) => j !== i)),
+            }, '删除'))),
+          h('button', {
+            className: 'csb-btn csb-btn-s',
+            onClick: () => setDeptDraft([...deptDraft, { id: '', name: '' }]),
+          }, '＋ 新增部门'))
+          : null,
+
         // 「安排工作」弹窗
         assignOpen
           ? h(Modal, {
@@ -3453,6 +3525,10 @@ window.__ModuleLoader__.load({
     function TasksTab({ onGoto, sourceFilter = 'human' }) {
       // 「去对话」面板（2026-11-14 Boss：任务管理页顶部要有去对话按钮）
       const [convOpen, setConvOpen] = useState(false)
+      // 建 Bot 时就地新增部门（2026-11-15 Boss：部门下拉里没有新增入口）
+      const [newDeptOpen, setNewDeptOpen] = useState(false)
+      const [newDept, setNewDept] = useState({ id: '', name: '' })
+      const [newDeptBusy, setNewDeptBusy] = useState(false)
       const [filter, setFilter] = useState('')
       const [subject, setSubject] = useState('')
       const [desc, setDesc] = useState('')
@@ -4740,10 +4816,50 @@ window.__ModuleLoader__.load({
             h('label', null, '部门'),
             h('select', {
               className: 'csb-sel', style: { maxWidth: 260 }, value: dept,
-              onChange: (e) => setForm({ ...form, department: e.target.value }),
-            }, dpts.map((d) => h('option', { key: d.id, value: d.id }, d.name))),
+              onChange: (e) => {
+                if (e.target.value === '__new') { setNewDeptOpen(true); return }
+                setForm({ ...form, department: e.target.value })
+              },
+            }, [
+              ...dpts.map((d) => h('option', { key: d.id, value: d.id }, d.name)),
+              // 下拉底部固定一项「＋ 新增部门…」—— 建 Bot 时发现缺部门，不用先跑去别的页面
+              h('option', { key: '__new', value: '__new' }, '＋ 新增部门…'),
+            ]),
+            // 选了「＋ 新增部门…」⇒ 就地弹一个小输入框，建完自动选中
+            newDeptOpen
+              ? h('div', { className: 'csb-bar', style: { marginTop: 6 } },
+                h('input', {
+                  className: 'csb-in', style: { width: 100 }, placeholder: 'id（英文）',
+                  value: newDept.id,
+                  onChange: (e) => setNewDept({ ...newDept, id: e.target.value.replace(/[/\\.]/g, '') }),
+                }),
+                h('input', {
+                  className: 'csb-in', style: { width: 140 }, placeholder: '显示名（如 测试部）',
+                  value: newDept.name, onChange: (e) => setNewDept({ ...newDept, name: e.target.value }),
+                }),
+                h('button', {
+                  className: 'csb-btn csb-btn-s',
+                  disabled: !newDept.id.trim() || !newDept.name.trim() || newDeptBusy,
+                  onClick: async () => {
+                    setNewDeptBusy(true)
+                    try {
+                      const list = [...dpts, { id: newDept.id.trim(), name: newDept.name.trim() }]
+                      await call('/departments/save', { method: 'POST', body: { departments: list, by: 'ui' } })
+                      setNewDept({ id: '', name: '' })
+                      setNewDeptOpen(false)
+                      setForm((f) => ({ ...f, department: newDept.id.trim() }))
+                      reloadSettings()   // 让下拉立刻出现新部门
+                    } catch (e) {
+                      setErr(`新增部门失败：${e.message}`)
+                    } finally {
+                      setNewDeptBusy(false)
+                    }
+                  },
+                }, newDeptBusy ? '保存中…' : '保存'),
+                h('button', { className: 'csb-btn csb-btn-s', onClick: () => setNewDeptOpen(false) }, '取消'))
+              : null,
             h('div', { className: 'csb-fld-h' },
-              '选部门后，工作目录自动放在该部门下，不用手填路径。部门在「设置」里增删。'))
+              '选部门后，工作目录自动放在该部门下，不用手填路径。部门也可在「部门」页管理。'))
           : h('div', { className: 'csb-fld' },
             h('label', null, '工作目录'),
             h('div', { className: 'csb-bar', style: { marginBottom: 6 } },
