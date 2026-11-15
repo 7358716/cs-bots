@@ -56,6 +56,7 @@ function boot({ workspaces = LEGACY, rootOverride } = {}) {
   const prevHome = process.env.DSH_HOME
   process.env.DSH_HOME = dshHome
 
+  let agentSeq = 0
   const registered = new Set(workspaces)
   const deleted = []
   // 并发度探针：create 进入 +1、离开 -1，记录峰值。
@@ -85,6 +86,18 @@ function boot({ workspaces = LEGACY, rootOverride } = {}) {
       if (k === 'workspaceRegistry') return registry
       if (k === 'workspaceController') return workspaceController
       if (k === 'tools') return { register: () => () => {}, guard: () => () => {}, schemas: () => [] }
+      // roster.create 需要 agents（否则「agents.create 不可用」直接失败）
+      if (k === 'agents') {
+        return {
+          live: new Set(),
+          async create(r) {
+            const id = r?.sessionId ?? `bot-t${(agentSeq += 1)}`
+            return { id, sessionId: id }
+          },
+          get: () => undefined,
+          list: () => [],
+        }
+      }
       if (k === 'webServer') return { register: ({ handler: hd }) => { handler = hd; return () => {} } }
       return undefined
     },
@@ -226,5 +239,24 @@ test('tidy：★ 分级登记严格串行（并发峰值必须是 1，否则会�
       `create 并发峰值应为 1，实际 ${h.conc.max} —— 并发注册会把同一路径注册两次，`
       + '正是 2026-11-15 workspace domain is inconsistent 的成因')
     assert.equal((r.json.hierarchy?.failed ?? []).length, 0)
+  } finally { h.cleanup() }
+})
+
+test('tidy：★ Bot cwd 落在「部门字典外」的目录，也要给它建文件夹', async () => {
+  // 实测踩过：3 个 Bot 在 misc/ 下，而 settings 只有 dev/qa/ops
+  // ⇒ misc 没被登记 ⇒ 那 3 个 Bot 直接挂在根下，跟部门文件夹混在一层。
+  const h = boot()
+  try {
+    // 造一个 cwd 在 misc/ 下的 Bot（misc 不在 settings.departments 里）
+    const miscDir = join(h.botsRoot, 'misc', '临时岗')
+    mkdirSync(miscDir, { recursive: true })
+    await h.req('POST', '/roster', { name: '临时岗', cwd: miscDir, byId: 'ui' })
+
+    const r = await h.req('POST', '/workspaces/tidy', { confirm: true, mode: 'stale' })
+    assert.equal(r.status, 200)
+    assert.ok(
+      h.registered.has(join(h.botsRoot, 'misc')),
+      '字典外但 Bot 实际所在的 misc/ 也必须登记成文件夹，否则它会挂在根下',
+    )
   } finally { h.cleanup() }
 })

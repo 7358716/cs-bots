@@ -13,6 +13,25 @@
 
 ---
 
+## [0.12.3] - 2026-11-15
+
+### Fixed · 部门字典外的目录没有文件夹（Bot 会挂在根下）
+
+实测：3 个 Bot 的 cwd 在 `misc/` 下，而 `settings.departments` 只有 `dev/qa/ops`
+⇒ `misc` 没被登记成文件夹 ⇒ 那 3 个 Bot 直接挂在 `cs-bots` 根下，
+跟 `dev/`、`qa/` 这些部门文件夹混在同一层，看着不一致。
+
+修法：登记范围从「settings 部门」改为
+**「settings 部门 ∪ 所有 Bot cwd 的一级目录」** —— 两者都要有文件夹。
+
+测试用变异验证过：
+- 只留 settings 部门 ⇒ 测试变红 ✅
+- 取并集 ⇒ 绿 ✅
+
+（夹具也补了 `agents` 替身 —— 原来 `roster.create` 建不出 Bot，这条测试会假过。）
+
+---
+
 ## [0.12.2] - 2026-11-15
 
 ### Added · 三级分层登记（cs-bots → 部门 → Bot，Boss 要的「下级向下展开」）

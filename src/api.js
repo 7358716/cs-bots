@@ -2650,8 +2650,20 @@ export function installApi(ctx, { warn } = {}) {
         if (ens.ok && body.hierarchy !== false) {
           const depts = Array.isArray(services.settings?.departments) ? services.settings.departments : []
           const bots = services.roster?.list?.() ?? []
-          for (const d of depts) {
-            const dir = `${root}/${d.id}`
+          // ⚠️ 不能只登记 settings 里的部门：Bot 的 cwd 可能落在「字典里没有」的一级目录下
+          //    （实测：3 个 Bot 在 misc/ 下，而 settings 只有 dev/qa/ops
+          //      ⇒ 它们直接挂在根下，跟部门文件夹混在一层，看着不一致）。
+          //    ⇒ 取「settings 部门 ∪ 所有 Bot cwd 的一级目录」，两者都要有文件夹。
+          const deptIds = [...new Set([
+            ...depts.map((d) => d?.id).filter(Boolean),
+            ...bots
+              .map((b) => (typeof b?.cwd === 'string' ? b.cwd.replace(/\/+$/, '') : ''))
+              .filter((cwd) => cwd.startsWith(`${root}/`))
+              .map((cwd) => cwd.slice(root.length + 1).split('/')[0])
+              .filter(Boolean),
+          ])]
+          for (const deptId of deptIds) {
+            const dir = `${root}/${deptId}`
             try {
               // 目录存在才能被 realpath 归一化（registry.create 要求真实目录）
               if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
