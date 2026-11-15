@@ -12,7 +12,7 @@
  *   - **前缀路由**：`/cs-bots/api`（与包名一致，避免和其他插件撞路径）。
  */
 
-import { readFileSync, readdirSync, statSync, existsSync, writeFileSync, renameSync } from 'node:fs'
+import { readFileSync, readdirSync, statSync, existsSync, writeFileSync, renameSync, mkdirSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { join, resolve, sep as pathSep } from 'node:path'
 import { registerRoute, listPresets, ensureWorkspaceDir, listWorkspaceRecords, removeWorkspaceByPath, defaultPreset, getAgent, resumeSession, readSessionMessages, attachToWorkspace, readSessionWatermark, sessionMeta, capabilities } from './kernel.js'
@@ -2638,6 +2638,44 @@ export function installApi(ctx, { warn } = {}) {
         // ① 先登记主目录（这一步失败就没法分层，直接报）
         const ens = await ensureWorkspaceDir(ctx, root)
 
+        // ①-b 再登记「部门」与每个 Bot 的目录 —— 这样左侧栏能展开成三级：
+        //       cs-bots → 部门 → Bot
+        //     原理：宿主按**最近的已登记祖先**嵌套（owningParentFolder）。
+        //     只登记根 ⇒ Bot 目录的父级就是根，只有两级；
+        //     把部门目录也登记上 ⇒ Bot 的父级变成部门，才有三级。
+        //
+        //     ⚠️ **严格串行、逐个 await**（2026-11-15 的 0.10.2 事故就是并发注册
+        //     把同一路径注册两次、搞出 domain inconsistent）。这里绝不用 Promise.all。
+        const hierarchy = { depts: 0, bots: 0, failed: [] }
+        if (ens.ok && body.hierarchy !== false) {
+          const depts = Array.isArray(services.settings?.departments) ? services.settings.departments : []
+          const bots = services.roster?.list?.() ?? []
+          for (const d of depts) {
+            const dir = `${root}/${d.id}`
+            try {
+              // 目录存在才能被 realpath 归一化（registry.create 要求真实目录）
+              if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
+              const r = await ensureWorkspaceDir(ctx, dir)
+              if (r.ok) hierarchy.depts += 1
+              else hierarchy.failed.push({ path: dir, reason: r.reason })
+            } catch (error) {
+              hierarchy.failed.push({ path: dir, reason: String(error?.message ?? error) })
+            }
+          }
+          for (const b of bots) {
+            const cwd = typeof b?.cwd === 'string' ? b.cwd.replace(/\/+$/, '') : ''
+            if (!cwd || !cwd.startsWith(`${root}/`)) continue
+            try {
+              if (!existsSync(cwd)) mkdirSync(cwd, { recursive: true })
+              const r = await ensureWorkspaceDir(ctx, cwd)
+              if (r.ok) hierarchy.bots += 1
+              else hierarchy.failed.push({ path: cwd, reason: r.reason })
+            } catch (error) {
+              hierarchy.failed.push({ path: cwd, reason: String(error?.message ?? error) })
+            }
+          }
+        }
+
         // ② 选出要删的
         const legacy = Array.isArray(body.legacyPrefixes) && body.legacyPrefixes.length
           ? body.legacyPrefixes
@@ -2668,6 +2706,7 @@ export function installApi(ctx, { warn } = {}) {
           mode,
           root,
           rootRegistered: { ok: ens.ok, created: ens.created === true, ...(ens.reason ? { reason: ens.reason } : {}) },
+          hierarchy,
           considered: target.length,
           removed: removedCount,
           failed: results.filter((x) => !x.ok).length,

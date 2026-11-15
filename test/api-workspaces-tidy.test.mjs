@@ -39,7 +39,7 @@ function boot({ workspaces = LEGACY, rootOverride } = {}) {
   mkdirSync(join(dshHome, 'storages'), { recursive: true })
   mkdirSync(join(dshHome, 'cs-bots'), { recursive: true })
   mkdirSync(botsRoot, { recursive: true })
-  mkdirSync(join(botsRoot, 'dev'), { recursive: true })
+  for (const d of ['dev', 'qa', 'ops']) mkdirSync(join(botsRoot, d), { recursive: true })
 
   // 伪造宿主 workspace.json（listWorkspaceRecords 从这里读）
   const table = {}
@@ -48,7 +48,9 @@ function boot({ workspaces = LEGACY, rootOverride } = {}) {
     tables: { workspaces: table }, global: { workspaceIds: Object.keys(table) },
   }))
   writeFileSync(join(dshHome, 'cs-bots', 'settings.json'), JSON.stringify({
-    botWorkspaceRoot: botsRoot, departments: [{ id: 'dev', name: '开发部' }],
+    // ⚠️ 至少 2 个部门：只有 1 个时「并发峰值」必然是 1，串行测试会假绿
+    botWorkspaceRoot: botsRoot,
+    departments: [{ id: 'dev', name: '开发部' }, { id: 'qa', name: '测试部' }, { id: 'ops', name: '综合部' }],
   }))
 
   const prevHome = process.env.DSH_HOME
@@ -56,9 +58,20 @@ function boot({ workspaces = LEGACY, rootOverride } = {}) {
 
   const registered = new Set(workspaces)
   const deleted = []
+  // 并发度探针：create 进入 +1、离开 -1，记录峰值。
+  // 并发注册正是 0.10.2 「domain is inconsistent」的成因 ⇒ 峰值必须是 1。
+  const conc = { inFlight: 0, max: 0 }
   const registry = {
     async resolveByPath(p) { return registered.has(p) ? { id: `ws-${p}`, path: p } : undefined },
-    async create(p) { registered.add(p); return { workspace: { id: `ws-${p}`, path: p }, created: true } },
+    async create(p) {
+      conc.inFlight += 1
+      conc.max = Math.max(conc.max, conc.inFlight)
+      try {
+        await new Promise((r) => setTimeout(r, 1))   // 给并发留出交错窗口
+        registered.add(p)
+        return { workspace: { id: `ws-${p}`, path: p }, created: true }
+      } finally { conc.inFlight -= 1 }
+    },
   }
   const workspaceController = {
     async delete(req) { deleted.push(req.workspaceId); return { deleted: true } },
@@ -80,7 +93,7 @@ function boot({ workspaces = LEGACY, rootOverride } = {}) {
   apply(ctx, { stateDir: join(dshHome, 'cs-bots') })
 
   return {
-    botsRoot, deleted, registered, box,
+    botsRoot, deleted, registered, box, conc,
     async req(method, path, body) {
       const payload = body === undefined ? [] : [Buffer.from(JSON.stringify(body), 'utf8')]
       const request = Object.assign(Readable.from(payload), { method, url: API_BASE + path })
@@ -175,5 +188,43 @@ test('tidy：结果逐条返回，含被删路径与会话数（可核查）', a
     assert.ok(Array.isArray(r.json.results) && r.json.results.length > 0, '要逐条列出')
     assert.ok(r.json.results.every((x) => typeof x.path === 'string' && typeof x.sessions === 'number'))
     assert.equal(typeof r.json.removed, 'number')
+  } finally { h.cleanup() }
+})
+
+// ── 三级分层：cs-bots → 部门 → Bot（2026-11-15 Boss：「下级可以向下展开」）──
+//
+// 原理：宿主按**最近的已登记祖先**嵌套（owningParentFolder）。
+// 只登记根 ⇒ Bot 目录父级是根，只有两级；把部门也登记上 ⇒ 才有三级。
+// 关键安全点：**必须串行注册**，绝不 Promise.all（0.10.2 事故是并发注册导致重复）。
+
+test('tidy：会串行登记「部门」和「Bot」目录，形成三级分层', async () => {
+  const h = boot()
+  try {
+    const r = await h.req('POST', '/workspaces/tidy', { confirm: true, mode: 'stale' })
+    assert.equal(r.status, 200)
+    assert.ok(r.json.hierarchy, '应返回分层登记结果')
+    assert.ok(h.registered.has(`${h.botsRoot}/dev`), '部门目录应被登记（否则只有两级）')
+  } finally { h.cleanup() }
+})
+
+test('tidy：hierarchy:false 可关闭分级登记（只要主目录一层）', async () => {
+  const h = boot()
+  try {
+    const r = await h.req('POST', '/workspaces/tidy', { confirm: true, mode: 'stale', hierarchy: false })
+    assert.equal(r.status, 200)
+    assert.equal(r.json.hierarchy.depts, 0, '关闭时不该登记部门')
+    assert.ok(!h.registered.has(`${h.botsRoot}/dev`))
+  } finally { h.cleanup() }
+})
+
+test('tidy：★ 分级登记严格串行（并发峰值必须是 1，否则会重演 domain inconsistent）', async () => {
+  const h = boot()
+  try {
+    const r = await h.req('POST', '/workspaces/tidy', { confirm: true, mode: 'stale' })
+    assert.equal(r.status, 200)
+    assert.equal(h.conc.max, 1,
+      `create 并发峰值应为 1，实际 ${h.conc.max} —— 并发注册会把同一路径注册两次，`
+      + '正是 2026-11-15 workspace domain is inconsistent 的成因')
+    assert.equal((r.json.hierarchy?.failed ?? []).length, 0)
   } finally { h.cleanup() }
 })
