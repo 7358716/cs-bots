@@ -13,6 +13,36 @@
 
 ---
 
+## [0.12.1] - 2026-11-15
+
+### Fixed · 左侧栏分组注册仍然失败（改用 ctx.inject 等服务就绪）
+
+0.12.0 上线后实测：`workspace.json` 的 mtime 仍停在重启前 ⇒ 注册依旧没写成。
+
+**三次失败尝试（记录，别再重走）**
+
+| 版本 | 做法 | 结果 |
+|---|---|---|
+| 0.11.0 | 启动时直接调一次 `ensureWorkspaceDir` | ❌ 拿到 `undefined` 就放弃 |
+| 0.11.1 | 加 `setTimeout` 重试 10 次 × 500ms | ❌ 仍然失败 —— **靠定时器猜就绪时机不可靠** |
+| **0.12.1** | **`ctx.inject(['workspaceRegistry'], cb)`** | ✅ 服务真正就绪才回调 |
+
+**根因**：`workspaceRegistry` 是**宿主服务**，宿主侧要等 registry/session 都装好才
+`provide`。cs-bots 的 `apply` 跑得早，此刻 `ctx.get('workspaceRegistry')` 必然是
+`undefined`。延迟只是碰运气，**只有声明依赖才是确定性的**
+（`cordis/lib/index.js:1672` 的 `inject(inject, callback)`）。
+
+**新增装配级测试**（`test/index-ws-register.test.mjs`）专门模拟这个时序：
+让 `get('workspaceRegistry')` 故意返回 `undefined`（只有 `inject` 的回调能拿到），
+验证插件确实等到了服务、并且**只登记主目录一条**。
+
+三项断言：
+- 必须声明依赖（不是靠 `get` 硬拿）
+- 服务就绪后登记主目录，且**恰好一条**（不重演 0.10.2 的并发重复注册）
+- 老宿主没有 `inject` API ⇒ 不崩，插件照常装配
+
+---
+
 ## [0.12.0] - 2026-11-15
 
 ### Added · 工作区整理：左侧栏只留一个 CS-bots，可向下展开

@@ -198,39 +198,49 @@ function applyInner(ctx, config, { log, warn }) {
     //
     // ## 幂等
     //   `ensureWorkspaceDir` 内部先 resolveByPath，已存在就复用。
-    if (typeof ensureWorkspaceDir === 'function') {
+    // ⚠️ **必须用 ctx.inject 等服务就绪**（2026-11-15 两次实测失败后的结论）
+    //
+    //   `workspaceRegistry` 是**宿主服务**，宿主侧要等 registry/session 都装好才 provide。
+    //   cs-bots 的 `apply` 跑得早，此时 `ctx.get('workspaceRegistry')` 拿到的是 undefined。
+    //
+    //   失败的两次尝试（都记在这里，别再重走）：
+    //     ① 直接调一次 → 拿到 undefined → 直接放弃（0.11.0）
+    //     ② 加 setTimeout 重试 10×500ms → 仍然失败（0.11.1）
+    //        —— 因为延迟只是碰运气，宿主什么时候 provide 是不确定的
+    //     ③ 实测证据：`workspace.json` 的 mtime 一直停在重启前，
+    //        说明那段代码从未成功写过任何东西
+    //
+    //   **正确做法**：Cordis 的 `ctx.inject(names, cb)` —— 只有当这些服务
+    //   **真正就绪**时才调用 cb（`cordis/lib/index.js:1672`）。
+    //   这才是「等依赖」的正道，不是靠定时器猜。
+    //
+    // ## 仍然安全（不重演 0.10.2 的并发事故）
+    //   · 只建 **1 个** Workspace（主目录本身）
+    //   · **不碰任何 session**
+    //   · 失败只 warn，不影响插件其他功能
+    if (typeof ensureWorkspaceDir === 'function' && typeof ctx.inject === 'function') {
       const root = settings.botWorkspaceRoot
       if (typeof root === 'string' && root.trim()) {
-        // ⚠️ **必须重试**（2026-11-15 实测）：`workspaceRegistry` 是**宿主服务**，
-        //    在 cs-bots 的 apply 跑的时候它可能**还没装配好**
-        //    （宿主侧 workspace 域要等 registry/session 都就绪才 provide）。
-        //    直接调一次 ⇒ 拿到 undefined ⇒ 返回 `{ok:false, reason:'宿主未提供 workspaceRegistry'}`
-        //    ⇒ 左侧栏永远平铺。实测就是这么失败的：重启后 workspace.json 的 mtime
-        //    还停在重启前，说明那次调用根本没成功写过任何东西。
-        //
-        //    处置：有限次重试（最多 10 次 × 500ms ≈ 5s），拿到就停；
-        //    全程串行、单次注册（不循环 Bot、不碰 session），不会重演 0.10.2 的并发事故。
-        void (async () => {
-          for (let attempt = 0; attempt < 10; attempt += 1) {
-            try {
-              const r = await ensureWorkspaceDir(ctx, root.trim())
-              if (r.ok) {
-                if (r.created) log(`[cs-bots] 已把 Bot 主目录注册为 Workspace 分组：${root.trim()}`)
-                return
+        const wsRoot = root.trim()
+        try {
+          ctx.inject(['workspaceRegistry'], (scoped) => {
+            void (async () => {
+              try {
+                const r = await ensureWorkspaceDir(scoped ?? ctx, wsRoot)
+                if (r.ok) {
+                  if (r.created) log(`[cs-bots] 已把 Bot 主目录注册为 Workspace 分组：${wsRoot}`)
+                } else {
+                  warn(`[cs-bots] 未能注册 Bot 主目录分组（${wsRoot}）：${r.reason} —— 左侧栏会平铺显示`)
+                }
+              } catch (error) {
+                warn(`[cs-bots] 注册 Bot 主目录分组异常：${error?.message ?? error}`)
               }
-              // 只在「registry 还没就绪」时重试；其它原因（如 create 报错）直接放弃，别死循环
-              if (!/未提供 workspaceRegistry|registry 无 create/.test(String(r.reason ?? ''))) {
-                warn(`[cs-bots] 未能注册 Bot 主目录分组（${root.trim()}）：${r.reason} —— 左侧栏会平铺显示`)
-                return
-              }
-            } catch (error) {
-              warn(`[cs-bots] 注册 Bot 主目录分组异常：${error?.message ?? error}`)
-              return
-            }
-            await new Promise((resolve) => { setTimeout(resolve, 500) })
-          }
-          warn('[cs-bots] 等待 workspaceRegistry 超时（5s）—— 左侧栏会平铺显示；重启后通常可恢复')
-        })()
+            })()
+          })
+        } catch (error) {
+          // inject 本身失败（老宿主没有该 API 等）⇒ 降级，不阻碍插件启动
+          warn(`[cs-bots] 无法等待 workspaceRegistry 就绪：${error?.message ?? error} —— 左侧栏会平铺显示`)
+        }
       }
     }
 
