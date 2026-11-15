@@ -2593,6 +2593,52 @@ export function installApi(ctx, { warn } = {}) {
         return
       }
 
+      // ── 部门树（2026-11-15 左侧栏分层 UI）────────────────────────────────
+      //
+      // `GET /departments/tree` —— 只读，返回三层结构：
+      //   部门 → (teamId, roomId, bots[]) → Bot
+      //
+      // **只读**：不建团队也不建房。缺的会在 warnings 里如实列出，
+      // 由用户「进入部门」时走 `POST /departments/ensure` 触发创建。
+      // （读接口带写副作用是坑：刷新一次列表就建一堆东西，还会掩盖真正的缺失。）
+      if (request.method === 'GET' && path === '/departments/tree') {
+        const { buildDeptTree } = await import('./depttree.js')
+        const services = getServices(ctx)
+        sendJson(response, 200, { ok: true, ...buildDeptTree(services) })
+        return
+      }
+
+      // `POST /departments/ensure` —— 确保某部门的团队与群聊存在（幂等）
+      //
+      // 这是「进入部门群聊」时调的：先确保有，再打开。
+      if (request.method === 'POST' && path === '/departments/ensure') {
+        const { ensureDeptRoom } = await import('./depttree.js')
+        const body = (await readBody(request)) ?? {}
+        const services = getServices(ctx)
+        const depts = Array.isArray(services?.settings?.departments) ? services.settings.departments : []
+        const dept = depts.find((d) => d && d.id === body.id)
+        if (!dept) {
+          sendJson(response, 404, {
+            ok: false, reason: 'DEPT_NOT_FOUND',
+            hint: `部门 ${JSON.stringify(body.id)} 不存在（可选：${depts.map((d) => d.id).join(' | ') || '（尚未配置任何部门）'}）`,
+          })
+          return
+        }
+        const got = await ensureDeptRoom(services, dept, body.by ?? 'ui')
+        if (!got.room) {
+          sendJson(response, 500, { ok: false, reason: 'DEPT_ROOM_FAILED', message: got.reason })
+          return
+        }
+        sendJson(response, 200, {
+          ok: true,
+          department: { id: dept.id, name: dept.name },
+          room: { id: got.room.id, name: got.room.name, mode: got.room.mode,
+            members: Array.isArray(got.room.members) ? got.room.members.length : 0 },
+          created: got.created === true,
+        })
+        return
+      }
+
       if (request.method === 'GET' && path === '/roster') {
         const includeRetired = qp(url, 'includeRetired') === '1'
         const bots = await withService(services, 'roster', (r) => [
