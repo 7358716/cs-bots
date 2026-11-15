@@ -15,7 +15,7 @@
 import { readFileSync, readdirSync, statSync, existsSync, writeFileSync, renameSync, mkdirSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { join, resolve, sep as pathSep } from 'node:path'
-import { registerRoute, service, listPresets, ensureWorkspaceDir, listWorkspaceRecords, removeWorkspaceByPath, defaultPreset, getAgent, resumeSession, readSessionMessages, attachToWorkspace, readSessionWatermark, sessionMeta, capabilities } from './kernel.js'
+import { registerRoute, service, stateDir as kernelStateDir, listPresets, ensureWorkspaceDir, listWorkspaceRecords, removeWorkspaceByPath, defaultPreset, getAgent, resumeSession, readSessionMessages, attachToWorkspace, readSessionWatermark, sessionMeta, capabilities } from './kernel.js'
 import { createLibrary } from './library.js'
 import { createDirBrowser } from './dirbrowse.js'
 import { getServices } from './registry.js'
@@ -4812,7 +4812,10 @@ export function installApi(ctx, { warn } = {}) {
       if (request.method === 'GET' && path === '/settings') {
         const { SETTING_SPECS, loadSettings } = await import('./settings.js')
         const dir = services.board?.paths?.stateDir ?? services.roster?.paths?.stateDir
-        const disk = dir ? loadSettings(dir) : { values: {}, diagnostics: { file: '', source: 'unknown', badKeys: [] } }
+        // ⚠️ 拿不到 stateDir 时**不能**返回空 diagnostics（2026-11-15 Win 实测）：
+        //    那样引导页拿不到 defaultRoot ⇒ 输入框全空白 ⇒ 用户不知道填什么。
+        //    ⇒ 兜底也用 loadSettings(默认 stateDir)，它内部会补默认值。
+        const disk = loadSettings(dir ?? kernelStateDir())
         sendJson(response, 200, {
           ok: true,
           values: disk.values,

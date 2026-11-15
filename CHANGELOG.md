@@ -13,6 +13,33 @@
 
 ---
 
+## [0.13.2] - 2026-11-15
+
+### Fixed · 引导页不能选目录、默认值为空（Boss 截图反馈）
+
+Boss：「没办法选择目录，只能手动输入，也没有默认的，至少应该先有默认的」
+
+**① 加「选择目录」按钮**
+复用「建 Bot」同款 `DirPicker` 组件，选完直接写回输入框。
+
+**② 默认值三层兜底，保证不为空**
+```
+diagnostics.defaultRoot          ← 后端给
+  → values.botWorkspaceRoot      ← 设置里已有
+  → 前端按平台猜（Windows ⇒ C:\Users\你\.dsh\cs-bots）
+```
+
+**③ 后端真 bug：拿不到 stateDir 时返回空 diagnostics**
+```js
+// 旧
+const disk = dir ? loadSettings(dir) : { values: {}, diagnostics: { file: '', source: 'unknown', badKeys: [] } }
+//                                                              ↑ 没有 defaultRoot
+```
+那个 else 分支让引导页拿不到默认值 ⇒ 输入框全空白。
+改成 `loadSettings(dir ?? kernelStateDir())` —— 它内部会补默认值。
+
+---
+
 ## [0.13.1] - 2026-11-15
 
 ### Fixed · 声明插件 `inject`（左侧栏分组在 Win 上始终不出现的根因）

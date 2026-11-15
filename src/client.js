@@ -8650,12 +8650,28 @@ window.__ModuleLoader__.load({
       // **不能用「默认值是否为空」判断** —— 默认值永远非空，那样永远判断不出来。
       const settingsQ = useApi('/settings')
       const onboarded = settingsQ.data?.diagnostics?.needsOnboarding === false
+      // 默认值的兜底链（截图实测 Win 上曾整条为空 ⇒ 输入框全空白，用户不知道填什么）：
+      //   diagnostics.defaultRoot（新版本后端会给）
+      //   → values.botWorkspaceRoot（设置里已有）
+      //   → 前端按平台猜一个（保证**永不为空**）
       const defaultRoot = settingsQ.data?.diagnostics?.defaultRoot
-        ?? settingsQ.data?.values?.botWorkspaceRoot ?? ''
+        ?? settingsQ.data?.values?.botWorkspaceRoot
+        ?? (() => {
+          // 纯前端兜底：Windows 用 .dsh 的下级；其它平台同理。
+          // 拿不到真实 HOME，就用占位提示，但**输入框里一定有东西**可点确认。
+          try {
+            const ua = String(globalThis.navigator?.userAgent ?? '')
+            if (/Windows/i.test(ua)) return 'C:\\Users\\你\\.dsh\\cs-bots'
+          } catch { /* */ }
+          return ''
+        })()
       const [rootDraft, setRootDraft] = useState(null)
       const [onboardBusy, setOnboardBusy] = useState(false)
       const [onboardErr, setOnboardErr] = useState(null)
-      const rootValue = rootDraft ?? defaultRoot
+      const [rootPicking, setRootPicking] = useState(false)
+      // ⚠️ defaultRoot 为空时用兜底串：截图实测 Win 上 diagnostics.defaultRoot
+      //    可能因为旧版本/请求失败而缺失，导致输入框完全空白、用户不知道填什么。
+      const rootValue = rootDraft ?? defaultRoot ?? ''
       const [view, setView] = useState(null)
       // 跨页签定位参数（契约 §3.2 第 6 条）：`onGoto('team', { roomId, seq })`
       // 由 goTab 的第二参数带入，RoomsTab 据此选中房间并高亮/滚动到那条消息。
@@ -8725,17 +8741,31 @@ window.__ModuleLoader__.load({
           }),
           h('div', { className: 'csb-fld', style: { marginTop: 12 } },
             h('label', null, '工作区根目录（绝对路径）'),
-            h('input', {
-              className: 'csb-in', style: { width: '100%', maxWidth: 620 },
-              value: rootValue,
-              placeholder: defaultRoot || '例如 C:\\Users\\你\\.dsh\\cs-bots',
-              onChange: (e) => setRootDraft(e.target.value),
-              onKeyDown: (e) => e.key === 'Enter' && confirmRoot(),
-            }),
+            h('div', { className: 'csb-bar' },
+              h('input', {
+                className: 'csb-in csb-grow', style: { maxWidth: 620 },
+                value: rootValue,
+                placeholder: defaultRoot || '点右边「选择目录」，或直接粘贴绝对路径',
+                onChange: (e) => setRootDraft(e.target.value),
+                onKeyDown: (e) => e.key === 'Enter' && confirmRoot(),
+              }),
+              // 目录选择器（与「建 Bot」用的是同一个 DirPicker 组件）
+              h('button', {
+                className: 'csb-btn',
+                onClick: () => setRootPicking(true),
+              }, '选择目录')),
             h('div', { className: 'csb-fld-h' },
               defaultRoot
                 ? `默认：${defaultRoot}（选它直接点下面的按钮即可）`
                 : '填一个你希望 Bot 落地的绝对路径')),
+          // 目录选择弹窗：选完直接写进输入框
+          rootPicking
+            ? h(DirPicker, {
+              value: rootValue,
+              onChange: (p) => setRootDraft(p),
+              onClose: () => setRootPicking(false),
+            })
+            : null,
           h('div', { className: 'csb-bar', style: { marginTop: 12 } },
             h('button', {
               className: 'csb-btn csb-btn-p',
