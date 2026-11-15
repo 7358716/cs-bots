@@ -13,6 +13,41 @@
 
 ---
 
+## [0.12.8] - 2026-11-15
+
+### Fixed · Windows 首次安装时左侧栏完全不显示 CS-BOTS（致命）
+
+`ensureWorkspaceDir` 调 `registry.create(dir)` **之前没有建目录**。
+而宿主 `registry.create` 第一行是：
+
+```js
+const canonical = await realpathNormalize(path)   // ← 目录不存在，这里就抛
+if (!(await stat(canonical)).isDirectory()) throw new Error(...)
+```
+
+⇒ **目录不存在时登记必然失败。**
+
+**Linux 上为什么没暴露**：`/home/ubuntu/cs-bots` 在 11-07 就被建好了
+（`stat` 实测创建时间 2026-11-07 23:15），登记时目录已经存在。
+**Windows 首次安装时** `C:\Users\<你>\cs-bots` 根本还没创建 ⇒ 登记必失败
+⇒ 左侧栏永远看不到 CS-BOTS 分组。
+
+修法：`registry.create` 前先 `mkdirSync(dir, { recursive: true })`；
+建目录失败返回可读原因（不冒泡）。
+
+测试用「严格 create」替身（目录不存在就抛，与宿主同口径）验证，
+变异验证：去掉 mkdir ⇒ 测试变红。
+
+### 说明 · 「展开后没有东西」的处理
+
+本机 17 个分组原本 **0 个会话** —— 因为 13 个 Bot 的会话 header 里
+`cwd` 还停在旧路径（`/home/ubuntu/output/*`），而分组是新路径，挂不进去。
+
+已用 `POST /roster/rebuild` 逐个重建（12 个 Bot，串行单样本验证后批量），
+重建后 **12 个分组各有 1 个会话**。详见运维记录。
+
+---
+
 ## [0.12.7] - 2026-11-15
 
 ### Fixed · Windows 上「没有左侧栏 CS-BOTS」（主目录退化到当前工作目录）

@@ -106,3 +106,56 @@ test('ensureWorkspaceDir：先未就绪、后就绪 ⇒ 第二次调用成功（
   assert.equal(second.created, true)
   assert.deepEqual(f.created, ['/home/ubuntu/cs-bots'], '只建一次，不重复')
 })
+
+// ── 2026-11-15 Windows 实测：目录不存在时 registry.create 会抛 ──────────────
+// 宿主 create 第一行是 realpathNormalize(path)，目录不存在直接抛。
+// Linux 上没暴露是因为 /home/ubuntu/cs-bots 早就建好了；
+// Windows 首次安装时 C:\Users\<你>\cs-bots 根本不存在 ⇒ 登记必失败 ⇒ 看不到分组。
+
+test('★ ensureWorkspaceDir：目录不存在时必须先 mkdir（否则 Win 首次安装看不到分组）', async () => {
+  const { mkdtempSync, rmSync, existsSync, mkdirSync } = await import('node:fs')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+
+  const base = mkdtempSync(join(tmpdir(), 'cs-bots-mkdir-'))
+  const target = join(base, 'not-exist-yet', 'cs-bots')
+  try {
+    assert.equal(existsSync(target), false, '前提：目录确实不存在')
+
+    // 模拟宿主的严格 create：目录不存在就抛（与 dsh-workspace/lib/index.js:408 同口径）
+    const created = []
+    const registry = {
+      async resolveByPath() { return undefined },
+      async create(p) {
+        if (!existsSync(p)) throw new Error(`cannot create a workspace at '${p}': ENOENT`)
+        created.push(p)
+        return { workspace: { id: `ws-${p}`, path: p }, created: true }
+      },
+    }
+    const r = await ensureWorkspaceDir(ctxWith(registry), target)
+    assert.equal(r.ok, true, `应成功，实际：${r.reason}`)
+    assert.equal(r.created, true)
+    assert.deepEqual(created, [target])
+    assert.equal(existsSync(target), true, '目录应被创建出来')
+  } finally {
+    try { rmSync(base, { recursive: true, force: true }) } catch { /* */ }
+  }
+})
+
+test('★ ensureWorkspaceDir：mkd 失败时返回可读原因，不冒泡', async () => {
+  // 拿一个「不可能建成的路径」：把文件当目录用
+  const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const base = mkdtempSync(join(tmpdir(), 'cs-bots-mkdirfail-'))
+  const asFile = join(base, 'iam-a-file')
+  writeFileSync(asFile, 'x')
+  try {
+    const registry = { async resolveByPath() { return undefined }, async create() { throw new Error('should not reach') } }
+    const r = await ensureWorkspaceDir(ctxWith(registry), join(asFile, 'sub'))
+    assert.equal(r.ok, false)
+    assert.match(r.reason, /建目录失败|建 Workspace 失败/, `原因应可读：${r.reason}`)
+  } finally {
+    try { rmSync(base, { recursive: true, force: true }) } catch { /* */ }
+  }
+})

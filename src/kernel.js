@@ -24,7 +24,7 @@
 //
 // 惰性的另一收益：**不构造消息的调用路径完全不依赖宿主包** —— 单元测试因此可离线跑。
 import { createRequire } from 'node:module'
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, readFileSync, mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 
 const HOST_LLM = '@deepseek-ai/dsh-llm'
@@ -717,6 +717,25 @@ export async function ensureWorkspaceDir(ctx, dir) {
     }
     if (existed) return { ok: true, created: false }
     if (typeof registry.create !== 'function') return { ok: false, reason: 'registry 无 create' }
+
+    // ⚠️ **必须先建目录**（2026-11-15 Windows 实测踩坑）
+    //
+    //   宿主 `registry.create(path)` 的第一行是：
+    //     const canonical = await realpathNormalize(path)
+    //     if (!(await stat(canonical)).isDirectory()) throw ...
+    //   ⇒ **目录不存在时 realpath 直接抛**，`create` 失败。
+    //
+    //   Linux 上之所以没暴露：`/home/ubuntu/cs-bots` 在 11-07 就被建好了，
+    //   登记时目录已经存在。而 **Windows 首次安装时 `C:\Users\<你>\cs-bots`
+    //   根本还没创建** ⇒ 登记必失败 ⇒ 左侧栏永远看不到 CS-BOTS 分组。
+    //
+    //   ⇒ 建 Workspace 前先确保目录存在（mkdir -p）。
+    try {
+      mkdirSync(dir, { recursive: true })
+    } catch (error) {
+      return { ok: false, reason: `建目录失败（${dir}）：${error?.message ?? error}` }
+    }
+
     await registry.create(dir)
     return { ok: true, created: true }
   } catch (error) {
