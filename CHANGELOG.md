@@ -13,6 +13,42 @@
 
 ---
 
+## [0.15.0] - 2026-11-16
+
+### Added · 部门常驻会话（方案A，Boss 选定）
+
+**根因（宿主设计，不是 bug）**
+
+`dsh-workspace/lib/index.js:787`：
+```js
+for (const group of groups) {            // groups 来自「按会话 header 的 cwd 分组」
+  let id = byPath.get(group.path)
+  if (id === void 0) {
+    const sessionIds = group.headers.map(...)
+    if (sessionIds.length === 0) continue;   // ← 空分组直接跳过，不重建
+  }
+}
+```
+
+**宿主每次启动都按「会话 header 的 cwd」重建 workspace 表，没有会话的分组不留。**
+⇒ 只登记部门目录、不建会话的话，重启后部门这一层就消失。
+
+**做法**：给每个部门建一个**常驻会话**（cwd = 部门目录），长期保留。
+这样部门既是分组容器、又有常驻会话 ⇒ 重启后能被重建，左侧栏稳定呈现
+「cs-bots → 部门 → Bot」三级结构。这个会话本身也是部门群聊的天然落点。
+
+- 幂等：先查宿主该目录已有会话，有就复用
+- 串行逐部门，失败只 warn（一个部门建不出来不影响其他）
+- 与 tidy 端点共用 `__csBotsWorkspaceRegLock` 锁，防并发重复注册
+
+### 说明 · 上一版的误判已纠正
+
+我把「21 个分组变 7 个」误判成宿主 bug，实际是 Boss 手动删的。
+真因是上面那条「空分组不重建」——它确实存在，只是不是那次现象的原因。
+两个都要处理，现在都处理了。
+
+---
+
 ## [0.14.0] - 2026-11-16
 
 ### Added · 端点契约测试（Boss 定纪律后立刻加的护栏）

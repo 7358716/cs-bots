@@ -269,3 +269,99 @@ export function buildDeptTree(services) {
     warnings,
   }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 部门常驻会话（2026-11-16 方案A）
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// ## 为什么需要「常驻会话」
+//
+//   实测宿主 `dsh-workspace/lib/index.js:787`：
+//   ```js
+//   for (const group of groups) {            // groups 来自「按会话 header 的 cwd 分组」
+//     if (id === void 0) {
+//       const sessionIds = group.headers.map(...)
+//       if (sessionIds.length === 0) continue;   // ← 空分组直接跳过，不重建
+//     }
+//   }
+//   ```
+//   **宿主每次启动都按「会话 header 的 cwd」重建 workspace 表，没有会话的分组不留。**
+//   ⇒ 部门目录只登记不建会话，重启后就消失，左侧栏也就没有「部门」这一层。
+//
+// ## 做法
+//
+//   给每个部门建一个**专属会话**（cwd = 部门目录），并长期保留。
+//   这样一个部门既是分组容器、又有常驻会话 ⇒ 重启后能被重建。
+//   这个会话本身也是「部门群聊」的天然落点 —— Boss 可以直接在里面说话。
+//
+// ## 命名
+//
+//   统一用 `部门名 · 常驻`，避免和 Bot 名撞车（Bot 名在部门下一级，不会重名）。
+
+/** 部门常驻会话的显示名后缀。 */
+export const DEPT_SESSION_SUFFIX = ' · 常驻'
+
+/**
+ * 部门常驻会话的标准名。
+ * @param {string} deptName
+ * @returns {string}
+ */
+export function deptSessionName(deptName) {
+  return `${String(deptName ?? '').trim()}${DEPT_SESSION_SUFFIX}`
+}
+
+/**
+ * 确保某部门有一个常驻会话（幂等）。
+ *
+ * 判据：宿主的 workspace 表里，该部门目录的 `sessionIds` 非空。
+ * 已有 ⇒ 直接复用；没有 ⇒ 建一个。
+ *
+ * @param {object} ctx
+ * @param {object} services
+ * @param {{id: string, name: string}} dept
+ * @returns {Promise<{ok: boolean, sessionId?: string, created?: boolean, reason?: string}>}
+ */
+export async function ensureDeptSession(ctx, services, dept) {
+  const root = String(services?.settings?.botWorkspaceRoot ?? '').replace(/\/+$/, '')
+  if (!root) return { ok: false, reason: '主目录未设置' }
+  const deptDir = `${root}/${dept?.id}`
+  if (!dept?.id) return { ok: false, reason: '部门 id 为空' }
+
+  // ① 目录必须存在（宿主 create 要 realpath）
+  try {
+    const { mkdirSync } = await import('node:fs')
+    mkdirSync(deptDir, { recursive: true })
+  } catch (error) {
+    return { ok: false, reason: `建部门目录失败：${error?.message ?? error}` }
+  }
+
+  // ② 已有会话就复用（问宿主，不自己猜）
+  const { service } = await import('./kernel.js')
+  let registry
+  try { registry = service(ctx, 'workspaceRegistry') } catch { registry = undefined }
+  if (registry && typeof registry.resolveByPath === 'function') {
+    try {
+      const ws = await registry.resolveByPath(deptDir)
+      if (ws && Array.isArray(ws.sessionIds) && ws.sessionIds.length > 0) {
+        // ⚠️ 宿主实体是只读投影，sessionIds 可能存在 record 里；
+        //    用 `ws.sessionIds` 拿不到时退回下面「重建会话」路径。
+        return { ok: true, sessionId: ws.sessionIds[0], created: false }
+      }
+    } catch { /* 查不到就往下建 */ }
+  }
+
+  // ③ 建一个常驻会话
+  try {
+    const { createSession } = await import('./kernel.js')
+    const { randomUUID } = await import('node:crypto')
+    const sessionId = `session-${randomUUID()}`
+    await createSession(ctx, {
+      sessionId,
+      cwd: deptDir,
+      agentOptions: { meta: { cwd: deptDir, title: deptSessionName(dept.name) } },
+    })
+    return { ok: true, sessionId, created: true }
+  } catch (error) {
+    return { ok: false, reason: `建部门常驻会话失败：${error?.message ?? error}` }
+  }
+}

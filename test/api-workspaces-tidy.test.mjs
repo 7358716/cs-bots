@@ -225,13 +225,16 @@ test('tidy：会串行登记「部门」和「Bot」目录，形成三级分层'
   } finally { h.cleanup() }
 })
 
-test('tidy：hierarchy:false 可关闭分级登记（只要主目录一层）', async () => {
+test('tidy：hierarchy:false 可关闭分级登记（tidy 自身不再登记部门）', async () => {
   const h = boot()
   try {
     const r = await h.req('POST', '/workspaces/tidy', { confirm: true, mode: 'stale', hierarchy: false })
     assert.equal(r.status, 200)
-    assert.equal(r.json.hierarchy.depts, 0, '关闭时不该登记部门')
-    assert.ok(!h.registered.has(`${h.botsRoot}/dev`))
+    // ⚠️ 断言只针对 **tidy 自己**的行为，不能断言全局「dev 目录没被登记」：
+    //    2026-11-16 起插件启动时会给每个部门建常驻会话，那一步**会**登记部门目录
+    //    （方案A 的必要动作）。所以这里只能看 tidy 返回的计数。
+    assert.equal(r.json.hierarchy.depts, 0, 'tidy 关闭分级时不该自己登记部门')
+    assert.equal(r.json.hierarchy.bots, 0, 'tidy 关闭分级时不该自己登记 Bot 目录')
   } finally { h.cleanup() }
 })
 

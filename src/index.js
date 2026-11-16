@@ -35,6 +35,7 @@ import { createTeams } from './teams.js'
 import { createSubscription } from './subscription.js'
 import { createDirBrowser } from './dirbrowse.js'
 import { loadSettings } from './settings.js'
+import { ensureDeptSession } from './depttree.js'
 import { probeHost, formatReport } from './compat.js'
 
 export const name = 'cs-bots'
@@ -304,6 +305,53 @@ function applyInner(ctx, config, { log, warn }) {
             await new Promise((resolve) => { setTimeout(resolve, 500) })
           }
           warn('[cs-bots] 等待 workspaceRegistry 超时（5s）—— 左侧栏会平铺显示；重启后通常可恢复')
+        })()
+      }
+    }
+
+    // ── 部门常驻会话（2026-11-16 方案A）──────────────────────────────────
+    //
+    // 宿主重建 workspace 表时**跳过空分组**（`dsh-workspace/lib/index.js:787`），
+    // 所以「只登记部门目录、不建会话」的话，重启后部门这一层就没了。
+    // ⇒ 给每个部门建一个常驻会话，部门才能长期留在左侧栏。
+    //
+    // 串行、逐部门、失败只 warn（某个部门建不出来不影响其他）。
+    if (typeof ensureDeptSession === 'function' && settings.botWorkspaceRoot) {
+      const depts = Array.isArray(settings.departments) ? settings.departments : []
+      if (depts.length > 0) {
+        void (async () => {
+          // 等 workspaceRegistry 就绪（同上，最多 5s）
+          for (let i = 0; i < 10; i += 1) {
+            const reg = (() => { try { return service(ctx, 'workspaceRegistry') } catch { return undefined } })()
+            if (reg) break
+            await new Promise((r) => { setTimeout(r, 500) })
+          }
+          // ⚠️ 与 tidy 端点共用同一把锁（`__csBotsWorkspaceRegLock`），
+          //    否则并发建 workspace 会把同一路径注册两次（domain inconsistent）。
+          const LOCK2 = '__csBotsWorkspaceRegLock'
+          const withLock2 = async (fn) => {
+            const prev = globalThis[LOCK2] ?? Promise.resolve()
+            let release
+            globalThis[LOCK2] = new Promise((r) => { release = r })
+            try {
+              await prev
+              return await fn()
+            } finally {
+              release()
+            }
+          }
+          let ok = 0; let fail = 0
+          for (const d of depts) {
+            try {
+              const r = await withLock2(() => ensureDeptSession(ctx, services, d))
+              if (r.ok) { ok += 1; if (r.created) log(`[cs-bots] 已为部门「${d.name}」建常驻会话`) }
+              else { fail += 1; warn(`[cs-bots] 部门「${d.name}」常驻会话：${r.reason}`) }
+            } catch (error) {
+              fail += 1
+              warn(`[cs-bots] 部门「${d.name}」常驻会话异常：${error?.message ?? error}`)
+            }
+          }
+          if (ok > 0 || fail > 0) log(`[cs-bots] 部门常驻会话：就绪 ${ok}，失败 ${fail}`)
         })()
       }
     }
