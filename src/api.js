@@ -3445,6 +3445,26 @@ export function installApi(ctx, { warn } = {}) {
         //   - dedupKey 用消息 ID，天然幂等，同一消息不会重复唤醒；
         //   - dispatcher 缺失时降级为「只落消息不唤醒」，不抛错。
         //
+        // ── 部门群聊解析主管（2026-11-16 Boss 规则）──────────────────────────
+        //
+        // Boss：「我说话只唤醒部门主任（主管），没有主管的话唤醒全部」
+        //
+        // 主管来自 `settings.departments[].leadBotName`（**人工设置**，不是第一个 Bot）。
+        // 这里把「部门配置 → Bot → sessionId」的解析做在 api 层：
+        //   room 不该知道部门/团队结构，它只收 `deptLeadId`。
+        const resolveDeptLeadId = (roomObj) => {
+          try {
+            const deptId = roomObj?.settings?.deptId
+            if (!deptId) return null
+            const depts = Array.isArray(services.settings?.departments) ? services.settings.departments : []
+            const d = depts.find((x) => x && x.id === deptId)
+            const leadName = typeof d?.leadBotName === 'string' ? d.leadBotName.trim() : ''
+            if (!leadName) return null
+            const bot = (services.roster?.list?.() ?? []).find((b) => b.name === leadName)
+            return bot ? (bot.sessionId ?? bot.id) : null
+          } catch { return null }
+        }
+
         // ⚠️ 修复（2026-11-12 t-40-B）：目标计算改走 room 服务的 `computeWakeTargets`。
         //   此前这里是裸的 `members.filter((m) => m !== skipSelf)`，**既不看
         //   `mentionOnly`、也不排除人类 id** —— 实测 6 个房间全部设了
@@ -3453,10 +3473,12 @@ export function installApi(ctx, { warn } = {}) {
         //   现在与 `room.relay()` 共用同一份四档规则（见 room.js computeWakeTargets）。
         const room = await withService(services, 'room', (r) => r.get(message.roomId))
         const senderSession = body.from ?? 'ui'
+        // 部门群聊：解析主管（人工设置的 leadBotName → sessionId）
+        const deptLeadId = resolveDeptLeadId(room)
         const decided = await withService(services, 'room', (r) =>
           r.computeWakeTargets(
             { members: room?.members ?? [], settings: room?.settings },
-            { from: senderSession, text: message.text, mentions: message.mentions },
+            { from: senderSession, text: message.text, mentions: message.mentions, deptLeadId },
           ))
         const toWake = decided?.targets ?? []
         const wakeByTarget = new Map()

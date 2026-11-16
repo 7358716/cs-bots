@@ -3792,19 +3792,30 @@ window.__ModuleLoader__.load({
       draft.length === 0
         ? h('div', { className: 'csb-set-d' }, '还没有部门，点下面「＋ 新增」')
         : null,
-      draft.map((d, i) => h('div', { key: i, className: 'csb-bar', style: { marginBottom: 6 } },
-        h('input', {
-          className: 'csb-in', style: { width: 110 }, value: d.id, placeholder: 'id（英文）',
-          onChange: (e) => upd(i, { id: e.target.value.replace(/[/\\.]/g, '') }),
-        }),
-        h('input', {
-          className: 'csb-in csb-grow', value: d.name, placeholder: '显示名（如 开发部）',
-          onChange: (e) => upd(i, { name: e.target.value }),
-        }),
-        h('button', {
-          className: 'csb-btn csb-btn-s csb-btn-d',
-          onClick: () => setDraft(draft.filter((_, j) => j !== i)),
-        }, '删除'))),
+      draft.map((d, i) => h('div', { key: i, style: { marginBottom: 8 } },
+        h('div', { className: 'csb-bar' },
+          h('input', {
+            className: 'csb-in', style: { width: 100 }, value: d.id, placeholder: 'id（英文）',
+            onChange: (e) => upd(i, { id: e.target.value.replace(/[/\\.]/g, '') }),
+          }),
+          h('input', {
+            className: 'csb-in csb-grow', value: d.name, placeholder: '显示名（如 开发部）',
+            onChange: (e) => upd(i, { name: e.target.value }),
+          }),
+          h('button', {
+            className: 'csb-btn csb-btn-s csb-btn-d',
+            onClick: () => setDraft(draft.filter((_, j) => j !== i)),
+          }, '删除')),
+        // 部门主管（2026-11-16 Boss：必须人工设置，不能自动取第一个 Bot）
+        h('div', { className: 'csb-bar', style: { marginTop: 4, paddingLeft: 0 } },
+          h('span', { className: 'csb-set-d', style: { fontSize: 11.5, flex: 'none' } }, '主管'),
+          h('input', {
+            className: 'csb-in csb-grow', style: { fontSize: 12 },
+            value: d.leadBotName ?? '',
+            placeholder: '填这个部门当主管的 Bot 名字（留空=没有主管，说话唤醒全部）',
+            title: '填 Bot 的名字（不是 id）。有主管时群里说话只唤醒主管。',
+            onChange: (e) => upd(i, { leadBotName: e.target.value }),
+          })))),
       h('button', {
         className: 'csb-btn csb-btn-s',
         onClick: () => setDraft([...draft, { id: '', name: '' }]),
@@ -5617,9 +5628,24 @@ window.__ModuleLoader__.load({
         setErr(null)
         setMsg(null)
         try {
+          // ⚠️ 保存前**重取最新 rev**（2026-11-16 修 CAS 冲突）
+          //
+          //   弹窗里的 `data.bot.rev` 是打开那一刻的快照。若期间做过别的操作
+          //   （比如在「部门」下拉里改了 cwd），rev 已经 +1 ⇒ 用旧 rev 保存
+          //   必然 `roster.setProfile CAS 冲突：期望 rev=N，实际 rev=N+1`。
+          //
+          //   这本来是对的（拒绝静默覆盖），但用户体验是「点保存就报错」。
+          //   ⇒ 保存前 GET 一次拿最新 rev；拿不到就退回快照值（不阻塞保存尝试）。
+          let expectedRev = data?.bot?.rev ?? bot.rev
+          try {
+            const fresh = await call(`/roster/profile?id=${encodeURIComponent(bot.id)}`)
+            const latest = fresh?.bot?.rev
+            if (typeof latest === 'number') expectedRev = latest
+          } catch { /* 取不到就用快照值 */ }
+
           const res = await call('/roster/profile', {
             method: 'POST',
-            body: { id: bot.id, expectedRev: data?.bot?.rev ?? bot.rev, profile: draft },
+            body: { id: bot.id, expectedRev, profile: draft },
           })
           setMsg(`已保存${res.memory ? `，同步了 ${res.memory.added} 条记忆` : ''}`)
           reload()

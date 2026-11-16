@@ -197,7 +197,18 @@ export function validateSetting(key, raw) {
       }
       if (seen.has(id)) return { ok: false, reason: `${key} 里 id 重复：${id}` }
       seen.add(id)
-      out.push({ id, name })
+      // 部门主管（2026-11-16 Boss：「需要人工设置」，不能拿第一个 Bot）
+      //   存的是 **Bot 名字**（比 sessionId 稳定：重建 Bot 会换 sessionId，名字不变）
+      //   空/null = 该部门暂无主管 ⇒ 群聊发言时唤醒全部成员
+      const leadRaw = item.leadBotName
+      let leadBotName = null
+      if (leadRaw !== undefined && leadRaw !== null) {
+        if (typeof leadRaw !== 'string') {
+          return { ok: false, reason: `${key}.leadBotName 必须是字符串或 null` }
+        }
+        leadBotName = leadRaw.trim() || null
+      }
+      out.push({ id, name, ...(leadBotName ? { leadBotName } : {}) })
     }
     return { ok: true, value: out }
   }

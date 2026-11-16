@@ -226,6 +226,13 @@ const DEFAULT_SETTINGS = Object.freeze({
   // 既吵又必然失败（`ui` 根本没有会话可唤醒）。改缺省 = 把最吵、最容易失败的路径关掉；
   // 需要广播的房间显式 `mentionOnly:false` 打开。
   mentionOnly: true,
+  // ── 部门群聊标识（2026-11-16 Boss 规则）──────────────────────────────────
+  //
+  // Boss：「我说话只唤醒部门主任（主管），没有主管的话唤醒全部，有主管的话由主管处理」
+  //
+  // 有 deptId ⇒ 走「主管优先」：有主管只唤醒主管，没主管广播全部。
+  // 没 deptId 的普通房间 ⇒ 仍按 mentionOnly 规则，互不影响。
+  deptId: null,
 })
 /** `bodyRef` 的合法形态（防路径穿越：只允许 `bodies/<安全文件名>.txt`）。 */
 const BODY_REF_RE = /^bodies\/[A-Za-z0-9._-]+\.txt$/
@@ -418,6 +425,35 @@ function computeWakeTargets(room, message, options = {}) {
     return { targets: list, source: 'explicit' }
   }
 
+  // ── 部门群聊：主管优先（2026-11-16 Boss 规则）────────────────────────────
+  //
+  // Boss：「我说话只唤醒部门主任（主管），没有主管的话唤醒全部，
+  //       有主管的话由主管处理」
+  //
+  // 数据来源：`settings.deptId` 标记这是部门群聊；
+  //          主管 id 由调用方查部门配置后经 `options.deptLeadId` 传进来
+  //          （room 不跨服务查 team，保持单一职责）。
+  //
+  // 优先级：显式 @ > 部门主管 > 广播/mentionOnly
+  //   —— @ 的意图最强；部门主管次之；都没有才按原来的规则。
+  if (settings.deptId) {
+    // 先看有没有 @：@ 了谁就唤醒谁（不变）
+    const mentioned = collectMentions(message, members).filter(wakeable)
+    if (mentioned.length > 0) {
+      return { targets: mentioned, source: 'mention' }
+    }
+    // 有主管 ⇒ 只唤醒主管
+    const lead = typeof options?.deptLeadId === 'string' ? options.deptLeadId : ''
+    if (lead && members.includes(lead) && wakeable(lead)) {
+      return { targets: [lead], source: 'dept-lead' }
+    }
+    // 没主管 ⇒ 唤醒全部可唤醒成员
+    const all = members.filter(wakeable)
+    return all.length > 0
+      ? { targets: all, source: 'dept-broadcast' }
+      : { targets: [], source: 'mention-only-no-target' }
+  }
+
   if (mentionOnly) {
     const mentioned = collectMentions(message, members)
     const targets = mentioned.filter(wakeable)
@@ -529,6 +565,18 @@ function normalizeSettingValue(key, value, where) {
       )
     }
     return value
+  }
+  // 部门群聊标识（2026-11-16）：null 或非空字符串（部门 id）
+  if (key === 'deptId') {
+    if (value === null || value === undefined) return null
+    if (typeof value !== 'string' || !value.trim()) {
+      throw new RoomError(
+        `room.${where}：settings.deptId 必须是非空字符串或 null，收到 ${JSON.stringify(value)}`,
+        'ROOM_BAD_SETTING',
+        { field: 'settings.deptId', where },
+      )
+    }
+    return value.trim()
   }
   if (key === 'maxBotsPerRound') {
     if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {

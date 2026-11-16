@@ -139,3 +139,26 @@ test('历史部门 UI：默认保留，清空是显式动作', () => {
   assert.match(DEPT, /全部清空/, '清空是另一个显式按钮')
   assert.match(DEPT, /还有 Bot，不能清空/, '有 Bot 时按钮禁用并说明原因')
 })
+
+// ── 部门主管（2026-11-16 Boss：必须人工设置）───────────────────────────────
+
+test('★ 主管：管理部门弹窗里能人工填主管名字', () => {
+  assert.match(MANAGE, /主管/, '要有主管字段')
+  assert.match(MANAGE, /leadBotName/, '字段名 leadBotName')
+  assert.match(MANAGE, /留空=没有主管，说话唤醒全部/, '要说明留空的含义')
+  assert.match(MANAGE, /填 Bot 的名字（不是 id）/, '要说清填名字不是 id')
+})
+
+test('★ 主管：后端不自动取第一个 Bot', async () => {
+  const dt = (await import('node:fs')).readFileSync(join(HERE, '..', 'src', 'depttree.js'), 'utf8')
+  assert.ok(!/inDept\[0\]/.test(dt), '不许出现 inDept[0]（自动取第一个）')
+  assert.match(dt, /wantedLead/, '要按 leadBotName 查')
+})
+
+test('★ 唤醒规则：部门群聊带 deptId，主管优先于广播', async () => {
+  const room = (await import('node:fs')).readFileSync(join(HERE, '..', 'src', 'room.js'), 'utf8')
+  assert.match(room, /if \(settings\.deptId\)/, '部门群聊走专用分支')
+  assert.match(room, /source: 'dept-lead'/, '有主管只唤醒主管')
+  assert.match(room, /source: 'dept-broadcast'/, '没主管广播')
+  assert.match(room, /deptId: null/, 'DEFAULT_SETTINGS 要有 deptId')
+})

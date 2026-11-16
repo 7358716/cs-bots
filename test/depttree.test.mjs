@@ -57,17 +57,37 @@ test('ensureDeptTeam：部门没 Bot 时也能建团队（leadId 用 Boss 兜底
   assert.equal(r.team.leadId, 'ui', '没有 Bot 时由 Boss 兜底当负责人')
 })
 
-test('ensureDeptTeam：部门有 Bot 时用该 Bot 当负责人，且不与自己自引用', async (t) => {
+test('★ ensureDeptTeam：**不自动拿第一个 Bot 当主管**（Boss：需要人工设置）', async (t) => {
+  // 2026-11-16 Boss：「不能设置拿部门里第一个 Bot，需要人工设置」
+  // 旧实现取 inDept[0] —— 用户永远不知道"主管"是谁、也没机会改。
   const { services, depts } = setup(t)
   await services.roster.create({ name: '开发执行岗', department: 'dev', byId: 'ui' })
   const r = await ensureDeptTeam(services, depts[0], 'ui')
   assert.ok(r.team, `建团队失败：${r.reason}`)
-  const lead = r.team.leadId
-  assert.notEqual(lead, 'ui', '有 Bot 时应由 Bot 当负责人')
+  assert.equal(r.team.leadId, 'ui', '没人工设主管时用 Boss 占位（绝不自动挑 Bot）')
+})
+
+test('★ ensureDeptTeam：人工设了 leadBotName ⇒ 用它当主管', async (t) => {
+  const { services, depts } = setup(t)
+  const bot = await services.roster.create({ name: '开发执行岗', department: 'dev', byId: 'ui' })
+  // 人工指定主管
+  const deptWithLead = { ...depts[0], leadBotName: '开发执行岗' }
+  const r = await ensureDeptTeam(services, deptWithLead, 'ui')
+  assert.ok(r.team, `建团队失败：${r.reason}`)
+  assert.equal(r.team.leadId, bot.sessionId, '主管应是人工指定的那个 Bot')
   assert.ok(
-    !(r.team.members ?? []).includes(lead),
-    'leadId 不能同时出现在 memberIds（会形成自引用，实测被拒）',
+    !(r.team.members ?? []).includes(r.team.leadId),
+    'leadId 不能同时出现在 memberIds（会形成自引用）',
   )
+})
+
+test('★ ensureDeptTeam：leadBotName 指向不存在的 Bot ⇒ 回退 Boss，不报错', async (t) => {
+  const { services, depts } = setup(t)
+  await services.roster.create({ name: '开发执行岗', department: 'dev', byId: 'ui' })
+  const deptWithBadLead = { ...depts[0], leadBotName: '不存在的岗' }
+  const r = await ensureDeptTeam(services, deptWithBadLead, 'ui')
+  assert.ok(r.team, `不该因为主管名不存在就建不出团队：${r.reason}`)
+  assert.equal(r.team.leadId, 'ui', '找不到就回退 Boss')
 })
 
 test('ensureDeptTeam：幂等 —— 重复调用复用同一团队', async (t) => {
@@ -165,4 +185,66 @@ test('部门管理：改名后部门名与团队名应保持一致（depttree �
   const { services, depts } = setup(t)
   const r = await ensureDeptTeam(services, depts[0], 'ui')
   assert.equal(r.team.name, depts[0].name, '团队名 = 部门名，这是 depttree 的查找约定')
+})
+
+// ── 部门群聊唤醒规则（2026-11-16 Boss）────────────────────────────────────
+// 「我说话只唤醒部门主任（主管），没有主管的话唤醒全部，有主管的话由主管处理」
+
+test('★ 部门群聊：有主管 ⇒ 只唤醒主管一个人', async (t) => {
+  const { services, depts } = setup(t)
+  await services.roster.create({ name: '开发执行岗', department: 'dev', byId: 'ui' })
+  const room = await ensureDeptRoom(services, { ...depts[0], leadBotName: '开发执行岗' }, 'ui')
+  assert.ok(room.room, room.reason)
+  assert.equal(room.room.settings?.deptId, 'dev', '部门群聊要带 deptId 标记')
+  // 主管必须是**群成员**才可能被唤醒（不在群里的 id 不算）
+  const lead = room.room.members.find((m) => m.startsWith('bot-'))
+  assert.ok(lead, '房间应有 Bot 成员')
+  const decided = services.room.computeWakeTargets(
+    { members: room.room.members, settings: room.room.settings },
+    { from: 'ui', text: '大家好' },
+    { deptLeadId: lead },
+  )
+  assert.deepEqual(decided.targets, [lead], '有主管只唤醒主管一个')
+  assert.equal(decided.source, 'dept-lead')
+
+  // 主管不在群成员里 ⇒ 视为没有主管，退回广播
+  const noLead = services.room.computeWakeTargets(
+    { members: room.room.members, settings: room.room.settings },
+    { from: 'ui', text: '大家好' },
+    { deptLeadId: 'bot-not-in-room' },
+  )
+  assert.equal(noLead.source, 'dept-broadcast', '主管不在群里时退回广播')
+})
+
+test('★ 部门群聊：没主管 ⇒ 唤醒全部可唤醒成员', async (t) => {
+  const { services, depts } = setup(t)
+  // 先建两个 Bot，否则房间里只有 ui（人类），没有可唤醒对象
+  await services.roster.create({ name: '甲岗', department: 'dev', byId: 'ui' })
+  await services.roster.create({ name: '乙岗', department: 'dev', byId: 'ui' })
+  const room = await ensureDeptRoom(services, depts[0], 'ui')
+  assert.ok(room.room, room.reason)
+  const decided = services.room.computeWakeTargets(
+    { members: room.room.members, settings: room.room.settings },
+    { from: 'ui', text: '大家好' },
+    { deptLeadId: null },
+  )
+  assert.equal(decided.source, 'dept-broadcast')
+  assert.ok(decided.targets.length >= 1, '应唤醒全部 Bot')
+  assert.ok(!decided.targets.includes('ui'), '不唤醒人类/发送者')
+})
+
+test('★ 部门群聊：显式 @ 优先于主管（@ 谁就唤醒谁）', async (t) => {
+  const { services, depts } = setup(t)
+  await services.roster.create({ name: '开发执行岗', department: 'dev', byId: 'ui' })
+  const room = await ensureDeptRoom(services, { ...depts[0], leadBotName: '开发执行岗' }, 'ui')
+  assert.ok(room.room, room.reason)
+  const botMember = room.room.members.find((m) => m.startsWith('bot-'))
+  assert.ok(botMember, '房间应有 Bot 成员')
+  const decided = services.room.computeWakeTargets(
+    { members: room.room.members, settings: room.room.settings },
+    { from: 'ui', text: '你好', mentions: [botMember] },
+    { deptLeadId: 'bot-lead-1' },
+  )
+  assert.equal(decided.source, 'mention', '@ 优先于主管')
+  assert.deepEqual(decided.targets, [botMember])
 })

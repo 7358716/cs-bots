@@ -67,22 +67,27 @@ export async function ensureDeptTeam(services, dept, by = 'ui') {
   } catch { /* 查失败就当作没有，往下建 */ }
 
   try {
-    // leadId：优先用该部门下已存在的某个 Bot（拿第一个），没有就留空
-    // —— 团队的 lead 允许后续再设，不该为了建团队而卡住
     const bots = services?.roster?.list?.() ?? []
-    const root = String(services?.settings?.botWorkspaceRoot ?? '').replace(/\/+$/, '')
+    const root = String(services?.settings?.botWorkspaceRoot ?? '').replace(/[\\/]+$/, '')
     const inDept = root
       ? bots.filter((b) => typeof b?.cwd === 'string' && isInsideDir(join(root, dept.id), b.cwd))
       : []
-    const leadId = inDept[0]?.sessionId ?? inDept[0]?.id
 
-    // ⚠️ `teams.create` 要求 leadId **必填**（实测报
-    //    「teams.create：leadId 必须是非空字符串，收到 undefined」）。
-    //    部门刚建、还没 Bot 时没有天然负责人 —— 用 Boss（`ui`）兜底：
-    //    部门本来就是 Boss 建的，他当负责人最合理，等有 Bot 了再在页面上换。
-    // ⚠️ leadId **不能**同时出现在 memberIds 里（实测报
-    //    「leadId X 不能同时出现在 memberIds 中（会形成自引用）」）。
-    //    所以先从成员里剔除负责人，再交给 teams.create。
+    // ── 主管：**只能人工指定**（2026-11-16 Boss：「不能设置拿部门里第一个 Bot」）──
+    //
+    //   配置项：`settings.departments[].leadBotName`（存名字不存 sessionId ——
+    //   重建 Bot 会换 sessionId，名字稳定）。
+    //
+    //   找不到就**留空**，绝不自动挑一个。理由：
+    //     自动挑第一个是「看起来能跑」的假象 —— 第一个 Bot 可能是不相关的岗，
+    //     用户永远不知道"主管"到底是谁、也没机会改。
+    //
+    //   留空时用 Boss（`ui`）占位，因为：
+    //     ⚠️ `teams.create` 要求 leadId **必填**（实测报「leadId 必须是非空字符串」）。
+    //     ⚠️ leadId **不能**同时出现在 memberIds 里（「会形成自引用」）。
+    const wantedLead = typeof dept?.leadBotName === 'string' ? dept.leadBotName.trim() : ''
+    const leadBot = wantedLead ? inDept.find((b) => b.name === wantedLead) : undefined
+    const leadId = leadBot ? (leadBot.sessionId ?? leadBot.id) : null
     const lead = leadId ?? 'ui'
     const memberIds = inDept
       .map((b) => b.sessionId ?? b.id)
@@ -167,6 +172,10 @@ export async function ensureDeptRoom(services, dept, by = 'ui') {
       // everyone：全员可发言（见上方注释）
       mode: 'everyone',
       purpose: `部门「${dept.name}」的群聊：Boss 在这里安排工作，成员在这里对齐`,
+      // ★ deptId 标记「这是部门群聊」（2026-11-16）
+      //   唤醒时据此走「主管优先」规则：有主管只唤醒主管，没有则唤醒全部。
+      //   没有这个标记的普通房间仍按原 mentionOnly 规则走，互不影响。
+      settings: { deptId: dept.id },
       byId: by,
     })
     attachTeamRoom(services, team, room.id, by)
