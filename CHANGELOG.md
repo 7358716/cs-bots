@@ -13,6 +13,71 @@
 
 ---
 
+## [0.18.0] - 2026-11-16
+
+Boss 本轮全部要求的落地批次。
+
+### Changed · 启动时不再登记任何 workspace（根治「页面登录不了」）
+
+Boss：「cs-bots 默认是空的，没有 bot 也没有部门，为什么要在启动的时候加载部门？」
+
+原启动逻辑登记「主目录 + 每个部门目录」，代价是灾难性的：
+宿主 `create` 查重依赖**内存态 entities**，域初始化期间不可靠
+⇒ 建出第二条同路径记录 ⇒ `workspace domain is inconsistent`
+⇒ workspaceRegistry 起不来 ⇒ 5 个组件 pending ⇒ **页面登录不了**，
+且清掉后重启又复发。
+
+现在：**启动一条都不建**。初始状态左侧栏为空 —— 这是正确行为。
+
+### Changed · 取消内置部门
+
+`departments` 默认 `[]`，`defaultDepartment` 默认 `''`。
+
+### Added · 部门分组标题用中文名
+
+`ensureWorkspaceDir(dir, title)` 传部门显示名（左侧显示「开发部」不是 `dev`）。
+
+### Added · 部门树页面（DeptTab 重做）
+
+- **空状态不造假层级**：没部门只给引导 +「新建第一个部门」
+- 树：部门可折叠（0 Bot 显示 `·`）、Bot 缩进、显示 Bot 数
+- 点部门 → 群聊；点 Bot → 详情 + 派活
+- 部门管理抽成独立 `DeptManageModal`
+
+### Added · 拖拽与批量换部门
+
+Bot 行 draggable、部门行 onDragOver/onDrop、悬停高亮；
+复选框 + 「已选 N 个 → 移到部门…」；串行执行、逐个上报失败。
+
+### Fixed · 换部门路径改由后端 join 拼
+
+前端原手拼 `${root}/${deptId}/${leaf}`，Windows 上得到混合分隔符。
+新增后端 `action: 'moveToDept'`，用 `join()` 拼并校验部门存在。
+
+### Added · 历史部门提示（方案B）
+
+`GET /departments/legacy` 识别旧内置 id，返回 Bot 数与 canClear。
+UI 顶部黄色提示条：【保留】默认，【全部清空】显式（有 Bot 时禁用）。
+
+### Added · 导入导出（zip + 确认页 + 校核提示）
+
+**`src/zip.js`** 零依赖 ZIP（`node:zlib` 拼结构）：
+DEFLATE/STORE、CRC32 校验、UTF-8 文件名、ZIP64 显式拒绝。
+互操作已验证：系统 `unzip -t` 通过；能读 Python zipfile 的包。
+
+**`src/transfer.js`**：buildExport / estimateExport / inspectPackage / applyImport
+- 8 个段：部门、Bot、技能、记忆、纪律、提示词、设置、任务板
+- 含文件独立开关；500MB 上限 + confirmLarge
+- 校核 9 项，**2 项阻断**（格式、校验和）
+- 冲突三策略：overwrite（默认）/ skip / rename
+- 事务性：临时目录 → 替换；事件流只追加
+
+**四个端点**：/transfer/export/estimate · /transfer/export · /transfer/inspect · /transfer/import
+
+**两个确认页**：导出（勾内容→实时体积→超限二次确认）、导入（选文件→校核→选策略→确认）。
+
+---
+
 ## [0.17.0] - 2026-11-16
 
 Boss 三项指示（按顺序）：
