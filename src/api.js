@@ -2714,10 +2714,13 @@ export function installApi(ctx, { warn } = {}) {
           ])]
           for (const deptId of deptIds) {
             const dir = join(root, deptId)
+            // ⚠️ title 用**部门显示名**（2026-11-16 Boss：「命名需要和部门名称一致」）。
+            //    宿主默认拿目录名当 title ⇒ 左侧栏显示 `dev`/`qa` 这种英文 id。
+            const deptName = depts.find((d) => d?.id === deptId)?.name
             try {
               // 目录存在才能被 realpath 归一化（registry.create 要求真实目录）
               if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
-              const r = await withLock(() => ensureWorkspaceDir(ctx, dir))
+              const r = await withLock(() => ensureWorkspaceDir(ctx, dir, deptName))
               if (r.ok) hierarchy.depts += 1
               else hierarchy.failed.push({ path: dir, reason: r.reason })
             } catch (error) {

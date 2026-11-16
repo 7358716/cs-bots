@@ -27,12 +27,15 @@ export const SETTING_SPECS = Object.freeze({
   // 部门字典：`[{ id: 'dev', name: '开发部' }]`。
   // `id` 用作目录名（英文、短、URL 安全），`name` 用作显示（中文）。
   // 保序（用户可拖拽排序）⇒ 用数组不用对象。
+  // 部门列表。
+  //
+  // ⚠️ 2026-11-16 Boss 定：**不内置任何部门**，全部由用户自己建。
+  //   之前写死了 dev/qa/ops 三个，后果是：
+  //     · 用户看到一堆自己没建过的部门，不知道哪来的
+  //     · 「待归类 misc」这种内部兜底目录也被当成部门展示
+  //   ⇒ 默认空数组。用户第一次进「部门」页时自己加。
   departments: {
-    def: [
-      { id: 'dev', name: '开发部' },
-      { id: 'qa', name: '测试部' },
-      { id: 'ops', name: '综合部' },
-    ],
+    def: [],
     departments: true,
     label: '部门',
   },
@@ -41,7 +44,8 @@ export const SETTING_SPECS = Object.freeze({
   // 默认部门 id。**不写死白名单** —— 部门是用户可增删的字典，
   // 写死 options 会导致「用户新增部门后设不成默认」。
   // 「是否存在」由 `validateDepartmentsPatch` 交叉校验（见 validateSetting 末尾）。
-  defaultDepartment: { def: 'dev', departmentRef: true, label: '默认部门' },
+  // ⚠️ 没有内置部门了，默认值也跟着空 —— 否则「默认部门 dev」指向一个不存在的部门。
+  defaultDepartment: { def: '', departmentRef: true, label: '默认部门' },
 
   /** 任务默认占用时长（ms）：owner claim 后多久未心跳即视为失联。 */
   defaultLeaseMs: { def: 5 * 60_000, min: 10_000, max: 24 * 60 * 60_000, label: '任务占用默认时长（ms）' },
@@ -200,8 +204,10 @@ export function validateSetting(key, raw) {
 
   // 部门引用：非空字符串（存在性在跨字段校验里做，单独 validate 时无从得知字典）
   if (spec.departmentRef) {
-    if (typeof raw !== 'string' || raw.trim() === '') {
-      return { ok: false, reason: `${key} 必须是非空部门 id 字符串` }
+    // 允许空字符串 = 「没有默认部门」（2026-11-16：取消内置部门后，
+    // 新装用户一个部门都没有，此时「默认部门」只能为空）。
+    if (typeof raw !== 'string') {
+      return { ok: false, reason: `${key} 必须是字符串` }
     }
     return { ok: true, value: raw.trim() }
   }

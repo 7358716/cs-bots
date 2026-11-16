@@ -22,6 +22,8 @@ function boot(settings = {}) {
   const stateDir = mkdtempSync(join(tmpdir(), 'cs-bots-rebuild-'))
   writeFileSync(join(stateDir, 'settings.json'), JSON.stringify({
     botWorkspaceRoot: join(stateDir, 'cs-bots'),
+    // 2026-11-16 取消内置部门后，测试要自己声明部门
+    departments: [{ id: 'dev', name: '开发部' }, { id: 'qa', name: '测试部' }],
     ...settings,
   }))
   const box = { handler: null }

@@ -354,17 +354,30 @@ export async function ensureDeptSession(ctx, services, dept) {
   }
 
   // ③ 建一个常驻会话
-  try {
-    const { createSession } = await import('./kernel.js')
-    const { randomUUID } = await import('node:crypto')
-    const sessionId = `session-${randomUUID()}`
-    await createSession(ctx, {
-      sessionId,
-      cwd: deptDir,
-      agentOptions: { meta: { cwd: deptDir, title: deptSessionName(dept.name) } },
-    })
-    return { ok: true, sessionId, created: true }
-  } catch (error) {
-    return { ok: false, reason: `建部门常驻会话失败：${error?.message ?? error}` }
+  //
+  // ⚠️ `createSession` 依赖宿主的 `agents` 服务，而**插件启动时它可能还没就绪**
+  //    （2026-11-16 实测：「agents.create 不可用（宿主未提供 agents 服务）」）
+  //    ⇒ 必须重试等待，不能一次失败就放弃。
+  const { createSession, service: getService } = await import('./kernel.js')
+  const { randomUUID } = await import('node:crypto')
+
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const agents = (() => { try { return getService(ctx, 'agents') } catch { return undefined } })()
+    if (agents && typeof agents.create === 'function') {
+      try {
+        const sessionId = `session-${randomUUID()}`
+        await createSession(ctx, {
+          sessionId,
+          cwd: deptDir,
+          agentOptions: { meta: { cwd: deptDir, title: deptSessionName(dept.name) } },
+        })
+        return { ok: true, sessionId, created: true }
+      } catch (error) {
+        return { ok: false, reason: `建部门常驻会话失败：${error?.message ?? error}` }
+      }
+    }
+    // agents 还没就绪 ⇒ 等 500ms 再试（最多 10s）
+    await new Promise((resolve) => { setTimeout(resolve, 500) })
   }
+  return { ok: false, reason: '等待 agents 服务超时（10s），暂未建部门常驻会话' }
 }

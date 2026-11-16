@@ -13,6 +13,42 @@
 
 ---
 
+## [0.17.0] - 2026-11-16
+
+Boss 三项指示（按顺序）：
+
+### Changed · 部门分组标题用中文名
+
+Boss：「本机云服务器的 DSH 左侧栏可见，但命名需要和部门名称一致」
+
+宿主 `registry.create(path, title)` 支持传 title，但默认拿**目录名**当标题
+⇒ 左侧栏显示 `dev` / `qa` / `ops`（英文 id）。
+
+修法：`ensureWorkspaceDir(ctx, dir, title)` 增加 title 参数，
+启动与 tidy 都传**部门显示名**（`开发部`）。已存在的分组走 `setTitle` 改名。
+
+### Changed · 取消内置部门（全由用户自建）
+
+Boss：「不要内置部门名称，均需要用户自行建立」
+
+`departments` 默认从 `[dev, qa, ops]` 改为 **`[]`**。
+
+之前内置的后果：用户看到一堆自己没建过的部门，且内部兜底目录 `misc` 也被当部门展示。
+
+连带：`defaultDepartment` 默认改为 `''`，`departmentRef` 校验允许空
+（否则「默认部门 dev」指向一个不存在的部门）。
+
+### Fixed · 部门常驻会话建不出来（左侧栏空白的直接原因）
+
+`ensureDeptSession` → `createSession` → `service(ctx,'agents')`，
+而 **`agents` 是宿主服务，插件启动时可能还没就绪**
+（实测报「agents.create 不可用（宿主未提供 agents 服务）」）
+⇒ 部门永远没有会话 ⇒ 宿主按会话重建 workspace 时清掉这些分组 ⇒ 左侧栏空白。
+
+修法：最多 20 次 × 500ms 等 `agents.create` 就绪，超时才放弃并 warn。
+
+---
+
 ## [0.16.0] - 2026-11-16
 
 ### Fixed · ★ 硬编码 `/` 导致 Windows 上整条链路失效（**Win 左侧栏全空的真根因**）

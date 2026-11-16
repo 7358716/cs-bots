@@ -706,7 +706,7 @@ export function listWorkspaceRecords(dir) {
  * @param {string} dir 绝对目录路径（必须已存在）
  * @returns {Promise<{ok: boolean, created?: boolean, reason?: string}>}
  */
-export async function ensureWorkspaceDir(ctx, dir) {
+export async function ensureWorkspaceDir(ctx, dir, title) {
   if (typeof dir !== 'string' || !dir.trim()) return { ok: false, reason: 'dir 为空' }
   const registry = service(ctx, 'workspaceRegistry')
   if (!registry) return { ok: false, reason: '宿主未提供 workspaceRegistry' }
@@ -715,7 +715,16 @@ export async function ensureWorkspaceDir(ctx, dir) {
     if (typeof registry.resolveByPath === 'function') {
       existed = await registry.resolveByPath(dir)
     }
-    if (existed) return { ok: true, created: false }
+    if (existed) {
+      // 已存在：如果给了 title 且与当前不同，顺手改名（否则旧的英文名会一直留着）
+      if (typeof title === 'string' && title.trim() && typeof existed.setTitle === 'function') {
+        try {
+          const cur = typeof existed.title === 'string' ? existed.title : ''
+          if (cur !== title.trim()) await existed.setTitle(title.trim())
+        } catch { /* 改名失败不影响登记 */ }
+      }
+      return { ok: true, created: false }
+    }
     if (typeof registry.create !== 'function') return { ok: false, reason: 'registry 无 create' }
 
     // ⚠️ **必须先建目录**（2026-11-15 Windows 实测踩坑）
@@ -736,7 +745,10 @@ export async function ensureWorkspaceDir(ctx, dir) {
       return { ok: false, reason: `建目录失败（${dir}）：${error?.message ?? error}` }
     }
 
-    await registry.create(dir)
+    // ⚠️ 传 title（2026-11-16 Boss：「命名需要和部门名称一致」）：
+    //   宿主默认拿目录名当 title ⇒ `dev` / `qa` 这种英文 id 直接显示在左侧栏。
+    //   传中文名（`开发部`）才符合直觉。
+    await registry.create(dir, typeof title === 'string' && title.trim() ? title.trim() : undefined)
     return { ok: true, created: true }
   } catch (error) {
     return { ok: false, reason: `建 Workspace 失败：${error?.message ?? error}` }

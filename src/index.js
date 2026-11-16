@@ -35,6 +35,7 @@ import { createTeams } from './teams.js'
 import { createSubscription } from './subscription.js'
 import { createDirBrowser } from './dirbrowse.js'
 import { loadSettings } from './settings.js'
+import { join } from 'node:path'
 import { ensureDeptSession } from './depttree.js'
 import { probeHost, formatReport } from './compat.js'
 
@@ -343,6 +344,13 @@ function applyInner(ctx, config, { log, warn }) {
           let ok = 0; let fail = 0
           for (const d of depts) {
             try {
+              // 先按部门名登记该部门目录（title 用中文名），再建常驻会话
+              const deptDir = join(String(settings.botWorkspaceRoot).replace(/\/+$/, ''), d.id)
+              try {
+                const { mkdirSync } = await import('node:fs')
+                mkdirSync(deptDir, { recursive: true })
+                await withLock2(() => ensureWorkspaceDir(ctx, deptDir, d.name))
+              } catch { /* 登记失败不阻塞会话创建 */ }
               const r = await withLock2(() => ensureDeptSession(ctx, services, d))
               if (r.ok) { ok += 1; if (r.created) log(`[cs-bots] 已为部门「${d.name}」建常驻会话`) }
               else { fail += 1; warn(`[cs-bots] 部门「${d.name}」常驻会话：${r.reason}`) }

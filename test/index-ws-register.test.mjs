@@ -131,7 +131,11 @@ test('装配：服务可用后会把 Bot 主目录登记成 Workspace 分组（�
   try {
     // 轮询最多 10×500ms，这里等 1.2s 足够
     await new Promise((r) => setTimeout(r, 1200))
-    assert.deepEqual(h.created, [h.botsRoot], `应正好登记主目录一条，实际 ${JSON.stringify(h.created)}`)
+    // 2026-11-16 起：除了主目录，还会登记**部门目录**（title 用部门名，
+    // 让左侧栏显示「开发部」而不是目录名 `dev`）。所以断言改为「主目录在内 + 没有多余」。
+    assert.ok(h.created.includes(h.botsRoot), `主目录应被登记，实际 ${JSON.stringify(h.created)}`)
+    assert.ok(h.created.includes(join(h.botsRoot, 'dev')), '部门目录也应被登记（用于显示中文名）')
+    assert.equal(h.created.length, 2, `应只有主目录 + 1 个部门，实际 ${JSON.stringify(h.created)}`)
   } finally { h.cleanup() }
 })
 
