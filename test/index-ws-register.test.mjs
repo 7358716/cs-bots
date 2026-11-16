@@ -126,16 +126,18 @@ test('装配：插件**不**声明 inject（声明会导致 pending，见 index.
   assert.equal(mod.inject, undefined, '不应导出 inject（会阻塞插件启动）')
 })
 
-test('装配：服务可用后会把 Bot 主目录登记成 Workspace 分组（运行时探测模型）', async () => {
+test('★ 装配：启动时**不登记任何 workspace**（2026-11-16 Boss 定）', async () => {
+  // Boss：「cs-bots 默认是空的，没有 bot 也没有部门，为什么要在启动的时候加载部门？」
+  //
+  // 原实现在启动时登记「主目录 + 每个部门目录」，代价是灾难性的：
+  //   宿主 create 的查重依赖内存态 entities，域初始化期间不可靠
+  //   ⇒ 建出第二条同路径记录 ⇒ domain is inconsistent ⇒ 页面登录不了
+  //
+  // 现在：启动时一条都不建。用户建 Bot 时才登记该 Bot 的目录。
   const h = boot2({ registryAvailable: true })
   try {
-    // 轮询最多 10×500ms，这里等 1.2s 足够
     await new Promise((r) => setTimeout(r, 1200))
-    // 2026-11-16 起：除了主目录，还会登记**部门目录**（title 用部门名，
-    // 让左侧栏显示「开发部」而不是目录名 `dev`）。所以断言改为「主目录在内 + 没有多余」。
-    assert.ok(h.created.includes(h.botsRoot), `主目录应被登记，实际 ${JSON.stringify(h.created)}`)
-    assert.ok(h.created.includes(join(h.botsRoot, 'dev')), '部门目录也应被登记（用于显示中文名）')
-    assert.equal(h.created.length, 2, `应只有主目录 + 1 个部门，实际 ${JSON.stringify(h.created)}`)
+    assert.deepEqual(h.created, [], `启动时不该建任何 workspace，实际 ${JSON.stringify(h.created)}`)
   } finally { h.cleanup() }
 })
 

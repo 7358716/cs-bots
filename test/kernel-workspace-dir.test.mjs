@@ -37,29 +37,44 @@ function fakeRegistry({ existing = [] } = {}) {
   }
 }
 
+/**
+ * 生成一个「磁盘上肯定不存在」的临时路径。
+ *
+ * ⚠️ 为什么需要：2026-11-16 给 `ensureWorkspaceDir` 加了**磁盘查重**
+ *   （先读 `workspace.json` 看这条路径是否已登记）。用固定的
+ *   `/home/ubuntu/cs-bots` 会命中本机真实记录 ⇒ 直接返回 alreadyInFile ⇒ 测试假失败。
+ */
+let tmpSeq = 0
+function freshPath() {
+  tmpSeq += 1
+  return `/tmp/cs-bots-wstest-${process.pid}-${Date.now()}-${tmpSeq}`
+}
+
 function ctxWith(registry) {
   return { get: (k) => (k === 'workspaceRegistry' ? registry : undefined) }
 }
 
 test('ensureWorkspaceDir：目录未注册 ⇒ 建一个，且**不挂任何 session**', async () => {
   const f = fakeRegistry()
-  const r = await ensureWorkspaceDir(ctxWith(f.registry), '/home/ubuntu/cs-bots')
+  const p = freshPath()
+  const r = await ensureWorkspaceDir(ctxWith(f.registry), p)
   assert.equal(r.ok, true)
   assert.equal(r.created, true)
-  assert.deepEqual(f.created, ['/home/ubuntu/cs-bots'])
+  assert.deepEqual(f.created, [p])
   assert.equal(f.attachCalls, 0, '只建分组容器，绝不能顺手挂会话（那是 2026-11-15 事故的成因）')
 })
 
 test('ensureWorkspaceDir：已注册 ⇒ 复用，不重复建', async () => {
-  const f = fakeRegistry({ existing: ['/home/ubuntu/cs-bots'] })
-  const r = await ensureWorkspaceDir(ctxWith(f.registry), '/home/ubuntu/cs-bots')
+  const __p = freshPath()
+  const f = fakeRegistry({ existing: [__p] })
+  const r = await ensureWorkspaceDir(ctxWith(f.registry), __p)
   assert.equal(r.ok, true)
   assert.equal(r.created, false)
   assert.deepEqual(f.created, [], '已存在就不该再 create（重复注册会导致 domain inconsistent）')
 })
 
 test('ensureWorkspaceDir：host 没有 workspaceRegistry ⇒ 返回 ok:false，绝不抛', async () => {
-  const r = await ensureWorkspaceDir(ctxWith(undefined), '/home/ubuntu/cs-bots')
+  const r = await ensureWorkspaceDir(ctxWith(undefined), freshPath())
   assert.equal(r.ok, false)
   assert.ok(r.reason, '要给可读原因，让调用方 warn 出来')
 })
@@ -69,7 +84,7 @@ test('ensureWorkspaceDir：create 抛错 ⇒ 返回 ok:false 带原因，不冒�
     async resolveByPath() { return undefined },
     async create() { throw new Error('domain is inconsistent') },
   }
-  const r = await ensureWorkspaceDir(ctxWith(registry), '/home/ubuntu/cs-bots')
+  const r = await ensureWorkspaceDir(ctxWith(registry), freshPath())
   assert.equal(r.ok, false)
   assert.match(r.reason, /domain is inconsistent/, '要把宿主的原始原因带出来，别吞掉')
 })
@@ -86,25 +101,27 @@ test('ensureWorkspaceDir：dir 为空 ⇒ ok:false（不拿空路径去 create�
 // 调用方必须**有限次重试**，等宿主把 registry provide 出来。
 
 test('ensureWorkspaceDir：registry 未就绪时返回可识别的 reason（调用方据此重试）', async () => {
-  const r = await ensureWorkspaceDir(ctxWith(undefined), '/home/ubuntu/cs-bots')
+  const r = await ensureWorkspaceDir(ctxWith(undefined), freshPath())
   assert.equal(r.ok, false)
   assert.match(r.reason, /未提供 workspaceRegistry/, 'reason 必须可识别，否则调用方无从判断该不该重试')
 })
 
 test('ensureWorkspaceDir：先未就绪、后就绪 ⇒ 第二次调用成功（模拟重试）', async () => {
+  const __p = freshPath()
   let ready = false
   const f = fakeRegistry()
   const ctx = {
     get: (k) => (k === 'workspaceRegistry' && ready ? f.registry : undefined),
   }
-  const first = await ensureWorkspaceDir(ctx, '/home/ubuntu/cs-bots')
+  // 两次必须用**同一个路径**，否则测不出「重试成功」
+  const first = await ensureWorkspaceDir(ctx, __p)
   assert.equal(first.ok, false, '第一次 registry 还没就绪')
 
   ready = true
-  const second = await ensureWorkspaceDir(ctx, '/home/ubuntu/cs-bots')
+  const second = await ensureWorkspaceDir(ctx, __p)
   assert.equal(second.ok, true, 'registry 就绪后重试必须成功')
   assert.equal(second.created, true)
-  assert.deepEqual(f.created, ['/home/ubuntu/cs-bots'], '只建一次，不重复')
+  assert.deepEqual(f.created, [__p], '只建一次，不重复')
 })
 
 // ── 2026-11-15 Windows 实测：目录不存在时 registry.create 会抛 ──────────────

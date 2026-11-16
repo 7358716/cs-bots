@@ -3252,40 +3252,98 @@ window.__ModuleLoader__.load({
      * ## 为什么群聊放右侧而不嵌在左列
      *   群聊要能看历史、要能输入长文本 —— 塞进 300px 的侧栏没法用。
      */
+/**
+     * 部门与 Bot（2026-11-16 重做，Boss 要「尽量完整的 UI 页面」）。
+     *
+     * ## 这一页要解决什么
+     *
+     *   Boss：「初始不需要 cs-bots，如果用户创建了部门和 bot，左侧栏要有树型层级展示；
+     *         先做个 UI 页面出来，尽量完整让我验证」
+     *
+     *   ⇒ 左侧栏怎么显示是宿主的决定（我们控制不了），但**我们能给一个完整可控的树**。
+     *     这一页就是那棵树：部门 → Bot → 会话，加上群聊和派活。
+     *
+     * ## 布局
+     *
+     *   ┌─────────────┬──────────────────────────────────────┐
+     *   │ 部门树（可折叠）│ 选中节点的详情 / 群聊                  │
+     *   │ ▼ 开发部 (3)  │  📢 开发部                             │
+     *   │   🤖 Bot A    │  成员 / 群聊消息 / 安排工作              │
+     *   │   🤖 Bot B    │                                       │
+     *   │ ▶ 测试部 (0)  │                                       │
+     *   │ ＋ 新建部门    │                                       │
+     *   └─────────────┴──────────────────────────────────────┘
+     *
+     * ## 空状态（默认情况，Boss 明确要求）
+     *
+     *   没有部门时**不显示任何假的层级**，只给一个引导：「先建一个部门」。
+     *   这与「初始不需要 cs-bots」一致 —— 不凭空造东西。
+     *
+     * ## 为什么折叠状态放组件内 state 而不是持久化
+     *
+     *   这是**临时的视觉状态**，不该跨设备同步。每次进来默认展开第一个有内容的部门，
+     *   其余折叠 —— 保证一眼能看到东西，又不会被长列表淹没。
+     */
     function DeptTab() {
-      const { data, loading, error, reload } = useApi('/departments/tree')
-      const { data: rosterData } = useApi('/roster')
-      const [activeId, setActiveId] = useState(null)
+      const treeQ = useApi('/departments/tree')
+      const rosterQ = useApi('/roster')
+      const [collapsed, setCollapsed] = useState({})   // { deptId: true } 表示折叠
+      const [selected, setSelected] = useState(null)    // { type:'dept', id } | { type:'bot', id }
       const [roomId, setRoomId] = useState(null)
       const [roomMsgs, setRoomMsgs] = useState([])
       const [draft, setDraft] = useState('')
       const [busy, setBusy] = useState(false)
       const [msg, setMsg] = useState(null)
-      // 「安排工作」弹窗
-      const [assignOpen, setAssignOpen] = useState(false)
-      const [assignForm, setAssignForm] = useState({ subject: '', assignee: '', longrun: false })
-      // 部门管理（2026-11-15 Boss：「给我一个管理页面或者新增按钮」）
+      // 部门管理
       const [manageOpen, setManageOpen] = useState(false)
       const [deptDraft, setDeptDraft] = useState([])
+      const [manageBusy, setManageBusy] = useState(false)
+      // 安排工作
+      const [assignOpen, setAssignOpen] = useState(false)
+      const [assignForm, setAssignForm] = useState({ subject: '', assignee: '', longrun: false })
 
-      const depts = data?.departments ?? []
-      const active = depts.find((d) => d.id === activeId) ?? depts[0] ?? null
-      const bots = rosterData?.bots ?? []
+      const depts = treeQ.data?.departments ?? []
+      const bots = rosterQ.data?.bots ?? []
+      const totalBots = treeQ.data?.total?.bots ?? 0
 
-      // 进入部门 ⇒ 确保群聊存在，然后读消息
-      const openDept = async (d) => {
-        setActiveId(d.id)
+      // 默认选中第一个部门（有内容的优先）
+      const activeDeptId = selected?.type === 'dept'
+        ? selected.id
+        : (selected?.type === 'bot' ? bots.find((b) => b.id === selected.id)?.deptId : null)
+      const dept = depts.find((d) => d.id === (activeDeptId ?? depts[0]?.id)) ?? depts[0] ?? null
+      const activeBot = selected?.type === 'bot' ? bots.find((b) => b.id === selected.id) : null
+
+      // 建部门 / 删部门 / 改名 都走同一个端点（它自带「有 Bot 不许删」保护）
+      const saveDepts = async (list) => {
+        setManageBusy(true)
         setMsg(null)
+        try {
+          const r = await call('/departments/save', { method: 'POST', body: { departments: list, by: 'ui' } })
+          if (r.warnings?.length) setMsg({ kind: 'err', text: r.warnings.join('；') })
+          else setMsg({ kind: 'ok', text: '部门已保存' })
+          setManageOpen(false)
+          treeQ.reload()
+          rosterQ.reload()
+        } catch (e) {
+          setMsg({ kind: 'err', text: `保存部门失败：${e.message}` })
+        } finally {
+          setManageBusy(false)
+        }
+      }
+
+      // 进部门群聊
+      const openRoom = async (d) => {
+        if (!d) return
         setBusy(true)
+        setMsg(null)
         try {
           const r = await call('/departments/ensure', { method: 'POST', body: { id: d.id, by: 'ui' } })
           setRoomId(r.room.id)
-          // ⚠️ 端点名是 `/rooms/messages`（不是 /rooms/read，那是我想当然写的，实测报「未知端点」）
           const read = await call(`/rooms/messages?roomId=${encodeURIComponent(r.room.id)}&withBody=1`)
           setRoomMsgs(read.messages ?? [])
-          if (r.created) setMsg({ kind: 'ok', text: `已为「${d.name}」建好部门群聊` })
+          if (r.created) setMsg({ kind: 'ok', text: `已为「${d.name}」建好群聊` })
         } catch (e) {
-          setMsg({ kind: 'err', text: `打开部门群聊失败：${e.message}` })
+          setMsg({ kind: 'err', text: `打开群聊失败：${e.message}` })
         } finally {
           setBusy(false)
         }
@@ -3307,29 +3365,25 @@ window.__ModuleLoader__.load({
         }
       }
 
-      // 「＋ 安排工作」：把当前这句话变成任务，派给该部门的某个 Bot
       const assign = async () => {
         const subject = assignForm.subject.trim()
         if (!subject || busy) return
         setBusy(true)
         try {
-          const body = {
-            subject,
-            byId: 'ui',
-            ...(assignForm.assignee ? { assignee: assignForm.assignee } : {}),
-            ...(assignForm.longrun ? { longrun: true } : {}),
-          }
-          const r = await call('/tasks', { method: 'POST', body })
+          const r = await call('/tasks', {
+            method: 'POST',
+            body: {
+              subject, byId: 'ui',
+              ...(assignForm.assignee ? { assignee: assignForm.assignee } : {}),
+              ...(assignForm.longrun ? { longrun: true } : {}),
+            },
+          })
           setAssignOpen(false)
           setAssignForm({ subject: '', assignee: '', longrun: false })
           setMsg({ kind: 'ok', text: `已创建并派活：${r.task?.id ?? '?'}` })
-          // 让部门群聊里也留一句上下文（任务与对话不脱节）
           if (roomId) {
             try {
-              await call('/rooms/post', {
-                method: 'POST',
-                body: { roomId, from: 'ui', text: `【已安排工作】${subject}` },
-              })
+              await call('/rooms/post', { method: 'POST', body: { roomId, from: 'ui', text: `【已安排工作】${subject}` } })
             } catch { /* 群里留痕失败不影响任务已创建 */ }
           }
         } catch (e) {
@@ -3339,157 +3393,180 @@ window.__ModuleLoader__.load({
         }
       }
 
-      // 保存部门清单（增/删/改名都走这一个端点，它自带「有 Bot 不许删」保护）
-      const saveDepts = async (list) => {
-        setBusy(true)
-        setMsg(null)
-        try {
-          const r = await call('/departments/save', { method: 'POST', body: { departments: list, by: 'ui' } })
-          if (r.warnings?.length) setMsg({ kind: 'err', text: r.warnings.join('；') })
-          else setMsg({ kind: 'ok', text: '部门已保存' })
-          setManageOpen(false)
-          reload()
-        } catch (e) {
-          setMsg({ kind: 'err', text: `保存部门失败：${e.message}` })
-        } finally {
-          setBusy(false)
-        }
-      }
+      // ── 加载中 / 出错 ─────────────────────────────────────────────────────
+      if (treeQ.loading && !treeQ.data) return h(Skeleton, { n: 3 })
+      if (treeQ.error) return h('div', { className: 'csb-err' }, `读取部门失败：${treeQ.error}`)
 
-      if (loading) return h(Skeleton, { n: 3 })
-      if (error) return h('div', { className: 'csb-err' }, error)
+      // ── 空状态：没有部门 ──────────────────────────────────────────────────
+      // Boss 明确要求「初始不需要 cs-bots」⇒ 不造假层级，只给引导。
       if (depts.length === 0) {
-        return h(Empty, {
-          icon: '🏢', title: '还没有部门',
-          hint: '先到「设置 → Bot 主目录与部门」里配好主目录，部门会随主目录初始化。',
-        })
-      }
-
-      return h('div', { style: { display: 'flex', gap: 16, alignItems: 'flex-start' } },
-        // ── 左：部门列表 ──
-        h('div', { style: { width: 240, flex: 'none' } },
+        return h('div', null,
           h(Section, {
             title: '部门',
-            desc: `${depts.length} 个部门 · ${data?.total?.bots ?? 0} 个 Bot`,
+            desc: '还没有任何部门。建一个部门后，就可以往里放 Bot 了。',
           }),
-          // 管理入口（Boss 要的「管理页面 / 新增按钮」）
+          h('div', { style: { padding: '32px 0', textAlign: 'center' } },
+            h('div', { style: { fontSize: 40, opacity: 0.35, marginBottom: 8 } }, '🏢'),
+            h('div', { style: { fontSize: 15, marginBottom: 6 } }, '还没有部门'),
+            h('div', { className: 'csb-set-d', style: { marginBottom: 16 } },
+              '部门是 Bot 的分组容器：每个 Bot 会落在「主目录 / 部门 / Bot名」下，'
+              + '同一部门的 Bot 共享一个群聊，你可以在群里直接派活。'),
+            h('button', {
+              className: 'csb-btn csb-btn-p',
+              onClick: () => { setDeptDraft([{ id: '', name: '' }]); setManageOpen(true) },
+            }, '＋ 新建第一个部门')),
+          manageOpen
+            ? h(DeptManageModal, {
+              draft: deptDraft, setDraft: setDeptDraft, busy: manageBusy,
+              onSave: () => saveDepts(deptDraft), onClose: () => setManageOpen(false),
+            })
+            : null,
+          msg ? h(Notice, { kind: msg.kind === 'ok' ? 'ok' : 'err', onClose: () => setMsg(null) }, msg.text) : null,
+        )
+      }
+
+      // ── 正常：左侧树 + 右侧详情 ───────────────────────────────────────────
+      return h('div', { style: { display: 'flex', gap: 16, alignItems: 'flex-start' } },
+        // 左：部门树
+        h('div', { style: { width: 260, flex: 'none' } },
+          h(Section, {
+            title: '部门',
+            desc: `${depts.length} 个部门 · ${totalBots} 个 Bot`,
+          }),
           h('div', { className: 'csb-bar', style: { marginTop: 8 } },
             h('button', {
               className: 'csb-btn csb-btn-s',
               onClick: () => { setDeptDraft(depts.map((d) => ({ id: d.id, name: d.name }))); setManageOpen(true) },
-            }, '⚙ 管理部门')),
-            // ⚠️ 曾有个切换左侧栏模式的按钮，直接写 localStorage
-            //    把宿主的视图状态改坏（Win 上左侧变成「暂无会话」）。已移除。
-            //    正确做法：让用户在宿主自己的左侧栏设置里选模式（见文件内说明）。
+            }, '⚙ 管理部门'),
+            h('button', {
+              className: 'csb-btn csb-btn-s',
+              onClick: () => { setDeptDraft([{ id: '', name: '' }]); setManageOpen(true) },
+            }, '＋ 新建')),
+
+          // 树
           h('div', { style: { marginTop: 10 } },
-            depts.map((d) => h('div', {
-              key: d.id,
-              onClick: () => openDept(d),
-              style: {
-                padding: '8px 10px', marginBottom: 4, borderRadius: 6, cursor: 'pointer',
-                background: d.id === (active?.id) ? 'var(--dsw-alias-bg-secondary, #eef)' : 'transparent',
-                display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-              },
-            },
-            h('span', null, `📢 ${d.name}`),
-            h('span', { className: 'csb-set-d', style: { fontSize: 11 } },
-              `${d.bots.length} Bot`)))),
-        ),
-        // ── 右：群聊 ──
+            depts.map((d) => {
+              const isCollapsed = collapsed[d.id] === true
+              const isActive = dept && dept.id === d.id
+              return h('div', { key: d.id, style: { marginBottom: 2 } },
+                // 部门行
+                h('div', {
+                  onClick: () => { setSelected({ type: 'dept', id: d.id }); setRoomMsgs([]); setRoomId(null) },
+                  style: {
+                    display: 'flex', alignItems: 'center', gap: 4, padding: '6px 8px',
+                    borderRadius: 6, cursor: 'pointer',
+                    background: isActive ? 'var(--dsw-alias-bg-secondary, #eef)' : 'transparent',
+                  },
+                },
+                // 折叠箭头（0 个 Bot 时不可折叠，避免点了没反应）
+                h('span', {
+                  style: { width: 14, textAlign: 'center', opacity: d.bots.length ? 1 : 0.3, cursor: d.bots.length ? 'pointer' : 'default' },
+                  onClick: (e) => {
+                    if (!d.bots.length) return
+                    e.stopPropagation()
+                    setCollapsed({ ...collapsed, [d.id]: !isCollapsed })
+                  },
+                }, d.bots.length ? (isCollapsed ? '▶' : '▼') : '·'),
+                h('span', null, `📢 ${d.name}`),
+                h('span', { className: 'csb-set-d', style: { marginLeft: 'auto', fontSize: 11 } }, `${d.bots.length}`)),
+                // Bot 子节点
+                !isCollapsed && d.bots.length > 0
+                  ? h('div', { style: { marginLeft: 22 } },
+                    d.bots.map((b) => {
+                      const isBotActive = selected?.type === 'bot' && selected.id === b.id
+                      return h('div', {
+                        key: b.id,
+                        onClick: () => setSelected({ type: 'bot', id: b.id }),
+                        style: {
+                          padding: '4px 8px', borderRadius: 6, cursor: 'pointer', fontSize: 12.5,
+                          background: isBotActive ? 'var(--dsw-alias-bg-secondary, #eef)' : 'transparent',
+                          display: 'flex', alignItems: 'center', gap: 6,
+                        },
+                      },
+                      h('span', { style: { fontSize: 11, opacity: 0.6 } }, '🤖'),
+                      h('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, b.name))
+                    }))
+                  : null,
+              )
+            }))),
+
+        // 右：详情
         h('div', { style: { flex: 1, minWidth: 0 } },
-          active
+          msg ? h(Notice, { kind: msg.kind === 'ok' ? 'ok' : 'err', onClose: () => setMsg(null) }, msg.text) : null,
+
+          // Bot 详情
+          activeBot
             ? h('div', null,
+              h(Section, { title: `🤖 ${activeBot.name}`, desc: `属于「${dept?.name ?? '未知部门'}」` }),
+              h('div', { className: 'csb-kv', style: { marginTop: 10 } },
+                h('span', { className: 'csb-k' }, '工作目录'), h('span', { className: 'csb-v csb-mono' }, activeBot.cwd ?? '—'),
+                h('span', { className: 'csb-k' }, '状态'), h('span', { className: 'csb-v' }, activeBot.state ?? '—'),
+                h('span', { className: 'csb-k' }, '预设'), h('span', { className: 'csb-v' }, activeBot.preset ?? '默认')),
+              h('div', { className: 'csb-bar', style: { marginTop: 12 } },
+                h('button', {
+                  className: 'csb-btn csb-btn-s',
+                  onClick: () => {
+                    setAssignForm({ subject: '', assignee: activeBot.sessionId ?? '', longrun: false })
+                    setAssignOpen(true)
+                  },
+                }, '＋ 给它安排工作')))
+            // 部门详情 + 群聊
+            : h('div', null,
               h(Section, {
-                title: `📢 ${active.name}`,
-                desc: `${active.bots.length} 个 Bot · 群聊 ${active.roomId ? '已就绪' : '尚未创建'}`,
+                title: `📢 ${dept?.name ?? ''}`,
+                desc: `${dept?.bots?.length ?? 0} 个 Bot · 群聊${dept?.roomId ? '已就绪' : '尚未创建'}`,
               }),
-              active.bots.length
+              dept?.bots?.length
                 ? h('div', { className: 'csb-bar', style: { marginTop: 8, flexWrap: 'wrap' } },
-                  active.bots.map((b) => h('span', { key: b.id, className: 'csb-b' }, `🤖 ${b.name}`)))
+                  dept.bots.map((b) => h('span', { key: b.id, className: 'csb-b' }, `🤖 ${b.name}`)))
                 : h('div', { className: 'csb-set-d', style: { marginTop: 8 } },
                   '这个部门还没有 Bot。到「Bot」页新建时选这个部门即可。'),
 
-              msg ? h(Notice, { kind: msg.kind === 'ok' ? 'ok' : 'err', onClose: () => setMsg(null) }, msg.text) : null,
-
-              // 群聊区
-              h('div', {
-                style: {
-                  marginTop: 12, border: '1px solid var(--dsw-alias-border-secondary, #e5e5e5)',
-                  borderRadius: 8, padding: 12, minHeight: 220, maxHeight: 380, overflow: 'auto',
-                  background: 'var(--dsw-alias-bg-primary, #fff)',
-                },
-              },
-              busy && roomMsgs.length === 0 ? h(Skeleton, { n: 2 }) : null,
-              roomMsgs.length === 0
-                ? h('div', { className: 'csb-set-d' }, '还没有消息。在下面说点什么，或者点「＋ 安排工作」直接派活。')
-                : roomMsgs.map((m) => h('div', { key: m.id, style: { marginBottom: 10 } },
-                  h('div', { style: { fontSize: 11.5, opacity: 0.7 } },
-                    `${m.from === 'ui' ? HUMAN_SELF_LABEL : m.from}  ${new Date(m.at).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}`),
-                  h('div', { style: { fontSize: 13, whiteSpace: 'pre-wrap' } }, m.text ?? '')))),
-
-              // 输入区
-              h('div', { className: 'csb-bar', style: { marginTop: 10 } },
-                h('input', {
-                  className: 'csb-in csb-grow', placeholder: '在部门群聊里说点什么…（回车发送）',
-                  value: draft, onChange: (e) => setDraft(e.target.value),
-                  onKeyDown: (e) => e.key === 'Enter' && send(),
-                }),
-                h('button', { className: 'csb-btn csb-btn-p', disabled: busy || !draft.trim(), onClick: send }, '发送'),
-                h('button', {
-                  className: 'csb-btn',
-                  title: '把这句话变成任务，派给本部门的 Bot',
-                  onClick: () => {
-                    setAssignForm({ subject: draft.trim(), assignee: active.bots[0]?.sessionId ?? '', longrun: false })
-                    setAssignOpen(true)
+              // 群聊入口
+              !roomId
+                ? h('div', { style: { marginTop: 14 } },
+                  h('button', {
+                    className: 'csb-btn', disabled: busy, onClick: () => openRoom(dept),
+                  }, busy ? '打开中…' : '💬 打开部门群聊'))
+                : h('div', { style: { marginTop: 12 } },
+                  h('div', {
+                    style: {
+                      border: '1px solid var(--dsw-alias-border-secondary, #e5e5e5)',
+                      borderRadius: 8, padding: 12, minHeight: 200, maxHeight: 360, overflow: 'auto',
+                      background: 'var(--dsw-alias-bg-primary, #fff)',
+                    },
                   },
-                }, '＋ 安排工作')),
-              h('div', { className: 'csb-fld-h', style: { marginTop: 4 } },
-                '「＋ 安排工作」把这句话直接变成任务，派给本部门的 Bot —— 说话与派活一步完成。'))
-            : null),
+                  roomMsgs.length === 0
+                    ? h('div', { className: 'csb-set-d' }, '还没有消息。在下面说点什么，或者点「＋ 安排工作」直接派活。')
+                    : roomMsgs.map((m) => h('div', { key: m.id, style: { marginBottom: 10 } },
+                      h('div', { style: { fontSize: 11.5, opacity: 0.7 } },
+                        `${m.from === 'ui' ? HUMAN_SELF_LABEL : m.from}  ${new Date(m.at).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}`),
+                      h('div', { style: { fontSize: 13, whiteSpace: 'pre-wrap' } }, m.text ?? '')))),
+                  h('div', { className: 'csb-bar', style: { marginTop: 10 } },
+                    h('input', {
+                      className: 'csb-in csb-grow', placeholder: '在部门群聊里说点什么…（回车发送）',
+                      value: draft, onChange: (e) => setDraft(e.target.value),
+                      onKeyDown: (e) => e.key === 'Enter' && send(),
+                    }),
+                    h('button', { className: 'csb-btn csb-btn-p', disabled: busy || !draft.trim(), onClick: send }, '发送'),
+                    h('button', {
+                      className: 'csb-btn',
+                      title: '把这句话变成任务，派给本部门的 Bot',
+                      onClick: () => {
+                        setAssignForm({ subject: draft.trim(), assignee: dept?.bots?.[0]?.sessionId ?? '', longrun: false })
+                        setAssignOpen(true)
+                      },
+                    }, '＋ 安排工作'))))),
+
         // 部门管理弹窗
         manageOpen
-          ? h(Modal, {
-            title: '管理部门',
-            onClose: () => setManageOpen(false),
-            footer: [
-              h('button', { key: 'c', className: 'csb-btn', onClick: () => setManageOpen(false) }, '取消'),
-              h('button', {
-                key: 'ok', className: 'csb-btn csb-btn-p', disabled: busy,
-                onClick: () => saveDepts(deptDraft),
-              }, busy ? '保存中…' : '保存'),
-            ],
-          },
-          h('div', { className: 'csb-set-d', style: { marginBottom: 8 } },
-            '部门决定 Bot 的工作目录层级（<主目录>/<部门>/<Bot名>）。'
-            + '删除部门前必须先把它下面的 Bot 迁走或退役 —— 否则会被拒绝。'),
-          deptDraft.map((d, i) => h('div', { key: i, className: 'csb-bar', style: { marginBottom: 6 } },
-            h('input', {
-              className: 'csb-in', style: { width: 110 }, value: d.id, placeholder: 'id（英文）',
-              onChange: (e) => {
-                const next = [...deptDraft]
-                next[i] = { ...next[i], id: e.target.value.replace(/[/\\.]/g, '') }
-                setDeptDraft(next)
-              },
-            }),
-            h('input', {
-              className: 'csb-in csb-grow', value: d.name, placeholder: '显示名（如 开发部）',
-              onChange: (e) => {
-                const next = [...deptDraft]
-                next[i] = { ...next[i], name: e.target.value }
-                setDeptDraft(next)
-              },
-            }),
-            h('button', {
-              className: 'csb-btn csb-btn-s csb-btn-d',
-              onClick: () => setDeptDraft(deptDraft.filter((_, j) => j !== i)),
-            }, '删除'))),
-          h('button', {
-            className: 'csb-btn csb-btn-s',
-            onClick: () => setDeptDraft([...deptDraft, { id: '', name: '' }]),
-          }, '＋ 新增部门'))
+          ? h(DeptManageModal, {
+            draft: deptDraft, setDraft: setDeptDraft, busy: manageBusy,
+            onSave: () => saveDepts(deptDraft), onClose: () => setManageOpen(false),
+          })
           : null,
 
-        // 「安排工作」弹窗
+        // 安排工作弹窗
         assignOpen
           ? h(Modal, {
             title: '安排工作',
@@ -3515,7 +3592,7 @@ window.__ModuleLoader__.load({
               onChange: (e) => setAssignForm({ ...assignForm, assignee: e.target.value }),
             },
             h('option', { value: '' }, '（先不派，稍后再说）'),
-            active?.bots.map((b) => h('option', { key: b.id, value: b.sessionId }, b.name)))),
+            (dept?.bots ?? []).map((b) => h('option', { key: b.id, value: b.sessionId }, b.name)))),
           h('label', { className: 'csb-bar', style: { gap: 6, cursor: 'pointer' } },
             h('input', {
               type: 'checkbox', checked: assignForm.longrun,
@@ -3524,6 +3601,52 @@ window.__ModuleLoader__.load({
             h('span', null, '长任务（分阶段推进）')))
           : null,
       )
+    }
+
+    /**
+     * 部门管理弹窗（新建/改名/删除）。
+     *
+     * 抽成独立组件：DeptTab 里有两处要打开它（空状态 + 正常状态），
+     * 内联会重复一大段 JSX。
+     */
+    function DeptManageModal({ draft, setDraft, busy, onSave, onClose }) {
+      const upd = (i, patch) => {
+        const next = [...draft]
+        next[i] = { ...next[i], ...patch }
+        setDraft(next)
+      }
+      return h(Modal, {
+        title: '管理部门',
+        onClose,
+        footer: [
+          h('button', { key: 'c', className: 'csb-btn', onClick: onClose }, '取消'),
+          h('button', { key: 'ok', className: 'csb-btn csb-btn-p', disabled: busy, onClick: onSave },
+            busy ? '保存中…' : '保存'),
+        ],
+      },
+      h('div', { className: 'csb-set-d', style: { marginBottom: 10 } },
+        '「id」是目录名（英文，会出现在路径里）；「显示名」是你在界面上看到的。'
+        + '删除部门前要先把它下面的 Bot 迁走 —— 否则会被拒绝。'),
+      draft.length === 0
+        ? h('div', { className: 'csb-set-d' }, '还没有部门，点下面「＋ 新增」')
+        : null,
+      draft.map((d, i) => h('div', { key: i, className: 'csb-bar', style: { marginBottom: 6 } },
+        h('input', {
+          className: 'csb-in', style: { width: 110 }, value: d.id, placeholder: 'id（英文）',
+          onChange: (e) => upd(i, { id: e.target.value.replace(/[/\\.]/g, '') }),
+        }),
+        h('input', {
+          className: 'csb-in csb-grow', value: d.name, placeholder: '显示名（如 开发部）',
+          onChange: (e) => upd(i, { name: e.target.value }),
+        }),
+        h('button', {
+          className: 'csb-btn csb-btn-s csb-btn-d',
+          onClick: () => setDraft(draft.filter((_, j) => j !== i)),
+        }, '删除'))),
+      h('button', {
+        className: 'csb-btn csb-btn-s',
+        onClick: () => setDraft([...draft, { id: '', name: '' }]),
+      }, '＋ 新增'))
     }
 
     /**

@@ -255,133 +255,33 @@ function applyInner(ctx, config, { log, warn }) {
     //   · 只建 **1 个** Workspace（主目录本身）
     //   · **不碰任何 session**
     //   · 失败只 warn，不影响插件其他功能
-    // ── 左侧栏分组：运行时探测 + 有限次重试（**不用 inject 声明**）────────────
+    // ── 左侧栏登记：**启动时什么都不做**（2026-11-16 Boss 定）─────────────
     //
-    // 为什么不用 `ctx.inject` / `export const inject`：
-    //   见文件头 inject 注释里的三次失败记录。核心结论：
-    //   **插件必须在宿主服务缺失时也能启动**，不能因为「等一个可选服务」而 pending。
+    // ## 为什么删掉
     //
-    // 现在的做法：
-    //   · 用 `service(ctx,'workspaceRegistry')` 探测（拿不到就算了）
-    //   · 拿不到就**有限次重试**（10 × 500ms ≈ 5s），宿主通常在这窗口内装配好
-    //   · 全程串行单次，只建 1 个分组、不碰任何 session
-    //   · 失败只 warn —— 左侧栏少个分组，其它功能一切正常
-    if (typeof ensureWorkspaceDir === 'function') {
-      const root = settings.botWorkspaceRoot
-      if (typeof root === 'string' && root.trim()) {
-        const wsRoot = root.trim()
-        // ⚠️ 用**模块级互斥锁**保证全局串行（2026-11-15 测试抓到并发峰值 2）。
-        //    场景：启动时后台轮询登记 与 `POST /workspaces/tidy` 同时在建目录
-        //    ⇒ 同一路径可能被注册两次 ⇒ 正是 domain inconsistent 的成因。
-        //    这个锁横跨 index.js（启动）与 api.js（tidy），所以挂在 globalThis 上。
-        const LOCK = '__csBotsWorkspaceRegLock'
-        const withLock = async (fn) => {
-          const prev = globalThis[LOCK] ?? Promise.resolve()
-          let release
-          globalThis[LOCK] = new Promise((r) => { release = r })
-          try {
-            await prev
-            return await fn()
-          } finally {
-            release()
-          }
-        }
-        void (async () => {
-          for (let attempt = 0; attempt < 10; attempt += 1) {
-            try {
-              const r = await withLock(() => ensureWorkspaceDir(ctx, wsRoot))
-              if (r.ok) {
-                if (r.created) log(`[cs-bots] 已把 Bot 主目录注册为 Workspace 分组：${wsRoot}`)
-                return
-              }
-              // 只有「服务还没就绪」值得重试；别的错误（如建目录失败）立刻放弃
-              if (!/未提供 workspaceRegistry|registry 无 create/.test(String(r.reason ?? ''))) {
-                warn(`[cs-bots] 未能注册 Bot 主目录分组（${wsRoot}）：${r.reason} —— 左侧栏会平铺显示，其它功能不受影响`)
-                return
-              }
-            } catch (error) {
-              warn(`[cs-bots] 注册 Bot 主目录分组异常：${error?.message ?? error}`)
-              return
-            }
-            await new Promise((resolve) => { setTimeout(resolve, 500) })
-          }
-          warn('[cs-bots] 等待 workspaceRegistry 超时（5s）—— 左侧栏会平铺显示；重启后通常可恢复')
-        })()
-      }
-    }
+    //   Boss：「cs-bots 默认是空的，没有 bot 也没有部门，为什么要在启动的时候加载部门？」
+    //
+    //   我原先在启动时登记「主目录 + 每个部门目录」，为了在左侧栏显示层级。
+    //   代价是灾难性的：
+    //     · 宿主 `create` 内部的查重依赖**内存态 entities**，域初始化期间不可靠
+    //     · ⇒ 建出第二条同路径记录 ⇒ `workspace domain is inconsistent`
+    //     · ⇒ workspaceRegistry 起不来 ⇒ 5 个组件 pending ⇒ **页面登录不了**
+    //     · 清掉后重启又复发，因为每次启动都在补登记
+    //
+    //   ⇒ **彻底改为按需登记**：
+    //     · 用户建 Bot 时登记该 Bot 的目录（那时 agents/registry 都已就绪）
+    //     · 启动时一条都不建
+    //
+    //   初始状态（无部门无 Bot）⇒ 左侧栏就是空的，这是**正确行为**。
 
-    // ── 部门常驻会话（2026-11-16 方案A）──────────────────────────────────
+    // ── 部门常驻会话：**启动时不做**（2026-11-16 Boss 定）──────────────────
     //
-    // 宿主重建 workspace 表时**跳过空分组**（`dsh-workspace/lib/index.js:787`），
-    // 所以「只登记部门目录、不建会话」的话，重启后部门这一层就没了。
-    // ⇒ 给每个部门建一个常驻会话，部门才能长期留在左侧栏。
+    // 原方案A（给每个部门建常驻会话）有两个绕不过去的问题：
+    //   ① 启动时拿不到 `agents` 服务（Cordis 作用域，重试无效）
+    //   ② 建会话就得登记部门目录 ⇒ 与上面同一个冲突问题
     //
-    // 串行、逐部门、失败只 warn（某个部门建不出来不影响其他）。
-    if (typeof ensureDeptSession === 'function' && settings.botWorkspaceRoot) {
-      const depts = Array.isArray(settings.departments) ? settings.departments : []
-      if (depts.length > 0) {
-        void (async () => {
-          // 等 workspaceRegistry 就绪（同上，最多 5s）
-          for (let i = 0; i < 10; i += 1) {
-            const reg = (() => { try { return service(ctx, 'workspaceRegistry') } catch { return undefined } })()
-            if (reg) break
-            await new Promise((r) => { setTimeout(r, 500) })
-          }
-          // ⚠️ 与 tidy 端点共用同一把锁（`__csBotsWorkspaceRegLock`），
-          //    否则并发建 workspace 会把同一路径注册两次（domain inconsistent）。
-          const LOCK2 = '__csBotsWorkspaceRegLock'
-          const withLock2 = async (fn) => {
-            const prev = globalThis[LOCK2] ?? Promise.resolve()
-            let release
-            globalThis[LOCK2] = new Promise((r) => { release = r })
-            try {
-              await prev
-              return await fn()
-            } finally {
-              release()
-            }
-          }
-          let ok = 0; let fail = 0
-          const details = []
-          for (const d of depts) {
-            try {
-              // 先按部门名登记该部门目录（title 用中文名），再建常驻会话
-              const deptDir = join(String(settings.botWorkspaceRoot).replace(/\/+$/, ''), d.id)
-              try {
-                const { mkdirSync } = await import('node:fs')
-                mkdirSync(deptDir, { recursive: true })
-                await withLock2(() => ensureWorkspaceDir(ctx, deptDir, d.name))
-              } catch { /* 登记失败不阻塞会话创建 */ }
-              const r = await withLock2(() => ensureDeptSession(ctx, services, d))
-              if (r.ok) {
-                ok += 1
-                details.push({ dept: d.id, name: d.name, ok: true, created: r.created === true, sessionId: r.sessionId })
-                if (r.created) log(`[cs-bots] 已为部门「${d.name}」建常驻会话`)
-              } else {
-                fail += 1
-                details.push({ dept: d.id, name: d.name, ok: false, reason: r.reason })
-                warn(`[cs-bots] 部门「${d.name}」常驻会话：${r.reason}`)
-              }
-            } catch (error) {
-              fail += 1
-              warn(`[cs-bots] 部门「${d.name}」常驻会话异常：${error?.message ?? error}`)
-            }
-          }
-          if (ok > 0 || fail > 0) log(`[cs-bots] 部门常驻会话：就绪 ${ok}，失败 ${fail}`)
-          // ⚠️ 结果落盘（2026-11-16）：`ctx.logger.info` 的输出**不进** dsh-web 主日志，
-          //    Boss 在 Win 上看不到任何启动信息，我也无法远程排查。
-          //    ⇒ 把结果写到状态目录，任何人 `cat` 一下就知道发生了什么。
-          try {
-            const { writeFileSync } = await import('node:fs')
-            writeFileSync(
-              join(kernelStateDir(), 'dept-session-report.json'),
-              JSON.stringify({ at: Date.now(), ok, fail, details }, null, 2),
-              'utf8',
-            )
-          } catch { /* 落盘失败不影响主流程 */ }
-        })()
-      }
-    }
+    // ⇒ 移除。部门层级改由 **cs-bots 面板内的「部门」页**展示（那是我们完全可控的 UI），
+    //   左侧栏只在用户真正建了 Bot 之后才有内容。
 
     // ── 宿主能力自检（t-40 · 插件安装场景）──────────────────────────────
     // 别人把 cs-bots 当插件装上去时，宿主不一定装配了全部能力。

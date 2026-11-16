@@ -727,6 +727,25 @@ export async function ensureWorkspaceDir(ctx, dir, title) {
     }
     if (typeof registry.create !== 'function') return { ok: false, reason: 'registry 无 create' }
 
+    // ── ★ 先查**持久化文件**，不只看宿主内存态（2026-11-16 根治复发）────────
+    //
+    // ## 为什么必须这一步
+    //
+    //   宿主 `create` 内部的查重是：
+    //     for (const entity of this.entities.values()) if (entity.path === canonical) return entity
+    //   而 **`entities` 是内存态，在 workspace 域初始化期间可能还没建好/不完整**。
+    //   此时 `resolveByPath` 和 `create` 的查重同时失效 ⇒ 建出第二条同路径记录
+    //   ⇒ `workspace domain is inconsistent` ⇒ 域初始化失败 ⇒ 5 个组件 pending
+    //   ⇒ **页面登录不了**。清掉后重启又复发，就是这么来的。
+    //
+    //   ⇒ 建之前先读磁盘上真实有什么。磁盘是唯一不会被内存态欺骗的真相源。
+    try {
+      const records = listWorkspaceRecords()
+      const canonicalPrefix = dir.replace(/[\\/]+$/, '')
+      const hit = records.some((r) => r.path.replace(/[\\/]+$/, '') === canonicalPrefix)
+      if (hit) return { ok: true, created: false, alreadyInFile: true }
+    } catch { /* 读不到磁盘就继续走宿主判断 */ }
+
     // ⚠️ **必须先建目录**（2026-11-15 Windows 实测踩坑）
     //
     //   宿主 `registry.create(path)` 的第一行是：
