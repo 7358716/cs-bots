@@ -361,7 +361,16 @@ export async function ensureDeptSession(ctx, services, dept) {
   const { createSession, service: getService } = await import('./kernel.js')
   const { randomUUID } = await import('node:crypto')
 
-  for (let attempt = 0; attempt < 20; attempt += 1) {
+  // ## 重试策略（2026-11-16 实测修正）
+  //
+  //   原先重试 20×500ms=10s，结果**全部超时**。根因是 Cordis 的作用域：
+  //   `reflect._getImpl` 里 `const impl = this.store[key]; if (!impl) return`
+  //   —— 服务没 provide 时永远 undefined，**等多久都不会变**。
+  //
+  //   ⇒ 只在**明确处于请求上下文**（服务已全装配）时才有意义。
+  //     现在主调用点是 `GET /departments/tree`（请求时），那里一次就能成；
+  //     启动时那段只做一次快速尝试（3×200ms），失败就交给请求时补。
+  for (let attempt = 0; attempt < 3; attempt += 1) {
     const agents = (() => { try { return getService(ctx, 'agents') } catch { return undefined } })()
     if (agents && typeof agents.create === 'function') {
       try {
@@ -376,8 +385,11 @@ export async function ensureDeptSession(ctx, services, dept) {
         return { ok: false, reason: `建部门常驻会话失败：${error?.message ?? error}` }
       }
     }
-    // agents 还没就绪 ⇒ 等 500ms 再试（最多 10s）
-    await new Promise((resolve) => { setTimeout(resolve, 500) })
+    await new Promise((resolve) => { setTimeout(resolve, 200) })
   }
-  return { ok: false, reason: '等待 agents 服务超时（10s），暂未建部门常驻会话' }
+  return {
+    ok: false,
+    skipped: true,
+    reason: '当前上下文拿不到 agents 服务（启动阶段正常现象）；打开「部门」页时会自动补建',
+  }
 }

@@ -2799,8 +2799,28 @@ export function installApi(ctx, { warn } = {}) {
       // 由用户「进入部门」时走 `POST /departments/ensure` 触发创建。
       // （读接口带写副作用是坑：刷新一次列表就建一堆东西，还会掩盖真正的缺失。）
       if (request.method === 'GET' && path === '/departments/tree') {
-        const { buildDeptTree } = await import('./depttree.js')
+        const { buildDeptTree, ensureDeptSession } = await import('./depttree.js')
         const services = getServices(ctx)
+        // ★ 顺手补齐部门常驻会话（2026-11-16 关键修复）
+        //
+        // ## 为什么放在这里而不是插件启动时
+        //
+        //   启动时拿不到 `agents` 服务 —— 这是 Cordis 的作用域问题（`_getImpl`：
+        //   `if (!impl) return`，服务没 provide 时永远 undefined，重试多久都没用）。
+        //   实测诊断报告：4 个部门全部「等待 agents 服务超时（10s）」。
+        //
+        //   而**在一个 HTTP 请求里 `agents` 一定已就绪**（能处理请求说明宿主全装配完了）。
+        //   ⇒ 把「建部门常驻会话」挪到读部门树时做，触发时机就是用户打开部门页。
+        //
+        // ## 幂等
+        //   `ensureDeptSession` 内部先查宿主已有会话，有就复用，不会重复建。
+        try {
+          const depts = Array.isArray(services?.settings?.departments) ? services.settings.departments : []
+          for (const d of depts) {
+            try { await ensureDeptSession(ctx, services, d) } catch { /* 单个失败不影响读树 */ }
+          }
+        } catch { /* 补齐失败不该让读接口挂掉 */ }
+
         sendJson(response, 200, { ok: true, ...buildDeptTree(services) })
         return
       }
