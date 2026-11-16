@@ -3287,6 +3287,8 @@ window.__ModuleLoader__.load({
     function DeptTab() {
       const treeQ = useApi('/departments/tree')
       const rosterQ = useApi('/roster')
+      // 历史内置部门（2026-11-16 方案B：保留 + 给提示，不自动删）
+      const legacyQ = useApi('/departments/legacy')
       const [collapsed, setCollapsed] = useState({})   // { deptId: true } 表示折叠
       const [selected, setSelected] = useState(null)    // { type:'dept', id } | { type:'bot', id }
       const [roomId, setRoomId] = useState(null)
@@ -3301,6 +3303,11 @@ window.__ModuleLoader__.load({
       // 安排工作
       const [assignOpen, setAssignOpen] = useState(false)
       const [assignForm, setAssignForm] = useState({ subject: '', assignee: '', longrun: false })
+      // 批量选择（2026-11-16 Boss：「加拖拽和批量」）
+      const [checked, setChecked] = useState({})     // { botId: true }
+      const [dragBot, setDragBot] = useState(null)   // 正在拖的 Bot id
+      const [dragOver, setDragOver] = useState(null) // 悬停的部门 id
+      const [moveBusy, setMoveBusy] = useState(false)
 
       const depts = treeQ.data?.departments ?? []
       const bots = rosterQ.data?.bots ?? []
@@ -3312,6 +3319,39 @@ window.__ModuleLoader__.load({
         : (selected?.type === 'bot' ? bots.find((b) => b.id === selected.id)?.deptId : null)
       const dept = depts.find((d) => d.id === (activeDeptId ?? depts[0]?.id)) ?? depts[0] ?? null
       const activeBot = selected?.type === 'bot' ? bots.find((b) => b.id === selected.id) : null
+
+      /** 把一批 Bot 移到某部门（串行，逐个上报结果）。 */
+      const moveBots = async (botIds, deptId) => {
+        if (!botIds.length || !deptId || moveBusy) return
+        setMoveBusy(true)
+        setMsg(null)
+        const done = []
+        const failed = []
+        for (const id of botIds) {
+          const bot = bots.find((b) => b.id === id)
+          if (!bot) { failed.push(`${id}（找不到）`); continue }
+          try {
+            await call('/roster/manage', {
+              method: 'POST',
+              body: { action: 'moveToDept', id, department: deptId, byId: 'ui', expectedRev: bot.rev },
+            })
+            done.push(bot.name)
+          } catch (e) {
+            failed.push(`${bot.name}（${e.message}）`)
+          }
+        }
+        setMoveBusy(false)
+        setChecked({})
+        treeQ.reload()
+        rosterQ.reload()
+        if (failed.length) {
+          setMsg({ kind: 'err', text: `已移动 ${done.length} 个；失败 ${failed.length} 个：${failed.join('；')}` })
+        } else {
+          setMsg({ kind: 'ok', text: `已移动 ${done.length} 个 Bot 到「${depts.find((d) => d.id === deptId)?.name ?? deptId}」` })
+        }
+      }
+
+      const checkedIds = Object.keys(checked).filter((k) => checked[k])
 
       // 建部门 / 删部门 / 改名 都走同一个端点（它自带「有 Bot 不许删」保护）
       const saveDepts = async (list) => {
@@ -3426,7 +3466,44 @@ window.__ModuleLoader__.load({
       }
 
       // ── 正常：左侧树 + 右侧详情 ───────────────────────────────────────────
-      return h('div', { style: { display: 'flex', gap: 16, alignItems: 'flex-start' } },
+      const legacy = legacyQ.data?.legacy ?? []
+
+      return h('div', null,
+        // 历史部门提示（有才显示）
+        legacy.length > 0
+          ? h('div', {
+            style: {
+              marginBottom: 12, padding: '10px 12px', borderRadius: 8, fontSize: 12.5,
+              background: 'var(--dsw-alias-bg-secondary, #fef9c3)',
+              border: '1px solid #facc15',
+            },
+          },
+          h('div', { style: { marginBottom: 6 } },
+            `⚠️ 检测到 ${legacy.length} 个历史部门：`,
+            legacy.map((x) => `${x.name}（${x.botCount} 个 Bot）`).join('、')),
+          h('div', { className: 'csb-set-d', style: { marginBottom: 8 } },
+            '它们是旧版本内置的，现在版本不再自动创建。保留不影响使用；'
+            + '若想清空，需先把里面的 Bot 移到别处。'),
+          h('div', { className: 'csb-bar' },
+            h('button', {
+              className: 'csb-btn csb-btn-s',
+              onClick: () => legacyQ.reload(),
+            }, '知道了，保留'),
+            h('button', {
+              className: 'csb-btn csb-btn-s',
+              disabled: moveBusy || !legacyQ.data?.canClear,
+              title: legacyQ.data?.canClear ? '' : '这些部门里还有 Bot，请先移走',
+              onClick: async () => {
+                if (!legacyQ.data?.canClear) return
+                const legacyIds = new Set(legacy.map((x) => x.id))
+                const next = depts.filter((d) => !legacyIds.has(d.id))
+                await saveDepts(next)
+                legacyQ.reload()
+              },
+            }, legacyQ.data?.canClear ? '全部清空' : '（还有 Bot，不能清空）')))
+          : null,
+
+        h('div', { style: { display: 'flex', gap: 16, alignItems: 'flex-start' } },
         // 左：部门树
         h('div', { style: { width: 260, flex: 'none' } },
           h(Section, {
@@ -3443,6 +3520,34 @@ window.__ModuleLoader__.load({
               onClick: () => { setDeptDraft([{ id: '', name: '' }]); setManageOpen(true) },
             }, '＋ 新建')),
 
+          // 批量操作条（有勾选时才出现）
+          checkedIds.length > 0
+            ? h('div', {
+              className: 'csb-bar',
+              style: {
+                marginTop: 8, padding: '6px 8px', borderRadius: 6,
+                background: 'var(--dsw-alias-bg-secondary, #eef)', fontSize: 12,
+              },
+            },
+            h('span', null, `已选 ${checkedIds.length} 个`),
+            h('select', {
+              className: 'csb-sel', style: { width: 130, height: 26, fontSize: 12 },
+              value: '',
+              disabled: moveBusy,
+              onChange: (e) => {
+                const target = e.target.value
+                e.target.value = ''
+                if (target) moveBots(checkedIds, target)
+              },
+            },
+            h('option', { value: '' }, moveBusy ? '移动中…' : '移到部门…'),
+            depts.map((d) => h('option', { key: d.id, value: d.id }, d.name))),
+            h('button', {
+              className: 'csb-btn csb-btn-s',
+              onClick: () => setChecked({}),
+            }, '清除'))
+            : null,
+
           // 树
           h('div', { style: { marginTop: 10 } },
             depts.map((d) => {
@@ -3452,10 +3557,25 @@ window.__ModuleLoader__.load({
                 // 部门行
                 h('div', {
                   onClick: () => { setSelected({ type: 'dept', id: d.id }); setRoomMsgs([]); setRoomId(null) },
+                  // 拖拽目标：把 Bot 拖到部门行上就移过去
+                  onDragOver: (e) => {
+                    if (!dragBot) return
+                    e.preventDefault()                      // 必须 preventDefault 才允许 drop
+                    if (dragOver !== d.id) setDragOver(d.id)
+                  },
+                  onDragLeave: () => { if (dragOver === d.id) setDragOver(null) },
+                  onDrop: (e) => {
+                    e.preventDefault()
+                    setDragOver(null)
+                    if (dragBot) { moveBots([dragBot], d.id); setDragBot(null) }
+                  },
                   style: {
                     display: 'flex', alignItems: 'center', gap: 4, padding: '6px 8px',
                     borderRadius: 6, cursor: 'pointer',
-                    background: isActive ? 'var(--dsw-alias-bg-secondary, #eef)' : 'transparent',
+                    background: dragOver === d.id
+                      ? 'var(--dsw-alias-bg-accent, #dbeafe)'          // 拖拽悬停高亮
+                      : (isActive ? 'var(--dsw-alias-bg-secondary, #eef)' : 'transparent'),
+                    outline: dragOver === d.id ? '1px dashed #3b82f6' : 'none',
                   },
                 },
                 // 折叠箭头（0 个 Bot 时不可折叠，避免点了没反应）
@@ -3476,13 +3596,30 @@ window.__ModuleLoader__.load({
                       const isBotActive = selected?.type === 'bot' && selected.id === b.id
                       return h('div', {
                         key: b.id,
+                        // 可拖到别的部门行上
+                        draggable: true,
+                        onDragStart: (e) => {
+                          setDragBot(b.id)
+                          try { e.dataTransfer.effectAllowed = 'move'; e.dataTransfer.setData('text/plain', b.id) } catch { /* 老浏览器 */ }
+                        },
+                        onDragEnd: () => { setDragBot(null); setDragOver(null) },
                         onClick: () => setSelected({ type: 'bot', id: b.id }),
                         style: {
                           padding: '4px 8px', borderRadius: 6, cursor: 'pointer', fontSize: 12.5,
                           background: isBotActive ? 'var(--dsw-alias-bg-secondary, #eef)' : 'transparent',
                           display: 'flex', alignItems: 'center', gap: 6,
+                          opacity: dragBot === b.id ? 0.4 : 1,
                         },
                       },
+                      // 批量勾选（点复选框不触发选中）
+                      h('input', {
+                        type: 'checkbox',
+                        checked: checked[b.id] === true,
+                        onClick: (e) => e.stopPropagation(),
+                        onChange: (e) => setChecked({ ...checked, [b.id]: e.target.checked }),
+                        title: '勾选后可批量移动到别的部门',
+                        style: { margin: 0, cursor: 'pointer' },
+                      }),
                       h('span', { style: { fontSize: 11, opacity: 0.6 } }, '🤖'),
                       h('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, b.name))
                     }))
@@ -3600,6 +3737,7 @@ window.__ModuleLoader__.load({
             }),
             h('span', null, '长任务（分阶段推进）')))
           : null,
+        ),
       )
     }
 
@@ -5146,13 +5284,13 @@ window.__ModuleLoader__.load({
         setDeptBusy(true)
         setDeptMsg(null)
         try {
-          const leaf = String(bot?.cwd ?? '').split(/[\\/]/).filter(Boolean).pop() || bot?.name || 'bot'
-          const nextCwd = `${root}/${deptId}/${leaf}`
-          await call('/roster/manage', {
+          // ⚠️ 路径拼接待后端做（2026-11-16 纪律）：前端手拼在 Windows 上会得到
+          //    `C:\...\.dsh\cs-bots/dev/名字`（混合分隔符）。后端用 join() 才对。
+          const r = await call('/roster/manage', {
             method: 'POST',
-            body: { action: 'setCwd', id: bot.id, cwd: nextCwd, byId: 'ui', expectedRev: bot.rev },
+            body: { action: 'moveToDept', id: bot.id, department: deptId, byId: 'ui', expectedRev: bot.rev },
           })
-          setDeptMsg({ kind: 'ok', text: `已移到部门「${deptId}」：${nextCwd}` })
+          setDeptMsg({ kind: 'ok', text: `已移到部门「${deptId}」：${r?.bot?.cwd ?? ''}` })
           onChange?.()
         } catch (e) {
           setDeptMsg({ kind: 'err', text: `改部门失败：${e.message}` })

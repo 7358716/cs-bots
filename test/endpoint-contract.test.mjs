@@ -69,5 +69,8 @@ test('端点契约：房间相关端点用正确名字（/rooms/messages 不是 
 test('端点契约：改工作目录走 /roster/manage + action，没有 /roster/set-cwd', () => {
   assert.ok(BACK.has('/roster/manage'), '/roster/manage 是实际端点')
   assert.ok(!CLIENT.includes("call('/roster/set-cwd"), '不该再调 /roster/set-cwd（它不存在）')
-  assert.match(CLIENT, /action: 'setCwd'/, '应通过 action:setCwd 改目录')
+  // 2026-11-16 起改用 moveToDept（路径由后端 join 拼接，跨平台正确）
+  assert.match(CLIENT, /action: 'moveToDept'/, '换部门应走 action:moveToDept')
+  assert.ok(API.includes("case 'moveToDept'"), '后端要有 moveToDept 分支')
+  assert.match(API, /const nextCwd = join\(root, deptId, leaf\)/, '路径必须用 join 拼（不能用模板字符串）')
 })

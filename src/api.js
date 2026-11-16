@@ -2798,6 +2798,47 @@ export function installApi(ctx, { warn } = {}) {
       // **只读**：不建团队也不建房。缺的会在 warnings 里如实列出，
       // 由用户「进入部门」时走 `POST /departments/ensure` 触发创建。
       // （读接口带写副作用是坑：刷新一次列表就建一堆东西，还会掩盖真正的缺失。）
+      // ── 历史内置部门识别（2026-11-16 Boss 选了方案B：保留 + 给提示）─────────
+      //
+      // ## 背景
+      //   0.16.0 之前 `departments` 默认内置 [dev,qa,ops]。
+      //   用户在那一版安装/保存过设置 ⇒ 这 3 个（后来还多了 misc）就落进了 settings.json。
+      //   现在默认改成 []，但**已落盘的不会自动消失**。
+      //
+      // ## 判据（不靠猜）
+      //   旧版内置的 id 是固定的：dev / qa / ops / misc。
+      //   只要某个部门的 id 属于这组、且**用户从没手动建过它**，就认为是历史遗留。
+      //
+      //   「从没手动建过」无法直接知道 ⇒ 退一步：**只要是这几个 id 就提示**，
+      //   因为用户如果自己建了同名 id，提示一下也无害（他会点「保留」）。
+      //
+      // ## 为什么只提示不自动删
+      //   Boss：「历史部门保留吧」。删部门要先把 Bot 迁走，自动删会造成一堆孤儿目录。
+      if (request.method === 'GET' && path === '/departments/legacy') {
+        const LEGACY_IDS = ['dev', 'qa', 'ops', 'misc']
+        const depts = Array.isArray(services.settings?.departments) ? services.settings.departments : []
+        const legacy = depts.filter((d) => d && LEGACY_IDS.includes(d.id))
+        const root = String(services.settings?.botWorkspaceRoot ?? '').replace(/[\\/]+$/, '')
+        const bots = services.roster?.list?.() ?? []
+        const detail = legacy.map((d) => ({
+          id: d.id,
+          name: d.name,
+          botCount: root
+            ? bots.filter((b) => isInsideDir(join(root, d.id), b.cwd ?? '')).length
+            : 0,
+        }))
+        sendJson(response, 200, {
+          ok: true,
+          legacy: detail,
+          total: detail.length,
+          canClear: detail.every((x) => x.botCount === 0),
+          hint: detail.some((x) => x.botCount > 0)
+            ? '这些部门里还有 Bot，清空前要先把 Bot 移到别处'
+            : '这些部门里没有 Bot，可以直接清空',
+        })
+        return
+      }
+
       if (request.method === 'GET' && path === '/departments/tree') {
         const { buildDeptTree, ensureDeptSession } = await import('./depttree.js')
         const services = getServices(ctx)
@@ -3149,6 +3190,39 @@ export function installApi(ctx, { warn } = {}) {
               return r.retire({ id: body.id, reason: body.reason, byId })
             case 'setCwd':
               return r.setCwd({ id: body.id, cwd: body.cwd, expectedRev: body.expectedRev, byId })
+            // ── 换部门（2026-11-16）──────────────────────────────────────────
+            //
+            // ## 为什么放后端拼路径
+            //   前端原先手拼 `${root}/${deptId}/${leaf}` —— 在 Windows 上会得到
+            //   `C:\Users\X\.dsh\cs-bots/dev/名字`（混合分隔符）。
+            //   功能上 isInsideDir 归一化后能认，但违反「路径一律走 node:path」的纪律。
+            //   ⇒ 改由后端用 `join()` 拼，跨平台正确。
+            //
+            // ## 行为
+            //   · 用 Bot 当前 cwd 的最后一段作为目录名（保持名字不变）
+            //   · 目标 = join(主目录, 部门id, 名字)
+            //   · 部门必须存在（否则留个孤儿目录，下次派生会 BOT_DEPT_UNKNOWN）
+            //   · 目标已存在同名目录 ⇒ 拒绝（避免两个 Bot 撞进同一个目录）
+            case 'moveToDept': {
+              const root = String(services.settings?.botWorkspaceRoot ?? '').replace(/[\\/]+$/, '')
+              if (!root) {
+                throw Object.assign(new Error('movetoDept：主目录未设置'), { code: 'BOT_ROOT_UNSET' })
+              }
+              const depts = Array.isArray(services.settings?.departments) ? services.settings.departments : []
+              const deptId = String(body.department ?? '').trim()
+              if (!deptId) throw Object.assign(new Error('moveToDept：department 必填'), { code: 'BOT_DEPT_REQUIRED' })
+              if (!depts.some((d) => d?.id === deptId)) {
+                throw Object.assign(
+                  new Error(`部门 ${JSON.stringify(deptId)} 不存在（可选：${depts.map((d) => d.id).join(' | ') || '无'}）`),
+                  { code: 'BOT_DEPT_UNKNOWN' },
+                )
+              }
+              const bot = r.get?.(body.id) ?? r.list().find((b) => b.id === body.id)
+              if (!bot) throw Object.assign(new Error(`找不到 Bot ${body.id}`), { code: 'ROSTER_NOT_FOUND' })
+              const leaf = String(bot.cwd ?? '').split(/[\\/]/).filter(Boolean).pop() || bot.name
+              const nextCwd = join(root, deptId, leaf)
+              return r.setCwd({ id: body.id, cwd: nextCwd, expectedRev: body.expectedRev, byId })
+            }
             // 改造07（借鉴 Super-agent prepare command）：设置/清除开工准备命令
             case 'prepare':
               return r.setPrepareCommand({

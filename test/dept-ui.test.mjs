@@ -75,3 +75,67 @@ test('部门管理：保存走 /departments/save（有 Bot 不许删的保护在
   assert.match(DEPT, /\/departments\/save/, '保存端点')
   assert.match(DEPT, /r\.warnings/, '要展示后端返回的警告')
 })
+
+// ── 拖拽与批量换部门（2026-11-16 Boss：「加拖拽和批量」）─────────────────────
+
+test('★ 换部门：路径由后端 join 拼，前端不手拼（跨平台纪律）', async () => {
+  const api = (await import('node:fs')).readFileSync(
+    join(HERE, '..', 'src', 'api.js'), 'utf8',
+  )
+  assert.match(api, /case 'moveToDept'/, '后端要有 moveToDept')
+  assert.match(api, /const nextCwd = join\(root, deptId, leaf\)/, '必须用 join')
+  // 前端不该再出现手拼 root/deptId/leaf
+  assert.ok(
+    !/\$\{root\}\/\$\{deptId\}\/\$\{leaf\}/.test(SRC),
+    '前端不该手拼路径（Windows 上会得到混合分隔符）',
+  )
+})
+
+test('拖拽：Bot 可拖，部门行可接，悬停有高亮', () => {
+  assert.match(DEPT, /draggable: true/, 'Bot 行要可拖')
+  assert.match(DEPT, /onDragStart/, '要有 dragstart')
+  assert.match(DEPT, /onDragOver/, '部门行要能接收')
+  assert.match(DEPT, /onDrop/, '要有 drop 处理')
+  assert.match(DEPT, /preventDefault\(\)/, 'dragover 必须 preventDefault 否则浏览器不允许 drop')
+  assert.match(DEPT, /dragOver === d\.id/, '悬停高亮')
+})
+
+test('批量：Bot 行有复选框，勾选不触发选中', () => {
+  assert.match(DEPT, /type: 'checkbox'/, '要有复选框')
+  assert.match(DEPT, /e\.stopPropagation\(\)/, '点复选框不该触发选中')
+  assert.match(DEPT, /checked\[b\.id\]/, '勾选状态按 botId 记')
+})
+
+test('批量：有勾选时出现操作条，能选目标部门', () => {
+  assert.match(DEPT, /checkedIds\.length > 0/, '有勾选才显示')
+  assert.match(DEPT, /已选 \$\{checkedIds\.length\} 个/, '显示已选数量')
+  assert.match(DEPT, /移到部门…/, '有目标部门下拉')
+  assert.match(DEPT, /moveBots\(checkedIds, target\)/, '批量移动')
+})
+
+test('批量：串行执行并逐个上报失败（不许一个失败全中断）', () => {
+  assert.match(DEPT, /const failed = \[\]/, '要收集失败')
+  assert.match(DEPT, /for \(const id of botIds\)/, '逐个移动')
+  assert.match(DEPT, /失败 \$\{failed\.length\} 个/, '失败要报出来')
+})
+
+// ── 历史部门提示（2026-11-16 Boss 方案B：保留 + 给提示）────────────────────
+
+test('历史部门：有 /departments/legacy 端点，只识别旧内置 id', async () => {
+  const api = (await import('node:fs')).readFileSync(join(HERE, '..', 'src', 'api.js'), 'utf8')
+  assert.ok(api.includes("path === '/departments/legacy'"), '端点要存在')
+  assert.match(api, /LEGACY_IDS = \['dev', 'qa', 'ops', 'misc'\]/, '只认这 4 个旧 id')
+})
+
+test('历史部门：不清空，只提示；有 Bot 时禁止清空', async () => {
+  const api = (await import('node:fs')).readFileSync(join(HERE, '..', 'src', 'api.js'), 'utf8')
+  assert.match(api, /canClear: detail\.every\(\(x\) => x\.botCount === 0\)/, '有 Bot 就不许清')
+  assert.match(api, /这些部门里还有 Bot，清空前要先把 Bot 移到别处/, '要给出可操作的原因')
+})
+
+test('历史部门 UI：默认保留，清空是显式动作', () => {
+  assert.match(DEPT, /历史部门/, 'UI 要有提示')
+  assert.match(DEPT, /知道了，保留/, '默认动作是保留')
+  assert.match(DEPT, /全部清空/, '清空是另一个显式按钮')
+  assert.match(DEPT, /还有 Bot，不能清空/, '有 Bot 时按钮禁用并说明原因')
+})
