@@ -3377,29 +3377,10 @@ window.__ModuleLoader__.load({
             h('button', {
               className: 'csb-btn csb-btn-s',
               onClick: () => { setDeptDraft(depts.map((d) => ({ id: d.id, name: d.name }))); setManageOpen(true) },
-            }, '⚙ 管理部门'),
-            // ★ 左侧栏分组模式切换（2026-11-16）
-            //   宿主的嵌套只在「工作区树」模式生效；默认是平铺模式，
-            //   所以不切的话，登记好的三级结构也看不出来。
-            h('button', {
-              className: 'csb-btn csb-btn-s',
-              title: '左侧栏默认是平铺模式，嵌套不生效。点这里切成「工作区树」',
-              onClick: () => {
-                try {
-                  const KEY = 'dsh.workspace.view.v5'
-                  const raw = globalThis.localStorage?.getItem(KEY)
-                  const parsed = raw ? JSON.parse(raw) : {}
-                  const holder = parsed?.state ?? parsed ?? {}
-                  holder.groupBy = 'workspace-tree'
-                  const out = parsed?.state ? { ...parsed, state: holder } : holder
-                  globalThis.localStorage?.setItem(KEY, JSON.stringify(out))
-                  globalThis.localStorage?.setItem('csbots.treeBootstrapped', '1')
-                  setMsg({ kind: 'ok', text: '已切换为「工作区树」模式，刷新页面后左侧栏就会按部门分层展开' })
-                } catch (e) {
-                  setMsg({ kind: 'err', text: `切换失败：${e.message}` })
-                }
-              },
-            }, '🌲 左侧栏切成树形')),
+            }, '⚙ 管理部门')),
+            // ⚠️ 曾有个切换左侧栏模式的按钮，直接写 localStorage
+            //    把宿主的视图状态改坏（Win 上左侧变成「暂无会话」）。已移除。
+            //    正确做法：让用户在宿主自己的左侧栏设置里选模式（见文件内说明）。
           h('div', { style: { marginTop: 10 } },
             depts.map((d) => h('div', {
               key: d.id,
@@ -8911,71 +8892,28 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * 自动把左侧栏切到「工作区树」模式（2026-11-16 关键修复）。
+     * ⚠️ **已移除**：曾在这里自动改 `localStorage['dsh.workspace.view.v5']`
+     * 把左侧栏切成「工作区树」模式。
      *
-     * ## 为什么必须做
+     * ## 为什么要移除（2026-11-16 Win 实测事故）
      *
-     *   宿主（`dsh-client-ui-workspace/lib/client.js:4136`）：
-     *   ```js
-     *   nestWorkspaces: groupBy === "workspace-tree"
-     *   ```
-     *   **嵌套只在「工作区树」模式下生效。** 默认是 `groupBy: "workspace"`（平铺），
-     *   所以我们登记的「主目录/部门/Bot」三级结构，用户看到的仍是
-     *   「cs-bots / ops / qa / dev …」一堆平铺条目 —— 这正是 Boss 反复说的
-     *   「左侧栏还是没有 cs-bots 层级」。
+     *   我以为宿主的持久化格式是 `{ state: {...} }` 或扁平对象，**没查清就写了**。
+     *   结果 Boss 在 Win 上左侧栏变成「暂无会话」——**整个视图状态被写坏**。
      *
-     * ## 怎么做
+     *   宿主是通过 `@deepseek-ai/dsh-client-store` 的 `defineStore({ persist })` 持久化的，
+     *   序列化格式由那个库决定，**不是我能猜的**。
      *
-     *   宿主的视图状态持久化在 `localStorage['dsh.workspace.view.v5']`
-     *   （`createWorkspaceViewStore`，`persist: "dsh.workspace.view.v5"`）。
-     *   我们**只改一次**：若当前 `groupBy !== 'workspace-tree'`，改成它并写回。
+     * ## 现在的做法
      *
-     * ## 为什么只改一次、且可被用户改回
+     *   完全不碰宿主的存储。切换模式改为**明确告诉用户怎么做**：
+     *   在左侧栏「工作区」标题旁有个分组方式按钮（图标），点它选「工作区树」。
+     *   插件只负责把三级目录登记好，是否用树形由用户自己在宿主 UI 里选。
      *
-     *   用一个标记 `csbots.treeBootstrapped` 记录「我们是否已经切过」。
-     *   切过之后**不再干预** —— 用户想用平铺就让他用，不硬抢控制权。
-     *
-     * ## 失败不报错
-     *
-     *   localStorage 可能被禁用（隐私模式）、key 可能改名、JSON 可能坏。
-     *   全程 try/catch，失败就静默跳过 —— 大不了还是平铺，不能因此让页面崩。
+     *   这也符合 Boss 定的纪律：**后端/宿主的数据必须从它那里取，不能自己写死或猜**。
      */
-    function bootstrapTreeGrouping() {
-      try {
-        const LS = globalThis.localStorage
-        if (!LS) return
-        const FLAG = 'csbots.treeBootstrapped'
-        if (LS.getItem(FLAG) === '1') return          // 已经切过，不再干预
-        const KEY = 'dsh.workspace.view.v5'
-        const raw = LS.getItem(KEY)
-        const parsed = raw ? JSON.parse(raw) : {}
-        // 宿主的持久化形状可能是 { state: {...} } 或直接是 state，两种都兼容
-        const holder = (parsed && typeof parsed === 'object' && parsed.state && typeof parsed.state === 'object')
-          ? parsed.state
-          : (parsed && typeof parsed === 'object' ? parsed : {})
-        if (holder.groupBy === 'workspace-tree') {
-          LS.setItem(FLAG, '1')                        // 已经是树形，记一笔就走
-          return
-        }
-        holder.groupBy = 'workspace-tree'
-        const out = (parsed && parsed.state && typeof parsed.state === 'object')
-          ? { ...parsed, state: holder }
-          : holder
-        LS.setItem(KEY, JSON.stringify(out))
-        LS.setItem(FLAG, '1')
-        // ⚠️ **不自动 reload**（2026-11-16 自我纠正）：
-        //    这段跑在插件每次装载时。若在这里 reload，会形成
-        //    「装载 → reload → 装载 → reload」的死循环。
-        //    改为：把标记写进 sessionStorage，提示用户「刷新一次生效」，
-        //    由人主动刷新。宁可多一步点击，不能把页面刷死。
-      } catch {
-        /* 静默：切不过去就还是平铺，不影响任何功能 */
-      }
-    }
 
     function apply(ctx) {
       bindHost(ctx)
-      bootstrapTreeGrouping()
       const disposers = []
       try {
         const d = installStyles()

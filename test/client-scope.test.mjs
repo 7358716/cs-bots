@@ -81,3 +81,26 @@ test('组件作用域：每个用到的 useState 标识符都在同组件内声�
   }
   assert.deepEqual(problems, [], problems.join('；'))
 })
+
+// ── 2026-11-16 Win 事故：插件不得改写宿主的 localStorage 视图状态 ──────────
+//
+// 我曾写代码直接改 `localStorage['dsh.workspace.view.v5']` 把左侧栏切成树形，
+// 但**没查清宿主的序列化格式**（由 @deepseek-ai/dsh-client-store 的 defineStore 决定）⇒
+// 写坏了整个视图状态 ⇒ Boss 的左侧栏变成「暂无会话」，所有分组都消失。
+//
+// 教训：宿主的数据必须通过它自己的 API 操作，不能猜格式直接写存储。
+
+test('★ 不得写宿主的 localStorage 视图状态（会写坏左侧栏）', () => {
+  // 允许读，不允许写宿主的 key
+  const writesHostKey = /localStorage\??\.setItem\(\s*['"`]dsh\./.test(SOURCE)
+  assert.equal(
+    writesHostKey,
+    false,
+    '不得用 localStorage.setItem 写 dsh.* 键 —— 那是宿主的持久化领地，格式由它的 store 决定，'
+    + '猜格式会写坏整个视图状态（2026-11-16 事故）',
+  )
+})
+
+test('★ 不得出现「🌲 左侧栏切成树形」这类直接改宿主状态的按钮', () => {
+  assert.ok(!SOURCE.includes('左侧栏切成树形'), '该按钮已移除，不得再加回来')
+})
