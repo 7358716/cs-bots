@@ -342,6 +342,7 @@ function applyInner(ctx, config, { log, warn }) {
             }
           }
           let ok = 0; let fail = 0
+          const details = []
           for (const d of depts) {
             try {
               // 先按部门名登记该部门目录（title 用中文名），再建常驻会话
@@ -352,14 +353,32 @@ function applyInner(ctx, config, { log, warn }) {
                 await withLock2(() => ensureWorkspaceDir(ctx, deptDir, d.name))
               } catch { /* 登记失败不阻塞会话创建 */ }
               const r = await withLock2(() => ensureDeptSession(ctx, services, d))
-              if (r.ok) { ok += 1; if (r.created) log(`[cs-bots] 已为部门「${d.name}」建常驻会话`) }
-              else { fail += 1; warn(`[cs-bots] 部门「${d.name}」常驻会话：${r.reason}`) }
+              if (r.ok) {
+                ok += 1
+                details.push({ dept: d.id, name: d.name, ok: true, created: r.created === true, sessionId: r.sessionId })
+                if (r.created) log(`[cs-bots] 已为部门「${d.name}」建常驻会话`)
+              } else {
+                fail += 1
+                details.push({ dept: d.id, name: d.name, ok: false, reason: r.reason })
+                warn(`[cs-bots] 部门「${d.name}」常驻会话：${r.reason}`)
+              }
             } catch (error) {
               fail += 1
               warn(`[cs-bots] 部门「${d.name}」常驻会话异常：${error?.message ?? error}`)
             }
           }
           if (ok > 0 || fail > 0) log(`[cs-bots] 部门常驻会话：就绪 ${ok}，失败 ${fail}`)
+          // ⚠️ 结果落盘（2026-11-16）：`ctx.logger.info` 的输出**不进** dsh-web 主日志，
+          //    Boss 在 Win 上看不到任何启动信息，我也无法远程排查。
+          //    ⇒ 把结果写到状态目录，任何人 `cat` 一下就知道发生了什么。
+          try {
+            const { writeFileSync } = await import('node:fs')
+            writeFileSync(
+              join(kernelStateDir(), 'dept-session-report.json'),
+              JSON.stringify({ at: Date.now(), ok, fail, details }, null, 2),
+              'utf8',
+            )
+          } catch { /* 落盘失败不影响主流程 */ }
         })()
       }
     }
