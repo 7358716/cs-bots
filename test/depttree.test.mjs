@@ -248,3 +248,40 @@ test('★ 部门群聊：显式 @ 优先于主管（@ 谁就唤醒谁）', async
   assert.equal(decided.source, 'mention', '@ 优先于主管')
   assert.deepEqual(decided.targets, [botMember])
 })
+
+// ── 房间成员同步（2026-11-17 实测：Bot 重建后 sessionId 变了，成员表没跟上）──
+
+test('★ syncDeptRoomMembers：把部门内所有 Bot 的当前 sessionId 都补进群成员', async (t) => {
+  // 线上真实问题：Bot 重建后 sessionId 变了，房间成员表还是旧快照 ⇒ 唤醒打给失效 id。
+  // 这里验证正向能力：sync 之后，部门里每个 Bot 的**当前** sessionId 都在成员表里。
+  const { services, depts } = setup(t)
+  const a = await services.roster.create({ name: '甲岗', department: 'dev', byId: 'ui' })
+  const b = await services.roster.create({ name: '乙岗', department: 'dev', byId: 'ui' })
+  const r = await ensureDeptRoom(services, depts[0], 'ui')
+  assert.ok(r.room, r.reason)
+
+  const { syncDeptRoomMembers } = await import('../src/depttree.js')
+  const sync = await syncDeptRoomMembers(services, depts[0], 'ui')
+  assert.equal(sync.ok, true, sync.reason)
+
+  const after = services.room.get(r.room.id)
+  assert.ok(after.members.includes(a.sessionId), '甲岗的当前 sessionId 要在群里')
+  assert.ok(after.members.includes(b.sessionId), '乙岗的当前 sessionId 要在群里')
+  assert.ok(after.members.includes('ui'), 'Boss 保留')
+
+  // 关键不变量：群成员里的每个 bot-* 都必须是「在册 Bot 的当前 sessionId」
+  const live = new Set(services.roster.list().map((x) => x.sessionId))
+  const badInRoom = after.members.filter((m) => String(m).startsWith('bot-') && !live.has(m))
+  assert.deepEqual(badInRoom, [], `群成员里不该有失效 sessionId：${JSON.stringify(badInRoom)}`)
+})
+
+test('★ syncDeptRoomMembers：成员表已经正确时不写事件（幂等）', async (t) => {
+  const { services, depts } = setup(t)
+  await services.roster.create({ name: '甲岗', department: 'dev', byId: 'ui' })
+  const r = await ensureDeptRoom(services, depts[0], 'ui')
+  assert.ok(r.room, r.reason)
+  const { syncDeptRoomMembers } = await import('../src/depttree.js')
+  const sync = await syncDeptRoomMembers(services, depts[0], 'ui')
+  assert.equal(sync.ok, true)
+  assert.equal(sync.changed, false, '已经正确时不该改')
+})

@@ -629,8 +629,15 @@ function settingsFromState(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return out
   for (const key of Object.keys(DEFAULT_SETTINGS)) {
     const v = value[key]
+    // ⚠️ 分类型处理，**别一律当 boolean**（2026-11-17 实测踩坑）：
+    //   `deptId` 是字符串，旧代码走 `typeof v === 'boolean'` 分支被直接丢弃
+    //   ⇒ 事件里明明写了 deptId，hydrate 后永远是 null
+    //   ⇒ 部门群聊的「主管优先唤醒」规则永久失效（而且不报任何错）。
     if (key === 'maxBotsPerRound') {
       if (typeof v === 'number' && Number.isInteger(v) && v >= 0) out[key] = v
+    } else if (key === 'deptId') {
+      // null 或非空字符串
+      if (v === null || (typeof v === 'string' && v.trim())) out[key] = v === null ? null : v.trim()
     } else if (typeof v === 'boolean') {
       out[key] = v
     }

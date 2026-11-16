@@ -402,3 +402,74 @@ export async function ensureDeptSession(ctx, services, dept) {
     reason: '当前上下文拿不到 agents 服务（启动阶段正常现象）；打开「部门」页时会自动补建',
   }
 }
+
+/**
+ * 同步部门群聊的成员表（2026-11-17 实测：Bot 重建后 sessionId 变了，房间成员没跟上）。
+ *
+ * ## 问题
+ *   实测发现：开发部房间里躺着 3 个**已经失效**的 bot sessionId
+ *   （`bot-854ea00f` 等），而该部门现有 Bot 的 sessionId 是 `bot-30edfe7e` 等。
+ *   原因：Bot 重建（`POST /roster/rebuild`）会换 sessionId，但房间成员表是创建时快照。
+ *
+ *   后果：唤醒打给失效 ID ⇒ `agent-not-live`，而且**不报任何错**（静默失败）。
+ *
+ * ## 做法
+ *   按「部门内现有 Bot」重建成员表：
+ *     - 保留：`ui`（Boss）、以及**仍存在的** bot id
+ *     - 移除：失效的 bot id
+ *     - 补上：该部门下所有 Bot 的当前 sessionId
+ *
+ *   幂等：成员表已经正确时不做任何写入（避免污染审计流）。
+ *
+ * @param {object} services
+ * @param {{id: string, name: string}} dept
+ * @param {string} by
+ * @returns {Promise<{ok: boolean, changed?: boolean, added?: number, removed?: number, reason?: string}>}
+ */
+export async function syncDeptRoomMembers(services, dept, by = 'ui') {
+  const rooms = services?.room
+  if (!rooms || typeof rooms.list !== 'function') return { ok: false, reason: 'room 服务不可用' }
+  const root = String(services?.settings?.botWorkspaceRoot ?? '').replace(/[\\/]+$/, '')
+  if (!root || !dept?.id) return { ok: false, reason: '主目录或部门 id 为空' }
+
+  const roomName = deptRoomName(dept.name)
+  let room
+  try { room = (rooms.list({}) ?? []).find((r) => r && r.name === roomName) } catch { room = undefined }
+  if (!room) return { ok: false, reason: '部门群聊还不存在' }
+
+  const bots = services?.roster?.list?.() ?? []
+  const inDept = bots.filter((b) => typeof b?.cwd === 'string' && isInsideDir(join(root, dept.id), b.cwd))
+  const liveBotIds = new Set(inDept.map((b) => b.sessionId ?? b.id).filter(Boolean))
+  const allBotIds = new Set(bots.map((b) => b.sessionId ?? b.id).filter(Boolean))
+
+  const cur = Array.isArray(room.members) ? room.members : []
+  // 保留非 bot 成员（ui/person 等人类与未知 id）；移除失效 bot；补上在册 bot
+  const kept = cur.filter((m) => !String(m).startsWith('bot-') || allBotIds.has(m) || liveBotIds.has(m))
+  const next = [...new Set([...kept, ...liveBotIds])]
+
+  const removed = cur.filter((m) => !next.includes(m)).length
+  const added = next.filter((m) => !cur.includes(m)).length
+  if (removed === 0 && added === 0) return { ok: true, changed: false, added: 0, removed: 0 }
+
+  // ⚠️ `update()` **不支持改成员**（实测：只有 join/leave 能改）。
+  //    直接 update({members}) 是**静默无效**的 —— 返回成功但什么都没写。
+  //    ⇒ 逐个 leave / join。
+  try {
+    let rev = room.rev
+    // 先移除失效的
+    for (const m of cur) {
+      if (next.includes(m)) continue
+      const r = rooms.leave({ roomId: room.id, sessionId: m, byId: by, expectedRev: rev })
+      rev = r?.rev ?? rev + 1
+    }
+    // 再补上新的
+    for (const m of next) {
+      if (cur.includes(m)) continue
+      const r = rooms.join({ roomId: room.id, sessionId: m, byId: by, expectedRev: rev })
+      rev = r?.rev ?? rev + 1
+    }
+    return { ok: true, changed: true, added, removed }
+  } catch (error) {
+    return { ok: false, reason: `同步成员失败：${error?.message ?? error}` }
+  }
+}

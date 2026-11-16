@@ -636,3 +636,30 @@ test('replay：硬删的房间不会复活（目录删除后回放不再加载�
   assert.equal(revived.get(gone.id), undefined)
   assert.deepEqual(revived.listMessages({ roomId: keep.id }), [])
 })
+
+// ── 2026-11-17 实测 bug：deptId 是字符串，会被 settingsFromState 丢弃 ──────────
+// 现象：事件流里明明有 deptId，hydrate 后永远是 null ⇒ 主管优先规则永久失效且不报错。
+
+test('★ settingsFromState：deptId 是字符串，必须能穿过回放（不能当 boolean）', (t) => {
+  const { dir, rooms } = setup(t)
+  const room = rooms.createRoom_({
+    name: 'dept-x', members: ['ui', 'bot-a'], mode: 'everyone', byId: 'ui',
+    settings: { deptId: 'dev' },
+  })
+  assert.equal(room.settings.deptId, 'dev')
+
+  // 关键：新建实例读**同一个 stateDir** ⇒ 走 replay ⇒ deptId 必须还在
+  const fresh = createRoom({ logger: { info() {}, warn() {} } }, { stateDir: dir })
+  const back = fresh.get(room.id)
+  assert.equal(
+    back.settings.deptId,
+    'dev',
+    'deptId 必须能穿过回放 —— 旧代码按 typeof v === "boolean" 判断会把字符串丢掉',
+  )
+})
+
+test('★ settingsFromState：不设 deptId 时缺省 null（不是 undefined）', (t) => {
+  const { rooms } = setup(t)
+  const room = rooms.createRoom_({ name: 'dept-y', members: ['ui'], mode: 'everyone', byId: 'ui' })
+  assert.equal(room.settings.deptId, null, '缺省 null')
+})

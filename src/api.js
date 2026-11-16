@@ -2949,7 +2949,7 @@ export function installApi(ctx, { warn } = {}) {
       }
 
       if (request.method === 'GET' && path === '/departments/tree') {
-        const { buildDeptTree, ensureDeptSession } = await import('./depttree.js')
+        const { buildDeptTree, ensureDeptSession, syncDeptRoomMembers } = await import('./depttree.js')
         const services = getServices(ctx)
         // ★ 顺手补齐部门常驻会话（2026-11-16 关键修复）
         //
@@ -2968,6 +2968,9 @@ export function installApi(ctx, { warn } = {}) {
           const depts = Array.isArray(services?.settings?.departments) ? services.settings.departments : []
           for (const d of depts) {
             try { await ensureDeptSession(ctx, services, d) } catch { /* 单个失败不影响读树 */ }
+            // ★ 同步群聊成员（2026-11-17）：Bot 重建后 sessionId 会变，
+            //   房间成员表是创建时快照 ⇒ 不更新的话唤醒打给失效 ID、静默 agent-not-live。
+            try { await syncDeptRoomMembers(services, d, 'ui') } catch { /* 同上 */ }
           }
         } catch { /* 补齐失败不该让读接口挂掉 */ }
 
