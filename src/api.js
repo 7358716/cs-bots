@@ -2798,6 +2798,115 @@ export function installApi(ctx, { warn } = {}) {
       // **只读**：不建团队也不建房。缺的会在 warnings 里如实列出，
       // 由用户「进入部门」时走 `POST /departments/ensure` 触发创建。
       // （读接口带写副作用是坑：刷新一次列表就建一堆东西，还会掩盖真正的缺失。）
+      // ── 导入导出（2026-11-16 Boss 需求）───────────────────────────────────
+      //
+      // 三段式：估体量 → 导出/校核 → 应用。
+      // Boss 要求「都要有确认页面，有校核提示」，所以 `apply` 之前必须先 `inspect`。
+
+      // POST /transfer/inspect —— 校核一个 zip（上传 base64），返回能不能导 + 会覆盖什么
+      if (request.method === 'POST' && path === '/transfer/inspect') {
+        const body = (await readBody(request)) ?? {}
+        const { inspectPackage } = await import('./transfer.js')
+        if (typeof body.zipBase64 !== 'string' || !body.zipBase64) {
+          sendJson(response, 400, { ok: false, reason: 'TRANSFER_NO_ZIP', hint: 'zipBase64 必填' })
+          return
+        }
+        let buf
+        try { buf = Buffer.from(body.zipBase64, 'base64') } catch { buf = null }
+        if (!buf) {
+          sendJson(response, 400, { ok: false, reason: 'TRANSFER_BAD_BASE64' })
+          return
+        }
+        const rep = inspectPackage(buf, getServices(ctx))
+        sendJson(response, 200, { ok: true, ...rep })
+        return
+      }
+
+      // POST /transfer/export/estimate —— 只估体积，不打包（勾选变化时实时显示）
+      if (request.method === 'POST' && path === '/transfer/export/estimate') {
+        const body = (await readBody(request)) ?? {}
+        const { estimateExport } = await import('./transfer.js')
+        const stateDir = services.board?.paths?.stateDir ?? services.roster?.paths?.stateDir
+        const estimate = estimateExport({
+          stateDir,
+          services: getServices(ctx),
+          sections: Array.isArray(body.sections) ? body.sections : [],
+          includeFiles: body.includeFiles === true,
+        })
+        sendJson(response, 200, { ok: true, estimate })
+        return
+      }
+
+      // POST /transfer/export —— 生成 zip（返回 base64，前端触发浏览器下载）
+      if (request.method === 'POST' && path === '/transfer/export') {
+        const body = (await readBody(request)) ?? {}
+        const { buildExport, estimateExport, FILES_SIZE_LIMIT } = await import('./transfer.js')
+        const stateDir = services.board?.paths?.stateDir ?? services.roster?.paths?.stateDir
+        const servicesObj = getServices(ctx)
+        const sections = Array.isArray(body.sections) ? body.sections : []
+        const includeFiles = body.includeFiles === true
+        if (!sections.length) {
+          sendJson(response, 400, { ok: false, reason: 'TRANSFER_NO_SECTIONS', hint: '至少选一段' })
+          return
+        }
+        // 体积上限：超了必须显式确认（Boss：「要设置上限，并确认」）
+        const est = estimateExport({ stateDir, services: servicesObj, sections, includeFiles })
+        if (est.overLimit && body.confirmLarge !== true) {
+          sendJson(response, 400, {
+            ok: false,
+            reason: 'TRANSFER_TOO_LARGE',
+            estimate: est,
+            limitBytes: FILES_SIZE_LIMIT,
+            hint: `预计 ${Math.round(est.totalBytes / 1024 / 1024)}MB，超过上限 ${Math.round(FILES_SIZE_LIMIT / 1024 / 1024)}MB。`
+              + '请取消勾选「含工作目录文件」，或带 confirmLarge:true 强制导出',
+          })
+          return
+        }
+        const { buffer, manifest } = buildExport({ stateDir, services: servicesObj, sections, includeFiles })
+        sendJson(response, 200, {
+          ok: true,
+          filename: `cs-bots-export-${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}.zip`,
+          bytes: buffer.length,
+          manifest,
+          zipBase64: buffer.toString('base64'),
+        })
+        return
+      }
+
+      // POST /transfer/import —— 应用（必须已先 inspect 并让用户确认）
+      if (request.method === 'POST' && path === '/transfer/import') {
+        const body = (await readBody(request)) ?? {}
+        if (body.confirm !== true) {
+          sendJson(response, 400, {
+            ok: false, reason: 'TRANSFER_NEEDS_CONFIRM',
+            hint: '导入会修改本机数据。先调 /transfer/inspect 给用户看校核结果，确认后带 confirm:true',
+          })
+          return
+        }
+        const { applyImport } = await import('./transfer.js')
+        const stateDir = services.board?.paths?.stateDir ?? services.roster?.paths?.stateDir
+        let buf
+        try { buf = Buffer.from(String(body.zipBase64 ?? ''), 'base64') } catch { buf = null }
+        if (!buf || !buf.length) {
+          sendJson(response, 400, { ok: false, reason: 'TRANSFER_NO_ZIP' })
+          return
+        }
+        const r = await applyImport(buf, {
+          stateDir,
+          services: getServices(ctx),
+          onConflict: body.onConflict,
+          only: Array.isArray(body.only) ? body.only : undefined,
+        })
+        // 导入后要让内存态跟上（部门变了，后续派生路径才对）
+        try {
+          const { loadSettings } = await import('./settings.js')
+          const fresh = loadSettings(stateDir)
+          if (services.settings) Object.assign(services.settings, fresh.values)
+        } catch { /* 刷新失败不影响导入结果 */ }
+        sendJson(response, r.ok ? 200 : 400, { ...r })
+        return
+      }
+
       // ── 历史内置部门识别（2026-11-16 Boss 选了方案B：保留 + 给提示）─────────
       //
       // ## 背景

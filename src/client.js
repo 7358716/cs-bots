@@ -3308,6 +3308,9 @@ window.__ModuleLoader__.load({
       const [dragBot, setDragBot] = useState(null)   // 正在拖的 Bot id
       const [dragOver, setDragOver] = useState(null) // 悬停的部门 id
       const [moveBusy, setMoveBusy] = useState(false)
+      // 导入导出（2026-11-16）
+      const [exportOpen, setExportOpen] = useState(false)
+      const [importOpen, setImportOpen] = useState(false)
 
       const depts = treeQ.data?.departments ?? []
       const bots = rosterQ.data?.bots ?? []
@@ -3519,6 +3522,14 @@ window.__ModuleLoader__.load({
               className: 'csb-btn csb-btn-s',
               onClick: () => { setDeptDraft([{ id: '', name: '' }]); setManageOpen(true) },
             }, '＋ 新建')),
+          // 导入导出（2026-11-16 Boss：都要有确认页）
+          h('div', { className: 'csb-bar', style: { marginTop: 6 } },
+            h('button', {
+              className: 'csb-btn csb-btn-s', onClick: () => setExportOpen(true),
+            }, '⬇ 导出'),
+            h('button', {
+              className: 'csb-btn csb-btn-s', onClick: () => setImportOpen(true),
+            }, '⬆ 导入')),
 
           // 批量操作条（有勾选时才出现）
           checkedIds.length > 0
@@ -3695,6 +3706,19 @@ window.__ModuleLoader__.load({
                       },
                     }, '＋ 安排工作'))))),
 
+        // 导出确认页
+        exportOpen
+          ? h(TransferExportModal, { onClose: () => setExportOpen(false) })
+          : null,
+
+        // 导入确认页
+        importOpen
+          ? h(TransferImportModal, {
+            onClose: () => setImportOpen(false),
+            onDone: () => { treeQ.reload(); rosterQ.reload(); legacyQ.reload() },
+          })
+          : null,
+
         // 部门管理弹窗
         manageOpen
           ? h(DeptManageModal, {
@@ -3785,6 +3809,268 @@ window.__ModuleLoader__.load({
         className: 'csb-btn csb-btn-s',
         onClick: () => setDraft([...draft, { id: '', name: '' }]),
       }, '＋ 新增'))
+    }
+
+    /**
+     * 导出确认页（2026-11-16 Boss：「都要有确认页面」）。
+     *
+     * 勾选内容 → 实时显示体积 → 超限要二次确认 → 生成 zip 并触发浏览器下载。
+     */
+    function TransferExportModal({ onClose }) {
+      const [sections, setSections] = useState({ departments: true, bots: true })
+      const [includeFiles, setIncludeFiles] = useState(false)
+      const [busy, setBusy] = useState(false)
+      const [err, setErr] = useState(null)
+      const [est, setEst] = useState(null)
+      const [needConfirm, setNeedConfirm] = useState(false)
+
+      const SECTIONS_UI = [
+        { id: 'departments', label: '部门', desc: '部门定义（id + 显示名）' },
+        { id: 'bots', label: 'Bot', desc: '注册表 + 档案（身份/人格/边界）' },
+        { id: 'skills', label: '技能', desc: '各 Bot 工作目录下的 .agents/skills' },
+        { id: 'memory', label: '记忆', desc: 'memory.jsonl' },
+        { id: 'discipline', label: '纪律', desc: 'discipline.jsonl' },
+        { id: 'prompts', label: '提示词', desc: 'prompts.jsonl' },
+        { id: 'settings', label: '设置', desc: '不含主目录等路径类键' },
+        { id: 'board', label: '任务板', desc: 'board.jsonl' },
+      ]
+      const picked = Object.keys(sections).filter((k) => sections[k])
+
+      // 估体积（勾选变化时刷新）
+      useEffect(() => {
+        let alive = true
+        if (!picked.length) { setEst(null); return () => { alive = false } }
+        call('/transfer/export/estimate', {
+          method: 'POST',
+          body: { sections: picked, includeFiles },
+        })
+          .then((r) => { if (alive) setEst(r.estimate ?? null) })
+          .catch(() => { if (alive) setEst(null) })
+        return () => { alive = false }
+      }, [JSON.stringify(picked), includeFiles])
+
+      const mb = (n) => `${(Number(n ?? 0) / 1024 / 1024).toFixed(1)} MB`
+
+      const doExport = async (force = false) => {
+        setBusy(true); setErr(null)
+        try {
+          const r = await call('/transfer/export', {
+            method: 'POST',
+            body: { sections: picked, includeFiles, ...(force ? { confirmLarge: true } : {}) },
+          })
+          // 浏览器直接下载
+          const bin = atob(r.zipBase64)
+          const arr = new Uint8Array(bin.length)
+          for (let i = 0; i < bin.length; i += 1) arr[i] = bin.charCodeAt(i)
+          const blob = new Blob([arr], { type: 'application/zip' })
+          const url = URL.createObjectURL(blob)
+          const a = document.createElement('a')
+          a.href = url
+          a.download = r.filename || 'cs-bots-export.zip'
+          document.body.appendChild(a)
+          a.click()
+          document.body.removeChild(a)
+          setTimeout(() => URL.revokeObjectURL(url), 5000)
+          onClose()
+        } catch (e) {
+          if (/TOO_LARGE|超过上限/.test(e.message)) setNeedConfirm(true)
+          setErr(e.message)
+        } finally {
+          setBusy(false)
+        }
+      }
+
+      return h(Modal, {
+        title: '导出',
+        onClose,
+        footer: [
+          h('button', { key: 'c', className: 'csb-btn', onClick: onClose }, '取消'),
+          h('button', {
+            key: 'ok', className: 'csb-btn csb-btn-p',
+            disabled: busy || picked.length === 0,
+            onClick: () => doExport(needConfirm),
+          }, busy ? '打包中…' : (needConfirm ? '确认导出（体积较大）' : '导出 zip')),
+        ],
+      },
+      h('div', { className: 'csb-set-d', style: { marginBottom: 10 } },
+        '选择要导出的内容。导出包是 zip，导入时会有校核提示。'),
+      SECTIONS_UI.map((x) => h('label', {
+        key: x.id, className: 'csb-bar',
+        style: { gap: 8, cursor: 'pointer', padding: '3px 0', alignItems: 'flex-start' },
+      },
+      h('input', {
+        type: 'checkbox', checked: sections[x.id] === true, style: { marginTop: 3 },
+        onChange: (e) => setSections({ ...sections, [x.id]: e.target.checked }),
+      }),
+      h('div', null,
+        h('div', { style: { fontSize: 13 } }, x.label),
+        h('div', { className: 'csb-set-d', style: { fontSize: 11.5 } }, x.desc)))),
+
+      h('label', {
+        className: 'csb-bar',
+        style: { gap: 8, cursor: 'pointer', marginTop: 10, paddingTop: 10, borderTop: '1px solid var(--dsw-alias-border-secondary, #eee)' },
+      },
+      h('input', {
+        type: 'checkbox', checked: includeFiles,
+        onChange: (e) => setIncludeFiles(e.target.checked),
+      }),
+      h('div', null,
+        h('div', { style: { fontSize: 13 } }, '包含工作目录文件'),
+        h('div', { className: 'csb-set-d', style: { fontSize: 11.5 } },
+          '会把每个 Bot 工作目录里的文件一起打包（不含 .agents 与 .git）。体积可能很大。'))),
+
+      est
+        ? h('div', {
+          style: {
+            marginTop: 10, padding: '8px 10px', borderRadius: 6, fontSize: 12,
+            background: est.overLimit ? 'var(--dsw-alias-bg-danger, #fee)' : 'var(--dsw-alias-bg-secondary, #f5f5f5)',
+          },
+        },
+        `预计体积：${mb(est.totalBytes)}`,
+        est.overLimit ? '（超过 500MB 上限，需确认）' : '',
+        est.overWarn && !est.overLimit ? '（较大，建议确认）' : '')
+        : null,
+      err ? h('div', { className: 'csb-err', style: { marginTop: 8 } }, err) : null)
+    }
+
+    /**
+     * 导入确认页（Boss 要求的核心：校核提示 + 冲突处理 + 确认）。
+     */
+    function TransferImportModal({ onClose, onDone }) {
+      const [zip, setZip] = useState(null)          // { name, base64, bytes }
+      const [rep, setRep] = useState(null)          // 校核结果
+      const [mode, setMode] = useState('overwrite')
+      const [only, setOnly] = useState(null)        // 用户取消勾选的段
+      const [busy, setBusy] = useState(false)
+      const [err, setErr] = useState(null)
+      const [done, setDone] = useState(null)
+
+      const pickFile = async (file) => {
+        if (!file) return
+        if (file.size > 600 * 1024 * 1024) { setErr('文件过大（>600MB），请手动解压后选择需要的部分'); return }
+        setErr(null); setRep(null)
+        const buf = await file.arrayBuffer()
+        const bytes = new Uint8Array(buf)
+        let bin = ''
+        const CHUNK = 0x8000
+        for (let i = 0; i < bytes.length; i += CHUNK) {
+          bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK))
+        }
+        const base64 = btoa(bin)
+        setZip({ name: file.name, base64, bytes: file.size })
+        setBusy(true)
+        try {
+          const r = await call('/transfer/inspect', { method: 'POST', body: { zipBase64: base64 } })
+          setRep(r)
+          setOnly(null)
+        } catch (e) {
+          setErr(`校核失败：${e.message}`)
+        } finally {
+          setBusy(false)
+        }
+      }
+
+      const doImport = async () => {
+        if (!zip || !rep?.ok) return
+        setBusy(true); setErr(null)
+        try {
+          const r = await call('/transfer/import', {
+            method: 'POST',
+            body: {
+              confirm: true, zipBase64: zip.base64, onConflict: mode,
+              ...(only ? { only } : {}),
+            },
+          })
+          setDone(r)
+          onDone?.()
+        } catch (e) {
+          setErr(`导入失败：${e.message}`)
+        } finally {
+          setBusy(false)
+        }
+      }
+
+      return h(Modal, {
+        title: '导入',
+        onClose,
+        footer: done
+          ? [h('button', { key: 'c', className: 'csb-btn csb-btn-p', onClick: onClose }, '完成')]
+          : [
+            h('button', { key: 'c', className: 'csb-btn', onClick: onClose }, '取消'),
+            h('button', {
+              key: 'ok', className: 'csb-btn csb-btn-p',
+              disabled: busy || !rep?.ok, onClick: doImport,
+            }, busy ? '导入中…' : '确认导入'),
+          ],
+      },
+      // ① 选文件
+      !zip
+        ? h('div', null,
+          h('div', { className: 'csb-set-d', style: { marginBottom: 10 } },
+            '选择一个 cs-bots 导出的 zip 文件。导入前会先校核，不会直接改动数据。'),
+          h('input', {
+            type: 'file', accept: '.zip,application/zip',
+            onChange: (e) => pickFile(e.target.files?.[0]),
+          }))
+        : null,
+
+      // ② 校核中
+      busy && !rep && !done ? h('div', { className: 'csb-set-d' }, '校核中…') : null,
+
+      // ③ 校核结果
+      rep
+        ? h('div', null,
+          // 包信息
+          h('div', {
+            style: { padding: '8px 10px', borderRadius: 6, background: 'var(--dsw-alias-bg-secondary, #f5f5f5)', marginBottom: 10, fontSize: 12 },
+          },
+          h('div', null, `📦 ${zip.name}（${(zip.bytes / 1024).toFixed(0)} KB）`),
+          h('div', { className: 'csb-set-d' },
+            `来自 ${rep.info?.manifest?.host?.platform ?? '?'} · 插件 v${rep.info?.manifest?.pluginVersion ?? '?'}`
+            + ` · ${new Date(rep.info?.manifest?.exportedAt ?? 0).toLocaleString('zh-CN')}`),
+          h('div', { className: 'csb-set-d' },
+            `包含：${(rep.info?.manifest?.sections ?? []).join('、') || '无'}`)),
+
+          // 阻断项
+          rep.blocking?.length
+            ? h('div', { style: { padding: '8px 10px', borderRadius: 6, background: '#fee', color: '#b91c1c', marginBottom: 10, fontSize: 12 } },
+              h('div', { style: { fontWeight: 600, marginBottom: 4 } }, '❌ 不能导入：'),
+              rep.blocking.map((b, i) => h('div', { key: i }, `· ${b}`)))
+            : null,
+
+          // 警告项（Boss 要的校核提示）
+          rep.warnings?.length
+            ? h('div', { style: { padding: '8px 10px', borderRadius: 6, background: '#fef9c3', border: '1px solid #facc15', marginBottom: 10, fontSize: 12 } },
+              h('div', { style: { fontWeight: 600, marginBottom: 4 } }, `⚠️ 校核提示（${rep.warnings.length} 条）：`),
+              rep.warnings.map((w, i) => h('div', { key: i }, `· ${w}`)))
+            : null,
+
+          // 冲突处理
+          rep.ok
+            ? h('div', { className: 'csb-fld' },
+              h('label', null, '同名冲突处理'),
+              h('label', { className: 'csb-bar', style: { gap: 6, cursor: 'pointer' } },
+                h('input', { type: 'radio', name: 'cf', checked: mode === 'overwrite', onChange: () => setMode('overwrite') }),
+                h('span', null, '覆盖（默认，上面的提示里会列出会覆盖哪些）')),
+              h('label', { className: 'csb-bar', style: { gap: 6, cursor: 'pointer' } },
+                h('input', { type: 'radio', name: 'cf', checked: mode === 'skip', onChange: () => setMode('skip') }),
+                h('span', null, '跳过（保留本机的）')),
+              h('label', { className: 'csb-bar', style: { gap: 6, cursor: 'pointer' } },
+                h('input', { type: 'radio', name: 'cf', checked: mode === 'rename', onChange: () => setMode('rename') }),
+                h('span', null, '自动改名（导入的加 _2 后缀）')))
+            : null,
+
+          done
+            ? h('div', { style: { marginTop: 10, padding: '8px 10px', borderRadius: 6, background: '#dcfce7', fontSize: 12 } },
+              h('div', { style: { fontWeight: 600, marginBottom: 4 } }, '✅ 导入完成'),
+              Object.entries(done.applied ?? {}).map(([k, v]) => h('div', { key: k },
+                `${k}：${JSON.stringify(v).slice(0, 120)}`)),
+              done.errors?.length
+                ? h('div', { style: { color: '#b91c1c', marginTop: 4 } }, `错误：${done.errors.join('；')}`)
+                : null)
+            : null)
+        : null,
+      err ? h('div', { className: 'csb-err', style: { marginTop: 8 } }, err) : null)
     }
 
     /**
