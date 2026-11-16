@@ -175,3 +175,11 @@ test('导入：skip 策略保留本机部门', async (t) => {
   const after = JSON.parse(readFileSync(join(stateDir, 'settings.json'), 'utf8'))
   assert.equal(after.departments.find((d) => d.id === 'dev').name, '本机的开发部', 'skip 时保留本机')
 })
+
+test('★ 体积估算：部门/Bot 不能算出 0（它们在 settings/roster 里，没有独立文件）', (t) => {
+  const { stateDir, services } = setup(t)
+  const est = estimateExport({ stateDir, services, sections: ['departments', 'bots'], includeFiles: false })
+  assert.ok(est.bySection.departments > 0, `部门体积应 >0，实际 ${est.bySection.departments}`)
+  assert.ok(est.bySection.bots > 0, `Bot 体积应 >0，实际 ${est.bySection.bots}`)
+  assert.ok(est.totalBytes > 0, '总体积应 >0')
+})

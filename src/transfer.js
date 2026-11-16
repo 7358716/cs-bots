@@ -142,6 +142,16 @@ export function estimateExport({ stateDir, services, sections, includeFiles }) {
       void root
     } else if (spec.dir) {
       bySection[id] = dirSize(join(stateDir, spec.file))
+    } else if (id === 'departments') {
+      // ⚠️ 部门定义存在 settings.json 里，没有独立的 departments.json
+      //    估算要按「序列化后的字节数」算，否则永远是 0（用户会以为没东西可导）
+      const depts = Array.isArray(services?.settings?.departments) ? services.settings.departments : []
+      bySection[id] = Buffer.byteLength(JSON.stringify(depts, null, 2), 'utf8')
+    } else if (id === 'bots') {
+      const bots = services?.roster?.list?.() ?? []
+      bySection[id] = Buffer.byteLength(JSON.stringify(bots.map((b) => ({
+        name: b.name, cwd: b.cwd, preset: b.preset, profile: b.profile ?? {},
+      })), null, 2), 'utf8')
     } else {
       const p = join(stateDir, spec.file)
       bySection[id] = existsSync(p) ? statSync(p).size : 0
