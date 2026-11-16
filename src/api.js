@@ -2592,66 +2592,66 @@ export function installApi(ctx, { warn } = {}) {
       // 插件装配期做写操作是不可接受的副作用（用户没要求、失败还难查）。
       // 做成显式端点（页面「Bot 档案」有按钮，也可手动调）。
       if (request.method === 'POST' && path === '/roster/attach-workspaces') {
+        // ── 补挂会话到工作区（2026-11-16 重写）─────────────────────────────
+        //
+        // ## 旧实现的问题（Boss Win 实测）
+        //   对每个 Bot 调 `attachToWorkspace(bot.cwd, bot.sessionId)`。
+        //   而 `attachToWorkspace` 在 workspace 不存在时会**新建一个**
+        //   ⇒ 每个 cwd 一个独立工作区 ⇒ 左侧栏又多一堆
+        //   ⇒ Boss 点了这个按钮后左侧出现「No.1」（那是 `D:\output\测试 bots2026\No.1`）。
+        //
+        //   这跟「一个 CS-bots 可展开」的目标**直接冲突**。
+        //
+        // ## 新行为
+        //   只把会话挂进**已经存在的**分组：
+        //     · cwd 在主目录下 ⇒ 找 <主目录>/<部门>/<Bot> 那条，没有就**跳过**
+        //     · cwd 不在主目录下 ⇒ **完全不碰**（不建、不挂）
+        //   绝不新建任何 workspace。
+        //
+        //   要让某个 Bot 的会话归位，正确路径是「重建它的会话」
+        //   （`POST /roster/rebuild`），让新会话的 header cwd 落在主目录下。
         const bots = await withService(services, 'roster', (r) => r.list({ includeRetired: false }))
+        const root = String(services.settings?.botWorkspaceRoot ?? '').replace(/\/+$/, '')
+        const registry = (() => { try { return service(ctx, 'workspaceRegistry') } catch { return undefined } })()
         const results = []
         for (const bot of bots) {
-          if (typeof bot.cwd !== 'string' || bot.cwd.trim() === '') {
-            results.push({ name: bot.name, ok: false, reason: '没有工作目录' })
+          const cwd = typeof bot.cwd === 'string' ? bot.cwd.replace(/\/+$/, '') : ''
+          if (!cwd) { results.push({ name: bot.name, ok: false, reason: '没有工作目录' }); continue }
+          if (!root || !cwd.startsWith(`${root}/`)) {
+            results.push({ name: bot.name, ok: false, skipped: true, reason: 'cwd 不在主目录下，不建也不挂（避免多出平铺分组）' })
             continue
           }
           try {
-            const attached = await attachToWorkspace(ctx, bot.cwd, bot.sessionId)
-            results.push({
-              name: bot.name,
-              cwd: bot.cwd,
-              sessionId: bot.sessionId,
-              ok: attached,
-              reason: attached ? null : '宿主未提供 workspaceRegistry（版本过旧）',
-            })
+            // 只找**已存在**的分组；没有就跳过，绝不 create
+            const ws = registry && typeof registry.resolveByPath === 'function'
+              ? await registry.resolveByPath(cwd)
+              : undefined
+            if (!ws || typeof ws.attachSession !== 'function') {
+              results.push({ name: bot.name, ok: false, skipped: true, reason: '该目录还没有对应分组（先跑一次「整理工作区」或重启让插件登记）' })
+              continue
+            }
+            await ws.attachSession(bot.sessionId)
+            results.push({ name: bot.name, cwd, sessionId: bot.sessionId, ok: true })
           } catch (error) {
             results.push({ name: bot.name, ok: false, reason: `挂载失败：${error?.message ?? error}` })
           }
         }
         const okCount = results.filter((r) => r.ok).length
+        const skipped = results.filter((r) => r.skipped).length
         sendJson(response, 200, {
           ok: true,
           total: results.length,
           attached: okCount,
-          failed: results.length - okCount,
+          skipped,
+          failed: results.length - okCount - skipped,
           results,
           note: okCount > 0
-            ? `已把 ${okCount} 个 Bot 的会话挂进各自工作目录对应的工作区，刷新左侧栏即可看到`
-            : '没有需要补挂的（或宿主版本过旧不支持工作区）',
+            ? `已把 ${okCount} 个 Bot 的会话挂进已有分组，刷新左侧栏即可看到`
+            + (skipped ? `；另有 ${skipped} 个跳过（不会新建分组）` : '')
+            : '没有可挂的：分组可能还没登记（重启 dsh-web 让插件登记），或 Bot 的 cwd 不在主目录下',
         })
         return
       }
-
-      // ── 工作区整理（2026-11-15 Boss：「工作区这里只有一个 CS-bots」）──────────
-      //
-      // ## 为什么要这个端点
-      //   宿主左侧栏是**平铺**的：每个 Bot 一个 cwd ⇒ 每个 cwd 一个 workspace 分组。
-      //   历史上 13 个 Bot 散在 /home/ubuntu/output/*，加上核心目录，一共 12 条，
-      //   把左侧栏占满。Boss 要的是「一个 CS-bots，里面向下展开」。
-      //
-      // ## 靠什么实现分层
-      //   宿主 `owningParentFolder()` 会把「路径在某个已登记 Workspace 之下」的
-      //   Workspace **自动嵌套**进父分组 ⇒ 只要登记 <botsRoot>，它下面的
-      //   <botsRoot>/<部门>/<Bot> 就自动折进这一个分组（见 kernel.ensureWorkspaceDir）。
-      //
-      // ## 这个端点做两件事
-      //   ① 登记 <botsRoot>（幂等）
-      //   ② 按 mode 删掉多余的工作区**登记**（`workspaceController.delete`
-      //      官方语义：只删登记，**保留文件与会话**）
-      //
-      //      mode='stale'（默认，安全）：只删「落在旧 Bot 父目录下的」
-      //         —— 那些目录里的 Bot 已经迁走了，分组是死的
-      //      mode='all'（彻底）：除 <botsRoot> 外全删
-      //         —— 会话不丢，只是变成「未分组」；Boss 说「以前的数据不管了」时用
-      //
-      // ## 安全阀
-      //   - 必须 `confirm:true`
-      //   - **永不删 <botsRoot> 本身**，也**永不删它下面的子目录**（那是要展开的内容）
-      //   - 逐条 try/catch，一条失败不影响其余；结果如实返回
       if (request.method === 'POST' && path === '/workspaces/tidy') {
         const body = (await readBody(request)) ?? {}
         if (body.confirm !== true) {
@@ -2786,8 +2786,7 @@ export function installApi(ctx, { warn } = {}) {
         return
       }
 
-      // ── 部门树（2026-11-15 左侧栏分层 UI）────────────────────────────────
-      //
+
       // `GET /departments/tree` —— 只读，返回三层结构：
       //   部门 → (teamId, roomId, bots[]) → Bot
       //

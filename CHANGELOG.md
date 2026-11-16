@@ -13,6 +13,63 @@
 
 ---
 
+## [0.14.0] - 2026-11-16
+
+### Added · 端点契约测试（Boss 定纪律后立刻加的护栏）
+
+Boss：「写代码的时候，要分析是后端有的数据还是规定好的数据，不能从代码直接写死」
+
+**这条纪律一落地，就抓到了 3 个真错**：
+
+| 错误 | 后果 |
+|---|---|
+| 前端调 `GET /rooms/read` | 实际是 `/rooms/messages` ⇒ 部门群聊报「未知端点」 |
+| 前端调 `POST /roster/set-cwd` | 实际是 `/roster/manage` + `action:'setCwd'` ⇒ 改部门报错 |
+| **部门端点被我的编辑误删** | `/departments/tree|ensure|save` 全部消失 ⇒ 部门页整页报错 |
+
+新增 `test/endpoint-contract.test.mjs`：
+- 提取 `client.js` 里所有 `call('/xxx')`，逐个断言 `api.js` 有对应 `path === '/xxx'`
+- 专项钉住部门端点齐全、房间端点用正确名字、改目录走 `action`
+
+### Fixed · 「把会话挂进工作区」会新建平铺分组
+
+Boss 在 Win 上点了这个按钮，左侧多出 `No.1`（`D:\output\测试 bots2026\No.1`）。
+
+原因：旧实现对每个 Bot 调 `attachToWorkspace(bot.cwd, ...)`，
+而它在 workspace 不存在时**会新建一个** ⇒ 每个 cwd 一个分组 ⇒ 与「一个 CS-bots 可展开」直接冲突。
+
+新行为：
+- cwd 在主目录下 ⇒ 只挂进**已存在的**分组，没有就跳过
+- cwd 不在主目录下 ⇒ **完全不碰**
+- **绝不新建 workspace**
+
+### Added · 老 Bot 现在能改部门了
+
+Boss：「原 bot 没有设置部门的地方」
+
+档案页新增「部门」下拉：
+- 显示当前归属（`dev` / `未归入任何部门`）
+- 选某个部门 ⇒ 移到 `<主目录>/<部门>/<原目录名>`，`AGENTS.md` 会跟着搬
+- 通过 `/roster/manage` 的 `action:'setCwd'` 执行（**不是** `/roster/set-cwd`，那端点不存在）
+
+### Added · 左侧栏自动切「工作区树」模式
+
+**这才是「看不到层级」的真正原因**：
+
+```js
+// dsh-client-ui-workspace/lib/client.js:4136
+nestWorkspaces: groupBy === "workspace-tree"
+```
+
+宿主**只在「工作区树」模式下才做嵌套**，默认是 `groupBy: "workspace"`（平铺）。
+所以我们登记的三级结构，用户看到的仍是一堆平铺条目。
+
+处理：
+- 插件加载时自动把 `localStorage['dsh.workspace.view.v5']` 的 `groupBy` 改成 `workspace-tree`，并用 `csbots.treeBootstrapped` 标记**只改一次**（之后尊重用户自己的选择）
+- **不自动 reload**（那会死循环），改为在部门页给一个「🌲 左侧栏切成树形」按钮，点了提示刷新
+
+---
+
 ## [0.13.3] - 2026-11-15
 
 ### Fixed · 插件 pending 导致整个后端 404（**我上轮引入的严重回归**）

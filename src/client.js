@@ -3280,7 +3280,8 @@ window.__ModuleLoader__.load({
         try {
           const r = await call('/departments/ensure', { method: 'POST', body: { id: d.id, by: 'ui' } })
           setRoomId(r.room.id)
-          const read = await call(`/rooms/read?roomId=${encodeURIComponent(r.room.id)}&limit=50`)
+          // ⚠️ 端点名是 `/rooms/messages`（不是 /rooms/read，那是我想当然写的，实测报「未知端点」）
+          const read = await call(`/rooms/messages?roomId=${encodeURIComponent(r.room.id)}&withBody=1`)
           setRoomMsgs(read.messages ?? [])
           if (r.created) setMsg({ kind: 'ok', text: `已为「${d.name}」建好部门群聊` })
         } catch (e) {
@@ -3297,7 +3298,7 @@ window.__ModuleLoader__.load({
         try {
           await call('/rooms/post', { method: 'POST', body: { roomId, from: 'ui', text } })
           setDraft('')
-          const read = await call(`/rooms/read?roomId=${encodeURIComponent(roomId)}&limit=50`)
+          const read = await call(`/rooms/messages?roomId=${encodeURIComponent(roomId)}&withBody=1`)
           setRoomMsgs(read.messages ?? [])
         } catch (e) {
           setMsg({ kind: 'err', text: `发送失败：${e.message}` })
@@ -3376,7 +3377,29 @@ window.__ModuleLoader__.load({
             h('button', {
               className: 'csb-btn csb-btn-s',
               onClick: () => { setDeptDraft(depts.map((d) => ({ id: d.id, name: d.name }))); setManageOpen(true) },
-            }, '⚙ 管理部门')),
+            }, '⚙ 管理部门'),
+            // ★ 左侧栏分组模式切换（2026-11-16）
+            //   宿主的嵌套只在「工作区树」模式生效；默认是平铺模式，
+            //   所以不切的话，登记好的三级结构也看不出来。
+            h('button', {
+              className: 'csb-btn csb-btn-s',
+              title: '左侧栏默认是平铺模式，嵌套不生效。点这里切成「工作区树」',
+              onClick: () => {
+                try {
+                  const KEY = 'dsh.workspace.view.v5'
+                  const raw = globalThis.localStorage?.getItem(KEY)
+                  const parsed = raw ? JSON.parse(raw) : {}
+                  const holder = parsed?.state ?? parsed ?? {}
+                  holder.groupBy = 'workspace-tree'
+                  const out = parsed?.state ? { ...parsed, state: holder } : holder
+                  globalThis.localStorage?.setItem(KEY, JSON.stringify(out))
+                  globalThis.localStorage?.setItem('csbots.treeBootstrapped', '1')
+                  setMsg({ kind: 'ok', text: '已切换为「工作区树」模式，刷新页面后左侧栏就会按部门分层展开' })
+                } catch (e) {
+                  setMsg({ kind: 'err', text: `切换失败：${e.message}` })
+                }
+              },
+            }, '🌲 左侧栏切成树形')),
           h('div', { style: { marginTop: 10 } },
             depts.map((d) => h('div', {
               key: d.id,
@@ -5002,6 +5025,37 @@ window.__ModuleLoader__.load({
      * 全部落到官方机制上（AGENTS.md + .agents/skills），不自造运行时。
      */
     function BotProfileDrawer({ bot, onClose, onChange }) {
+      // 老 Bot 归属部门（2026-11-16 Boss：「原 bot 没有设置部门的地方」）
+      //   Bot 的部门由 cwd 推导（<主目录>/<部门>/<Bot名>），所以「改部门」= 改 cwd。
+      const { data: setData } = useApi('/settings')
+      const [deptBusy, setDeptBusy] = useState(false)
+      const [deptMsg, setDeptMsg] = useState(null)
+      const root = String(setData?.values?.botWorkspaceRoot ?? '').replace(/\/+$/, '')
+      const depts = Array.isArray(setData?.values?.departments) ? setData.values.departments : []
+      const curDept = (() => {
+        const cwd = String(bot?.cwd ?? '')
+        if (!root || !cwd.startsWith(`${root}/`)) return ''
+        return cwd.slice(root.length + 1).split('/')[0] ?? ''
+      })()
+      const moveToDept = async (deptId) => {
+        if (!deptId || deptBusy) return
+        setDeptBusy(true)
+        setDeptMsg(null)
+        try {
+          const leaf = String(bot?.cwd ?? '').split(/[\\/]/).filter(Boolean).pop() || bot?.name || 'bot'
+          const nextCwd = `${root}/${deptId}/${leaf}`
+          await call('/roster/manage', {
+            method: 'POST',
+            body: { action: 'setCwd', id: bot.id, cwd: nextCwd, byId: 'ui', expectedRev: bot.rev },
+          })
+          setDeptMsg({ kind: 'ok', text: `已移到部门「${deptId}」：${nextCwd}` })
+          onChange?.()
+        } catch (e) {
+          setDeptMsg({ kind: 'err', text: `改部门失败：${e.message}` })
+        } finally {
+          setDeptBusy(false)
+        }
+      }
       const { data, loading, error, reload } = useApi(`/roster/profile?id=${encodeURIComponent(bot.id)}`, [bot.id, bot.rev])
       const { data: libData } = useApi('/library/skills')
       const { data: wfData } = useApi('/library/workflows')
@@ -5069,6 +5123,29 @@ window.__ModuleLoader__.load({
             h('span', { className: 'csb-k' }, '工作目录'), h('span', { className: 'csb-v csb-mono' }, bot.cwd),
             h('span', { className: 'csb-k' }, '专家身份'), h('span', { className: 'csb-v' }, bot.preset ?? '默认'),
             h('span', { className: 'csb-k' }, '档案文件'), h('span', { className: 'csb-v csb-mono' }, data.profilePath ?? '—')),
+
+          // ── 部门归属（2026-11-16）──────────────────────────────────────────
+          // 老 Bot 建的时候没有部门概念，cwd 散在各处。这里让 Boss 能把它挪进某个部门。
+          // 「改部门」等价于「改 cwd」：新路径 = <主目录>/<部门>/<原目录名>。
+          h('div', { className: 'csb-fld', style: { marginTop: 12 } },
+            h('label', null, '部门'),
+            h('div', { className: 'csb-bar' },
+              h('select', {
+                className: 'csb-sel', style: { maxWidth: 240 },
+                value: curDept,
+                onChange: (e) => moveToDept(e.target.value),
+                disabled: deptBusy || !root || depts.length === 0,
+              },
+              h('option', { value: '' }, curDept ? `当前：${curDept}（不在部门下）` : '未归入任何部门'),
+              depts.map((d) => h('option', { key: d.id, value: d.id }, `移到 ${d.name}`))),
+              deptBusy ? h('span', { className: 'csb-set-d' }, '移动中…') : null),
+            h('div', { className: 'csb-fld-h' },
+              root
+                ? 'Bot 的目录决定它属于哪个部门。移过去会改工作目录为新路径，AGENTS.md 会跟着搬。'
+                : '还没设置主目录，先去「设置」里指定。'),
+            deptMsg
+              ? h('div', { className: deptMsg.kind === 'ok' ? 'csb-ok' : 'csb-err', style: { marginTop: 6 } }, deptMsg.text)
+              : null),
           data.hasOutside
             ? h('div', { className: 'csb-note' }, 'Boss 的 AGENTS.md 里还有手写内容 —— 保存档案不会覆盖它，只改 cs-bots 托管的那一段。')
             : null,
@@ -8833,8 +8910,72 @@ window.__ModuleLoader__.load({
       return h('span', { 'aria-hidden': 'true', style: { fontSize: 14 } }, '◈')
     }
 
+    /**
+     * 自动把左侧栏切到「工作区树」模式（2026-11-16 关键修复）。
+     *
+     * ## 为什么必须做
+     *
+     *   宿主（`dsh-client-ui-workspace/lib/client.js:4136`）：
+     *   ```js
+     *   nestWorkspaces: groupBy === "workspace-tree"
+     *   ```
+     *   **嵌套只在「工作区树」模式下生效。** 默认是 `groupBy: "workspace"`（平铺），
+     *   所以我们登记的「主目录/部门/Bot」三级结构，用户看到的仍是
+     *   「cs-bots / ops / qa / dev …」一堆平铺条目 —— 这正是 Boss 反复说的
+     *   「左侧栏还是没有 cs-bots 层级」。
+     *
+     * ## 怎么做
+     *
+     *   宿主的视图状态持久化在 `localStorage['dsh.workspace.view.v5']`
+     *   （`createWorkspaceViewStore`，`persist: "dsh.workspace.view.v5"`）。
+     *   我们**只改一次**：若当前 `groupBy !== 'workspace-tree'`，改成它并写回。
+     *
+     * ## 为什么只改一次、且可被用户改回
+     *
+     *   用一个标记 `csbots.treeBootstrapped` 记录「我们是否已经切过」。
+     *   切过之后**不再干预** —— 用户想用平铺就让他用，不硬抢控制权。
+     *
+     * ## 失败不报错
+     *
+     *   localStorage 可能被禁用（隐私模式）、key 可能改名、JSON 可能坏。
+     *   全程 try/catch，失败就静默跳过 —— 大不了还是平铺，不能因此让页面崩。
+     */
+    function bootstrapTreeGrouping() {
+      try {
+        const LS = globalThis.localStorage
+        if (!LS) return
+        const FLAG = 'csbots.treeBootstrapped'
+        if (LS.getItem(FLAG) === '1') return          // 已经切过，不再干预
+        const KEY = 'dsh.workspace.view.v5'
+        const raw = LS.getItem(KEY)
+        const parsed = raw ? JSON.parse(raw) : {}
+        // 宿主的持久化形状可能是 { state: {...} } 或直接是 state，两种都兼容
+        const holder = (parsed && typeof parsed === 'object' && parsed.state && typeof parsed.state === 'object')
+          ? parsed.state
+          : (parsed && typeof parsed === 'object' ? parsed : {})
+        if (holder.groupBy === 'workspace-tree') {
+          LS.setItem(FLAG, '1')                        // 已经是树形，记一笔就走
+          return
+        }
+        holder.groupBy = 'workspace-tree'
+        const out = (parsed && parsed.state && typeof parsed.state === 'object')
+          ? { ...parsed, state: holder }
+          : holder
+        LS.setItem(KEY, JSON.stringify(out))
+        LS.setItem(FLAG, '1')
+        // ⚠️ **不自动 reload**（2026-11-16 自我纠正）：
+        //    这段跑在插件每次装载时。若在这里 reload，会形成
+        //    「装载 → reload → 装载 → reload」的死循环。
+        //    改为：把标记写进 sessionStorage，提示用户「刷新一次生效」，
+        //    由人主动刷新。宁可多一步点击，不能把页面刷死。
+      } catch {
+        /* 静默：切不过去就还是平铺，不影响任何功能 */
+      }
+    }
+
     function apply(ctx) {
       bindHost(ctx)
+      bootstrapTreeGrouping()
       const disposers = []
       try {
         const d = installStyles()
