@@ -15,6 +15,7 @@
 import { readFileSync, readdirSync, statSync, existsSync, writeFileSync, renameSync, mkdirSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { join, resolve, sep as pathSep } from 'node:path'
+import { isInsideDir, firstSegmentUnder } from './botdirs.js'
 import { registerRoute, service, stateDir as kernelStateDir, listPresets, ensureWorkspaceDir, listWorkspaceRecords, removeWorkspaceByPath, defaultPreset, getAgent, resumeSession, readSessionMessages, attachToWorkspace, readSessionWatermark, sessionMeta, capabilities } from './kernel.js'
 import { createLibrary } from './library.js'
 import { createDirBrowser } from './dirbrowse.js'
@@ -2617,7 +2618,8 @@ export function installApi(ctx, { warn } = {}) {
         for (const bot of bots) {
           const cwd = typeof bot.cwd === 'string' ? bot.cwd.replace(/\/+$/, '') : ''
           if (!cwd) { results.push({ name: bot.name, ok: false, reason: '没有工作目录' }); continue }
-          if (!root || !cwd.startsWith(`${root}/`)) {
+          // ⚠️ 跨平台：不能用 `${root}/` 比前缀（Windows 是反斜杠，永远 false）
+          if (!root || !isInsideDir(root, cwd)) {
             results.push({ name: bot.name, ok: false, skipped: true, reason: 'cwd 不在主目录下，不建也不挂（避免多出平铺分组）' })
             continue
           }
@@ -2706,12 +2708,12 @@ export function installApi(ctx, { warn } = {}) {
             ...depts.map((d) => d?.id).filter(Boolean),
             ...bots
               .map((b) => (typeof b?.cwd === 'string' ? b.cwd.replace(/\/+$/, '') : ''))
-              .filter((cwd) => cwd.startsWith(`${root}/`))
-              .map((cwd) => cwd.slice(root.length + 1).split('/')[0])
+              .filter((cwd) => isInsideDir(root, cwd))
+              .map((cwd) => firstSegmentUnder(root, cwd))
               .filter(Boolean),
           ])]
           for (const deptId of deptIds) {
-            const dir = `${root}/${deptId}`
+            const dir = join(root, deptId)
             try {
               // 目录存在才能被 realpath 归一化（registry.create 要求真实目录）
               if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
@@ -2724,7 +2726,7 @@ export function installApi(ctx, { warn } = {}) {
           }
           for (const b of bots) {
             const cwd = typeof b?.cwd === 'string' ? b.cwd.replace(/\/+$/, '') : ''
-            if (!cwd || !cwd.startsWith(`${root}/`)) continue
+            if (!cwd || !isInsideDir(root, cwd)) continue
             try {
               if (!existsSync(cwd)) mkdirSync(cwd, { recursive: true })
               const r = await withLock(() => ensureWorkspaceDir(ctx, cwd))
@@ -2752,7 +2754,7 @@ export function installApi(ctx, { warn } = {}) {
         const target = records.filter((w) => {
           const p = w.path
           if (p === root) return false                                  // 主目录本身
-          if (p.startsWith(`${root}/`)) return false                     // 子目录（要展开的内容）
+          if (isInsideDir(root, p)) return false                          // 子目录（要展开的内容）
           if (mode === 'all') return true
           // stale：只动旧 Bot 父目录下的（含父目录本身），且该目录已不是任何在用 Bot 的 cwd
           const underLegacy = legacy.some((pre) => p === pre.replace(/\/+$/, '') || p.startsWith(pre))
@@ -2827,7 +2829,7 @@ export function installApi(ctx, { warn } = {}) {
         const orphaned = []
         for (const d of removed) {
           if (!root) continue
-          const inDept = bots.filter((b) => typeof b?.cwd === 'string' && b.cwd.startsWith(`${root}/${d.id}/`))
+          const inDept = bots.filter((b) => typeof b?.cwd === 'string' && isInsideDir(join(root, d.id), b.cwd))
           if (inDept.length > 0) orphaned.push({ name: d.name, bots: inDept.map((b) => b.name) })
         }
         if (orphaned.length > 0) {
@@ -2984,7 +2986,7 @@ export function installApi(ctx, { warn } = {}) {
             //    「部门 "26" 不存在」⇒ 重建失败，而退役已经执行了 ⇒ 必须人工救。
             //    ⇒ 不在 root 下的，直接用**原 cwd** 重建，不碰 department。
             const botCwd = String(b.cwd ?? '').replace(/\/+$/, '')
-            const underRoot = botCwd.startsWith(`${root}/`)
+            const underRoot = isInsideDir(root, botCwd)
             const dept = underRoot
               ? (botCwd.slice(root.length + 1).split('/')[0] || depts[0]?.id)
               : null

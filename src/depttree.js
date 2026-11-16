@@ -24,6 +24,9 @@
  * 依赖面：node 内置。不直接依赖 teams/room 的实现，全部通过 services 注入。
  */
 
+import { join } from 'node:path'
+import { isInsideDir } from './botdirs.js'
+
 /** 部门群聊房间名的统一后缀（便于识别与查找）。 */
 export const DEPT_ROOM_SUFFIX = ' · 部门群聊'
 
@@ -69,7 +72,7 @@ export async function ensureDeptTeam(services, dept, by = 'ui') {
     const bots = services?.roster?.list?.() ?? []
     const root = String(services?.settings?.botWorkspaceRoot ?? '').replace(/\/+$/, '')
     const inDept = root
-      ? bots.filter((b) => typeof b?.cwd === 'string' && b.cwd.startsWith(`${root}/${dept.id}/`))
+      ? bots.filter((b) => typeof b?.cwd === 'string' && isInsideDir(join(root, dept.id), b.cwd))
       : []
     const leadId = inDept[0]?.sessionId ?? inDept[0]?.id
 
@@ -149,7 +152,7 @@ export async function ensureDeptRoom(services, dept, by = 'ui') {
     const bots = services?.roster?.list?.() ?? []
     const root = String(services?.settings?.botWorkspaceRoot ?? '').replace(/\/+$/, '')
     const inDept = root
-      ? bots.filter((b) => typeof b?.cwd === 'string' && b.cwd.startsWith(`${root}/${dept.id}/`))
+      ? bots.filter((b) => typeof b?.cwd === 'string' && isInsideDir(join(root, dept.id), b.cwd))
       : []
     const members = [
       by,
@@ -228,9 +231,9 @@ export function buildDeptTree(services) {
   const warnings = []
   const departments = depts.map((d) => {
     // 该部门的 Bot：cwd 前缀为 `<root>/<deptId>/`
-    const prefix = root ? `${root}/${d.id}/` : ''
-    const inDept = prefix
-      ? bots.filter((b) => typeof b?.cwd === 'string' && b.cwd.startsWith(prefix))
+    const deptDir = root ? join(root, d.id) : ''
+    const inDept = deptDir
+      ? bots.filter((b) => typeof b?.cwd === 'string' && isInsideDir(deptDir, b.cwd))
       : []
       .map((b) => ({
         id: b.id,
@@ -324,7 +327,7 @@ export function deptSessionName(deptName) {
 export async function ensureDeptSession(ctx, services, dept) {
   const root = String(services?.settings?.botWorkspaceRoot ?? '').replace(/\/+$/, '')
   if (!root) return { ok: false, reason: '主目录未设置' }
-  const deptDir = `${root}/${dept?.id}`
+  const deptDir = join(root, dept?.id)
   if (!dept?.id) return { ok: false, reason: '部门 id 为空' }
 
   // ① 目录必须存在（宿主 create 要 realpath）

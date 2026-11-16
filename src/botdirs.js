@@ -29,7 +29,7 @@
  * 依赖面：node 内置。零第三方依赖。
  */
 
-import { isAbsolute, resolve, sep } from 'node:path'
+import { isAbsolute, resolve, sep, relative } from 'node:path'
 
 /**
  * 把一个字符串洗成**安全的单层目录名**。
@@ -190,4 +190,94 @@ export function isManagedCwd(config, bot) {
   if (rel.length !== 2) return false
   const list = Array.isArray(config?.departments) ? config.departments : []
   return list.some((d) => d && d.id === rel[0])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 跨平台路径判断（2026-11-16 Windows 实测：硬编码 '/' 导致整条链失效）
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// ## 事故
+//
+//   我到处写 `cwd.startsWith(`${root}/`)` 判断「是不是在主目录下」。
+//   **Windows 上 root 是 `C:\Users\Song\.dsh\cs-bots`，子路径是
+//   `C:\Users\Song\.dsh\cs-bots\dev\xxx`（反斜杠）**
+//   ⇒ `startsWith('C:\Users\Song\.dsh\cs-bots/')` **永远 false**
+//   ⇒ 部门目录不登记、Bot 判定「不在主目录下」、挂载全部跳过
+//   ⇒ **Win 上左侧栏什么都没有**（这正是 Boss 反复报的现象）。
+//
+// ## 正确做法
+//
+//   用 `path.relative()` 判断包含关系 —— 它自动按平台处理分隔符，
+//   且能正确识别 `..`（越界）。不要自己拼字符串比前缀。
+
+/**
+ * `child` 是否在 `parent` 目录**之内**（严格子路径，不含 parent 自身）。
+ *
+ * 跨平台：内部用 `relative()`，Windows 的反斜杠与 POSIX 的斜杠都正确。
+ *
+ * @param {string} parent 父目录绝对路径
+ * @param {string} child  待判断路径
+ * @returns {boolean}
+ */
+export function isInsideDir(parent, child) {
+  if (typeof parent !== 'string' || typeof child !== 'string') return false
+  const a = normalizeForCompare(parent)
+  const b = normalizeForCompare(child)
+  if (!a || !b) return false
+  if (b === a) return false                       // 自身不算「在里面」
+  let rel
+  try { rel = relative(a, b) } catch { return false }
+  if (!rel) return false
+  // 越界（../ 开头）或绝对路径（不同盘符）都不算
+  if (rel.startsWith('..') || isAbsolute(rel)) return false
+  // Windows 上 `relative` 只认反斜杠；POSIX 上它不认反斜杠 ⇒ 再按字符兜一次
+  if (rel.includes('..')) return false
+  return true
+}
+
+/**
+ * 归一化路径用于**比较**：去掉尾部多余分隔符、把反斜杠统一成斜杠。
+ *
+ * ⚠️ 这一步是必需的（2026-11-16 实测）：`node:path` 的 `relative()` 在
+ *   POSIX 上把 `\` 当普通字符，在 Windows 上把 `/` 当可接受分隔符。
+ *   为了让「Win 风格字符串在 Linux 上也能被正确判断」（测试用），
+ *   也为了处理混合分隔符，先统一成 `/` 再比。
+ *
+ * 注意：这只用于**判断**，不用于产生真实文件路径（那必须用 `join`）。
+ */
+function normalizeForCompare(p) {
+  return String(p).trim().replace(/\\/g, '/').replace(/\/+$/, '')
+}
+
+/**
+ * `child` 是 `parent` 本身**或**在其之内。
+ * @param {string} parent
+ * @param {string} child
+ * @returns {boolean}
+ */
+export function isSameOrInsideDir(parent, child) {
+  if (typeof parent !== 'string' || typeof child !== 'string') return false
+  const a = normalizeForCompare(parent)
+  const b = normalizeForCompare(child)
+  if (!a || !b) return false
+  if (b === a) return true
+  return isInsideDir(a, b)
+}
+
+/**
+ * 取 `child` 相对 `parent` 的第一段目录名（部门 id 用）。
+ * 不在 parent 之内 ⇒ 返回 `null`。
+ *
+ * @param {string} parent
+ * @param {string} child
+ * @returns {string|null}
+ */
+export function firstSegmentUnder(parent, child) {
+  if (!isInsideDir(parent, child)) return null
+  const a = normalizeForCompare(parent)
+  const b = normalizeForCompare(child)
+  let rel
+  try { rel = relative(a, b) } catch { return null }
+  const seg = rel.split(/[\\/]/).filter(Boolean)[0]
+  return seg ?? null
 }

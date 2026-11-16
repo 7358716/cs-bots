@@ -13,6 +13,43 @@
 
 ---
 
+## [0.16.0] - 2026-11-16
+
+### Fixed · ★ 硬编码 `/` 导致 Windows 上整条链路失效（**Win 左侧栏全空的真根因**）
+
+**事故现象**：Win 上左侧栏什么都没有，「把会话挂进工作区」提示
+「分组可能还没登记，或 Bot 的 cwd 不在主目录下」，但 Bot 的 cwd
+明明就是 `C:\Users\Song\.dsh\cs-bots\dev\测试20261116`。
+
+**根因**：我到处写
+```js
+cwd.startsWith(`${root}/`)        // root = C:\Users\Song\.dsh\cs-bots
+```
+Windows 上子路径用**反斜杠**：`C:\Users\Song\.dsh\cs-bots\dev\xxx`
+⇒ `startsWith('...cs-bots/')` **永远 false**
+⇒ 部门目录不登记、Bot 判定「不在主目录下」、挂载全部跳过
+⇒ **左侧栏什么都没有**。
+
+共 7 处：`api.js` 5 处（attach-workspaces / tidy 的分级登记 / rebuild 的 underRoot）
++ `depttree.js` 2 处（部门 Bot 归类、deptDir 拼接）。
+
+**修法**：新增跨平台工具 `src/botdirs.js`
+- `isInsideDir(parent, child)` —— 用 `path.relative()` 判断包含关系，
+  **先归一化分隔符**（`\\` → `/`）再比，POSIX 与 Windows 都对
+- `isSameOrInsideDir()` / `firstSegmentUnder()`
+- 所有 `${root}/` 前缀判断全部替换成这些函数
+
+**新增测试** `test/path-crossplatform.test.mjs`（10 条）：
+- POSIX：子路径 / 越界 / 尾部斜杠 / 自身
+- **Windows**：反斜杠路径、混合分隔符、兄弟目录（前缀相同但非子路径）、取部门 id
+
+### 教训
+
+这是「本机能跑就算完」的最典型后果 —— Linux 上用 `/` 一切正常，
+Windows 上整条链路静默失效，且**不报任何错**（只是判定为 false 就跳过了）。
+
+---
+
 ## [0.15.1] - 2026-11-16
 
 ### Fixed · 移除「写宿主 localStorage」的危险代码（Win 左侧栏被写空）
