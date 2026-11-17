@@ -3289,6 +3289,12 @@ window.__ModuleLoader__.load({
       const rosterQ = useApi('/roster')
       // 历史内置部门（2026-11-16 方案B：保留 + 给提示，不自动删）
       const legacyQ = useApi('/departments/legacy')
+      // 「知道了，保留」点过之后要**真的消失**（2026-11-17 修：原来只 reload，条还在）
+      //   存在 localStorage：用户不想每次进页面都被同一句话烦一次。
+      //   key 带部门 id 集合，部门变了会重新提示（那是新信息，该提示）。
+      const [legacyDismissed, setLegacyDismissed] = useState(() => {
+        try { return globalThis.localStorage?.getItem('csbots.legacyDismissed') ?? '' } catch { return '' }
+      })
       const [collapsed, setCollapsed] = useState({})   // { deptId: true } 表示折叠
       const [selected, setSelected] = useState(null)    // { type:'dept', id } | { type:'bot', id }
       const [roomId, setRoomId] = useState(null)
@@ -3469,7 +3475,10 @@ window.__ModuleLoader__.load({
       }
 
       // ── 正常：左侧树 + 右侧详情 ───────────────────────────────────────────
-      const legacy = legacyQ.data?.legacy ?? []
+      const legacyAll = legacyQ.data?.legacy ?? []
+      // 忽略过的（按「部门 id 排序拼串」比对）不再显示
+      const legacyKey = legacyAll.map((x) => x.id).sort().join(',')
+      const legacy = legacyKey && legacyKey === legacyDismissed ? [] : legacyAll
 
       return h('div', null,
         // 历史部门提示（有才显示）
@@ -3490,7 +3499,11 @@ window.__ModuleLoader__.load({
           h('div', { className: 'csb-bar' },
             h('button', {
               className: 'csb-btn csb-btn-s',
-              onClick: () => legacyQ.reload(),
+              onClick: () => {
+                try { globalThis.localStorage?.setItem('csbots.legacyDismissed', legacyKey) } catch { /* 隐私模式 */ }
+                setLegacyDismissed(legacyKey)
+                setMsg({ kind: 'ok', text: '已记住，这些部门保留不再提示' })
+              },
             }, '知道了，保留'),
             h('button', {
               className: 'csb-btn csb-btn-s',
@@ -3905,6 +3918,26 @@ window.__ModuleLoader__.load({
       },
       h('div', { className: 'csb-set-d', style: { marginBottom: 10 } },
         '选择要导出的内容。导出包是 zip，导入时会有校核提示。'),
+      // 全选 / 清空（2026-11-17 Boss：「导出应该有个全选」）
+      h('div', { className: 'csb-bar', style: { marginBottom: 8 } },
+        h('button', {
+          className: 'csb-btn csb-btn-s',
+          onClick: () => {
+            const all = {}
+            for (const x of SECTIONS_UI) all[x.id] = true
+            setSections(all)
+            setNeedConfirm(false)
+          },
+        }, '全选'),
+        h('button', {
+          className: 'csb-btn csb-btn-s',
+          onClick: () => { setSections({}); setNeedConfirm(false) },
+        }, '全不选'),
+        h('button', {
+          className: 'csb-btn csb-btn-s',
+          title: '只选部门与 Bot（最常用的搬配置场景）',
+          onClick: () => { setSections({ departments: true, bots: true }); setIncludeFiles(false) },
+        }, '只选结构')),
       SECTIONS_UI.map((x) => h('label', {
         key: x.id, className: 'csb-bar',
         style: { gap: 8, cursor: 'pointer', padding: '3px 0', alignItems: 'flex-start' },

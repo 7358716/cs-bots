@@ -162,3 +162,9 @@ test('★ 唤醒规则：部门群聊带 deptId，主管优先于广播', async 
   assert.match(room, /source: 'dept-broadcast'/, '没主管广播')
   assert.match(room, /deptId: null/, 'DEFAULT_SETTINGS 要有 deptId')
 })
+
+test('★ 历史部门提示：点「知道了，保留」要真的消失（不是只 reload）', () => {
+  assert.match(DEPT, /csbots\.legacyDismissed/, '要持久化「已忽略」')
+  assert.match(DEPT, /setLegacyDismissed\(legacyKey\)/, '要点完立刻隐藏')
+  assert.match(DEPT, /legacyKey === legacyDismissed \? \[\] : legacyAll/, '忽略过的不再显示')
+})

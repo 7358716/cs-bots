@@ -80,3 +80,10 @@ test('入口：部门页有导出/导入按钮', () => {
   assert.match(SRC, /⬇ 导出/, '导出入口')
   assert.match(SRC, /⬆ 导入/, '导入入口')
 })
+
+test('★ 导出：有全选 / 全不选 / 只选结构（2026-11-17 Boss 要求）', () => {
+  assert.match(EXP, /'全选'/, '要有全选按钮')
+  assert.match(EXP, /'全不选'/, '要能一键清空')
+  assert.match(EXP, /'只选结构'/, '常用场景一键选')
+  assert.match(EXP, /for \(const x of SECTIONS_UI\) all\[x\.id\] = true/, '全选要遍历所有段')
+})
