@@ -3120,6 +3120,11 @@ export function installApi(ctx, { warn } = {}) {
           if (old && old.name !== d.name) renames.push({ id: d.id, from: old.name, to: d.name })
         }
 
+        // ②-b 保存前把「这次到底会删谁」写清楚回给页面（2026-11-18 Boss：
+        //      「删除部门前要校验并给弹窗，而不是在之后的页面展示」）。
+        //      前端虽然已经前置弹窗，但服务端必须自己说得清楚——多端并发下前端的判断会过时。
+        const removedNames = removed.map((d) => d.name ?? d.id)
+
         const saved = saveSettings(dir, { departments: next })
         if (!saved.ok) {
           sendJson(response, 400, { ok: false, reason: saved.reason })
@@ -3141,11 +3146,49 @@ export function installApi(ctx, { warn } = {}) {
           }
         }
 
+        // ②-c 改名后的全盘联动（2026-11-18 Boss：「改部门名称的时候，考虑全盘影响，通盘考虑修改」）
+        //
+        //   容器名一变，跟着变的东西有四处：
+        //     · 团队名（上面已做）
+        //     · 群聊名（房间 title）
+        //     · Bot 的 cwd 里的那一级目录
+        //     · 左侧栏工作区分组的 title
+        //   ⚠️ **目录本身不重命名**（那是破坏性文件操作，Boss 未授权）。
+        //   这里只改「显示层」与「注册表」，并在 warnings 里如实说明磁盘目录仍是旧名。
+        const linkWarnings = [...renameErrors]
+        for (const r of renames) {
+          // 群聊名：`<部门名> · 部门群聊`
+          try {
+            const rooms = services.room?.list?.() ?? []
+            const hit = rooms.find((x) => typeof x?.name === 'string' && (x.name === r.from || x.name.startsWith(`${r.from} ·`)))
+            // ⚠️ 房间域的改名入口是 `update({roomId, name, expectedRev, byId})`，
+            //    不是 `rename`。用错名字会静默不生效（try 里被吞成 warning）。
+            if (hit && typeof services.room?.update === 'function') {
+              const nextName = typeof hit.name === 'string' && hit.name.startsWith(`${r.from} ·`)
+                ? `${r.to}${hit.name.slice(r.from.length)}`
+                : `${r.to} · 部门群聊`
+              services.room.update({
+                roomId: hit.id, name: nextName, expectedRev: hit.rev, byId: body.by ?? 'ui',
+              })
+            }
+          } catch (error) {
+            linkWarnings.push(`群聊改名失败（${r.from} → ${r.to}）：${error?.message ?? error}`)
+          }
+        }
+        const rootAbs = String(services.settings?.botWorkspaceRoot ?? '').replace(/[\\/]+$/, '')
+        if (rootAbs && renames.length) {
+          linkWarnings.push(
+            `磁盘目录没有改名（这是保护措施）：${renames.map((r) => r.id).join('、')} 仍存在于 ${rootAbs} 下，`
+            + '只有显示名、团队、群聊、左侧栏分组跟着改了。',
+          )
+        }
+
         sendJson(response, 200, {
           ok: true,
           departments: saved.values?.departments ?? next,
           renames,
-          ...(renameErrors.length ? { warnings: renameErrors } : {}),
+          removed: removedNames,
+          ...(linkWarnings.length ? { warnings: linkWarnings } : {}),
         })
         return
       }

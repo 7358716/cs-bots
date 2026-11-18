@@ -63,12 +63,16 @@ test('群聊：能打开、能发言、能安排工作', () => {
   assert.match(DEPT, /＋ 安排工作/, '要有安排工作入口')
 })
 
-test('部门管理：新建/改名/删除都在独立弹窗里', () => {
+test('部门管理：新建/改名/删除都在独立弹窗里（0.20.1 口径：单字段即目录名）', () => {
   assert.match(DEPT, /DeptManageModal/, '要复用 DeptManageModal')
-  assert.match(MANAGE, /id（英文）/, '要能填目录名')
-  assert.match(MANAGE, /显示名/, '要能填显示名')
+  // 2026-11-18 Boss 第 1 条：「新增部门就是一个字段，字段名称作为目录名称」
+  // ⇒ id 与显示名合并为一个输入框，旧断言（id（英文）+ 显示名 两个框）已作废。
+  assert.match(MANAGE, /部门名（就是目录名/, '要说明名字即目录名')
+  assert.ok(!/id（英文）/.test(MANAGE), '不再出现「id（英文）」双字段')
   assert.match(MANAGE, /＋ 新增/, '要有新增按钮')
-  assert.match(MANAGE, /删除部门前要先把它下面的 Bot 迁走/, '要提示删除约束')
+  // 删除约束从「文字提示」升级为「前置拦截弹窗」
+  assert.match(MANAGE, /不能删除「/, '删除前置拦截弹窗')
+  assert.match(MANAGE, /去迁移这些 Bot/, '拦截弹窗要能一键去迁移')
 })
 
 test('部门管理：保存走 /departments/save（有 Bot 不许删的保护在后端）', () => {
@@ -142,11 +146,14 @@ test('历史部门 UI：默认保留，清空是显式动作', () => {
 
 // ── 部门主管（2026-11-16 Boss：必须人工设置）───────────────────────────────
 
-test('★ 主管：管理部门弹窗里能人工填主管名字', () => {
+test('★ 主管：管理部门弹窗里能人工选主管（0.20.1：从手填改为下拉）', () => {
   assert.match(MANAGE, /主管/, '要有主管字段')
   assert.match(MANAGE, /leadBotName/, '字段名 leadBotName')
-  assert.match(MANAGE, /留空=没有主管，说话唤醒全部/, '要说明留空的含义')
-  assert.match(MANAGE, /填 Bot 的名字（不是 id）/, '要说清填名字不是 id')
+  // 2026-11-18 Boss 第 2 条：「主管应该选择，也可以选择其他没有在其他部门的 bot」
+  // ⇒ 手填文本框改成下拉；旧断言「填 Bot 的名字（不是 id）」已作废。
+  assert.match(MANAGE, /没有主管，说话唤醒全部/, '要说明留空的含义')
+  assert.match(MANAGE, /未归属部门的 Bot/, '候选里要含未归属部门的 Bot')
+  assert.ok(!/placeholder: '填这个部门当主管/.test(MANAGE), '不再是手填输入框')
 })
 
 test('★ 主管：后端不自动取第一个 Bot', async () => {

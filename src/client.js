@@ -3000,6 +3000,82 @@ window.__ModuleLoader__.load({
     }
 
     /** Bot 页「派任务」：建任务 → 立即指派 → 显示唤醒结果（契约 §3.1）。 */
+    /**
+     * 执行者下拉（2026-11-18 Boss：「点击插件发布管理员，选择有误」）。
+     *
+     * ## 修的是什么
+     *
+     *   1. **原来只列本部门 Bot**（`dept.bots`），但弹窗标题不写部门 ⇒ 你在「综合部」
+     *      看「插件发布管理员」，下拉里却只有综合部的人，看不出层级关系。
+     *   2. 「安排工作」两处入口默认值不一致：Bot 卡片取当前 Bot，
+     *      部门群聊那侧取 `dept.bots[0]`（队列第一个，跟你选的人无关）。
+     *   3. 任务栏原先把空值标成「由系统自动分配」，但 `create()` 里 `if (assignee)` ⇒
+     *      选这项时 assignee 是空串，**根本不发给后端**，等于静默建了个无人任务。
+     *
+     * ## 现在的口径
+     *
+     *   · 分组显示：本部门 / 其他部门分清，跨部门选项标签带部门名
+     *   · 空值文案统一叫「未指定（不派）」，不再叫「自动」——因为确实没有自动
+     *   · 当前值高亮 + title 显示完整 cwd，重名时能分辨
+     *
+     * @param {{
+     *   value: string, onChange: (v: string) => void,
+     *   depts: Array<{id: string, name: string, bots: Array<object>}>,
+     *   currentDeptId?: string, width?: number|string, showNoAssign?: boolean,
+     * }} props
+     */
+    /**
+     * 把 `/roster` + `/settings` 组装成 `BotPicker` 需要的分组结构。
+     *
+     * 为什么放这里而不是各页各写一份：2026-11-18 的「选择有误」有一半原因就是
+     * 各页自己算一份列表，口径不一致。这里只做一件事——**按 cwd 推导部门**，
+     * 与后端 `departmentOfCwd` 同口径（`主目录/部门/…` 的第二段）。
+     *
+     * @param {{ bots: Array<object>, departments: Array<{id: string, name: string}>, root: string }} input
+     * @returns {Array<{id: string, name: string, bots: Array<object>}>}
+     */
+    function groupBotsByDept({ bots, departments, root }) {
+      const list = Array.isArray(departments) ? departments.filter((d) => d && d.id) : []
+      const norm = (x) => String(x ?? '').replace(/\\/g, '/').replace(/\/+$/, '')
+      const rootN = norm(root)
+      const pickDept = (b) => {
+        const cwd = norm(b?.cwd)
+        if (!rootN || !cwd.startsWith(`${rootN}/`)) return ''
+        return cwd.slice(rootN.length + 1).split('/')[0] ?? ''
+      }
+      const byId = new Map(list.map((d) => [d.id, { id: d.id, name: d.name ?? d.id, bots: [] }]))
+      const orphan = { id: '__orphan', name: '未归属部门', bots: [] }
+      for (const b of Array.isArray(bots) ? bots : []) {
+        if (!b || b.state === 'retired') continue
+        const id = pickDept(b)
+        const box = byId.get(id)
+        if (box) box.bots.push(b)
+        else orphan.bots.push(b)
+      }
+      const out = [...byId.values()]
+      if (orphan.bots.length) out.push(orphan)
+      return out
+    }
+
+    function BotPicker({ value, onChange, depts, currentDeptId, width = 220, showNoAssign = true }) {
+      const list = Array.isArray(depts) ? depts.filter((d) => d && Array.isArray(d.bots) && d.bots.length) : []
+      const group = (title, bots) => bots.length
+        ? h('optgroup', { key: title, label: title },
+          bots.map((b) => h('option', {
+            key: b.id, value: b.sessionId ?? '', title: b.cwd ?? '',
+          }, (value === (b.sessionId ?? '') ? '● ' : '') + b.name)))
+        : null
+      const mine = list.find((d) => d.id === currentDeptId)
+      const others = list.filter((d) => d.id !== currentDeptId)
+      return h('select', {
+        className: 'csb-sel', style: { width }, value: value ?? '',
+        onChange: (e) => onChange(e.target.value),
+      },
+      showNoAssign ? h('option', { key: '__none', value: '' }, '未指定（不派）') : null,
+      mine ? group(`本部门「${mine.name}」`, mine.bots) : null,
+      others.map((d) => group(d.name, (d.bots ?? []).map((b) => ({ ...b })))))
+    }
+
     function BotAssignModal({ bot, onClose }) {
       const [subject, setSubject] = useState('')
       const [desc, setDesc] = useState('')
@@ -3303,6 +3379,8 @@ window.__ModuleLoader__.load({
     function DeptTab() {
       const treeQ = useApi('/departments/tree')
       const rosterQ = useApi('/roster')
+      // 主目录（用于把 Bot 按 cwd 归类成「未归属部门」）——与任务栏同一口径
+      const { data: setData } = useApi('/settings')
       // 历史内置部门（2026-11-16 方案B：保留 + 给提示，不自动删）
       const legacyQ = useApi('/departments/legacy')
       // 「知道了，保留」点过之后要**真的消失**（2026-11-17 修：原来只 reload，条还在）
@@ -3323,8 +3401,9 @@ window.__ModuleLoader__.load({
       const [deptDraft, setDeptDraft] = useState([])
       const [manageBusy, setManageBusy] = useState(false)
       // 安排工作
+      // `fromBotId` = 用户是点哪个 Bot 进来的。默认值只认它，不再用 dept.bots[0]。
       const [assignOpen, setAssignOpen] = useState(false)
-      const [assignForm, setAssignForm] = useState({ subject: '', assignee: '', longrun: false })
+      const [assignForm, setAssignForm] = useState({ subject: '', assignee: '', longrun: false, fromBotId: '' })
       // 批量选择（2026-11-16 Boss：「加拖拽和批量」）
       const [checked, setChecked] = useState({})     // { botId: true }
       const [dragBot, setDragBot] = useState(null)   // 正在拖的 Bot id
@@ -3333,6 +3412,10 @@ window.__ModuleLoader__.load({
       // 导入导出（2026-11-16）
       const [exportOpen, setExportOpen] = useState(false)
       const [importOpen, setImportOpen] = useState(false)
+      // 部门人员管理（2026-11-18 Boss 第 3 条）
+      const [memberProfile, setMemberProfile] = useState(null)  // { id } 展开档案编辑
+      const [retireBot, setRetireBot] = useState(null)          // 待退役的 Bot
+      const [newBotDept, setNewBotDept] = useState(null)        // 在本部门新建 Bot
 
       const depts = treeQ.data?.departments ?? []
       const bots = rosterQ.data?.bots ?? []
@@ -3430,6 +3513,22 @@ window.__ModuleLoader__.load({
         }
       }
 
+      /** 本部门主管（人工设置的 leadBotName）。按名字找不到就返回 null —— 绝不静默挑第一个。 */
+      const leadBotOf = (d) => {
+        const want = String(d?.leadBotName ?? '').trim()
+        if (!want) return null
+        return (d?.bots ?? []).find((b) => b.name === want) ?? null
+      }
+
+      /** 按 id 找本页已知的 Bot 名字（只用于标题展示）。 */
+      const botNameOf = (id) => {
+        for (const d of depts) {
+          const hit = (d?.bots ?? []).find((b) => b.id === id)
+          if (hit) return hit.name
+        }
+        return ''
+      }
+
       const assign = async () => {
         const subject = assignForm.subject.trim()
         if (!subject || busy) return
@@ -3458,6 +3557,71 @@ window.__ModuleLoader__.load({
         }
       }
 
+      /**
+       * 部门人员管理（2026-11-18 Boss 第 3 条：B 方案）。
+       *
+       * ## 要求原文
+       *   「管理部门是要管理部门人员，对 bot 的增删改查，同步 bot 档案」
+       *
+       * ## 设计取舍（Boss 选了 B：弹窗内直接编辑档案）
+       *
+       *   · **列表**：本部门 Bot，每行给「档案 / 移出部门 / 退役」
+       *   · **改档案**：点「档案」原地展开 `BotProfileDrawer` —— 与「Bot 档案」页
+       *     **是同一个组件**，因此校验规则只有一份（后端 `roster.setProfile`），
+       *     不存在两处表单各写一套、互相对不上的问题。
+       *   · **新增**：本部门「新建 Bot」直接以该部门为归属（复用 BotsTab 的创建路径）
+       *   · **删除**：走**退役**（现有系统没有硬删除路径，退役是唯一不可逆度低的方式）；
+       *     点退役会二次确认，并说明目录与档案会保留。
+       */
+      const renderDeptMembers = (deptId) => {
+        const d = depts.find((x) => x.id === deptId)
+        const list = d?.bots ?? []
+        const others = depts.filter((x) => x.id !== deptId)
+        return h('div', null,
+          h('div', { className: 'csb-set-d', style: { marginBottom: 8 } },
+            `「${d?.name ?? deptId}」共 ${list.length} 个 Bot。改档案会直接写入该 Bot 的 AGENTS.md。`),
+          list.length === 0
+            ? h('div', { className: 'csb-set-d' }, '这个部门还没有 Bot。用右边「＋ 给它安排工作」以外的方式新建，或在下方「新建 Bot」里选本部门。')
+            : list.map((b) => h('div', {
+              key: b.id,
+              style: {
+                display: 'flex', alignItems: 'center', gap: 8, padding: '6px 8px',
+                borderRadius: 6, marginBottom: 4, background: 'var(--dsw-alias-bg-secondary, #f7f7f9)',
+              },
+            },
+            h('span', { style: { flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' } },
+              `🤖 ${b.name}`, h('span', { className: 'csb-set-d', style: { marginLeft: 8, fontSize: 11 } }, b.state ?? '')),
+            h('button', {
+              className: 'csb-btn csb-btn-s',
+              onClick: () => setMemberProfile({ id: b.id }),
+            }, '档案'),
+            others.length
+              ? h('select', {
+                className: 'csb-sel', style: { width: 130, height: 26, fontSize: 12 }, value: '',
+                onChange: async (e) => {
+                  const target = e.target.value
+                  e.target.value = ''
+                  if (!target) return
+                  await moveBots([b.id], target)
+                },
+              },
+              h('option', { key: '', value: '' }, '移到部门…'),
+              others.map((x) => h('option', { key: x.id, value: x.id }, x.name)))
+              : null,
+            h('button', {
+              className: 'csb-btn csb-btn-s csb-btn-d',
+              onClick: () => setRetireBot(b),
+            }, '退役'))),
+          // 新建：直接归属本部门
+          h('div', { className: 'csb-bar', style: { marginTop: 10 } },
+            h('button', {
+              className: 'csb-btn csb-btn-s',
+              onClick: () => setNewBotDept(deptId),
+            }, '＋ 在本部门新建 Bot'),
+            h('span', { className: 'csb-set-d', style: { fontSize: 11.5 } },
+              '退役 ≠ 删除：Bot 只读留档，目录与档案都保留；需要彻底清理请手动处理目录。')))
+      }
+
       // ── 加载中 / 出错 ─────────────────────────────────────────────────────
       if (treeQ.loading && !treeQ.data) return h(Skeleton, { n: 3 })
       if (treeQ.error) return h('div', { className: 'csb-err' }, `读取部门失败：${treeQ.error}`)
@@ -3478,6 +3642,7 @@ window.__ModuleLoader__.load({
               + '同一部门的 Bot 共享一个群聊，你可以在群里直接派活。'),
             h('button', {
               className: 'csb-btn csb-btn-p',
+              // 空状态：本来就没有部门，重置成一行空行是**正确**行为（不是 bug）。
               onClick: () => { setDeptDraft([{ id: '', name: '' }]); setManageOpen(true) },
             }, '＋ 新建第一个部门')),
           manageOpen
@@ -3549,7 +3714,11 @@ window.__ModuleLoader__.load({
             }, '⚙ 管理部门'),
             h('button', {
               className: 'csb-btn csb-btn-s',
-              onClick: () => { setDeptDraft([{ id: '', name: '' }]); setManageOpen(true) },
+              // ⚠️ 2026-11-18 修：这里原来是 `[{id:'',name:''}]` —— 只有一行空部门。
+              //    保存时提交的列表里没有任何已有部门 ⇒ 后端当成「删掉全部部门」
+              //    ⇒ 报「部门「开发部」还有 14 个 Bot」，用户完全看不懂。
+              //    现在：打开弹窗时**带上现有部门**并追加一行空行。
+              onClick: () => { setDeptDraft([...depts.map((d) => ({ id: d.id, name: d.name })), { id: '', name: '' }]); setManageOpen(true) },
             }, '＋ 新建')),
           // 导入导出（2026-11-16 Boss：都要有确认页）
           h('div', { className: 'csb-bar', style: { marginTop: 6 } },
@@ -3683,7 +3852,7 @@ window.__ModuleLoader__.load({
                 h('button', {
                   className: 'csb-btn csb-btn-s',
                   onClick: () => {
-                    setAssignForm({ subject: '', assignee: activeBot.sessionId ?? '', longrun: false })
+                    setAssignForm({ subject: '', assignee: activeBot.sessionId ?? '', longrun: false, fromBotId: activeBot.id })
                     setAssignOpen(true)
                   },
                 }, '＋ 给它安排工作')))
@@ -3730,7 +3899,14 @@ window.__ModuleLoader__.load({
                       className: 'csb-btn',
                       title: '把这句话变成任务，派给本部门的 Bot',
                       onClick: () => {
-                        setAssignForm({ subject: draft.trim(), assignee: dept?.bots?.[0]?.sessionId ?? '', longrun: false })
+                        // 2026-11-18 修：原来默认 `dept.bots[0]`（队列第一个，跟你无关）。
+                        // 现在默认=本部门主管；没有主管就留空，逼用户显式选。
+                        setAssignForm({
+                          subject: draft.trim(),
+                          assignee: leadBotOf(dept)?.sessionId ?? '',
+                          longrun: false,
+                          fromBotId: leadBotOf(dept)?.id ?? '',
+                        })
                         setAssignOpen(true)
                       },
                     }, '＋ 安排工作'))))),
@@ -3752,21 +3928,95 @@ window.__ModuleLoader__.load({
         manageOpen
           ? h(DeptManageModal, {
             draft: deptDraft, setDraft: setDeptDraft, busy: manageBusy,
-            onSave: () => saveDepts(deptDraft), onClose: () => setManageOpen(false),
+            bots: depts.flatMap((d) => d.bots ?? []),
+            orphanedBots: groupBotsByDept({
+              bots: rosterQ.data?.bots ?? [],
+              departments: depts.map((d) => ({ id: d.id, name: d.name })),
+              root: String(setData?.values?.botWorkspaceRoot ?? ''),
+            }).find((g) => g.id === '__orphan')?.bots ?? [],
+            deptBotsOf: (id) => (depts.find((d) => d.id === id)?.bots ?? []),
+            onMigrate: (deptId) => {
+              // 「去迁移」：把该部门的 Bot 全部勾上，引导用户去批量移动
+              const list = (depts.find((d) => d.id === deptId)?.bots ?? [])
+              const next = {}
+              for (const b of list) next[b.id] = true
+              setChecked(next)
+              setManageOpen(false)
+              setMsg({ kind: 'ok', text: `已勾选「${depts.find((d) => d.id === deptId)?.name ?? deptId}」的 ${list.length} 个 Bot，用上方「移到部门…」批量迁走` })
+            },
+            onManageMembers: (deptId) => { setSelected({ type: 'dept', id: deptId }); setManageOpen(false) },
+            profileForm: renderDeptMembers,
+          })
+          : null,
+
+        // 部门人员 → 改档案：**复用 Bot 档案抽屉本身**（B 方案的唯一正确做法）
+        memberProfile
+          ? (() => {
+            const all = depts.flatMap((d) => d.bots ?? [])
+            const bot = all.find((b) => b.id === memberProfile.id)
+            if (!bot) return null
+            return h(BotProfileDrawer, {
+              bot,
+              onClose: () => setMemberProfile(null),
+              onChange: () => { treeQ.reload(); rosterQ.reload() },
+            })
+          })()
+          : null,
+
+        // 部门人员 → 退役（二次确认 + 说清后果）
+        retireBot
+          ? h(Modal, {
+            title: `退役「${retireBot.name}」？`,
+            onClose: () => setRetireBot(null),
+            footer: [
+              h('button', { key: 'c', className: 'csb-btn', onClick: () => setRetireBot(null) }, '取消'),
+              h('button', {
+                key: 'r', className: 'csb-btn csb-btn-d',
+                onClick: async () => {
+                  const b = retireBot
+                  setRetireBot(null)
+                  try {
+                    await call('/roster/manage', {
+                      method: 'POST',
+                      body: { action: 'retire', id: b.id, expectedRev: b.rev, byId: 'ui', reason: '部门管理中退役' },
+                    })
+                    setMsg({ kind: 'ok', text: `已退役「${b.name}」（目录与档案保留）` })
+                    treeQ.reload(); rosterQ.reload()
+                  } catch (e) {
+                    setMsg({ kind: 'err', text: `退役失败：${e.message}` })
+                  }
+                },
+              }, '确认退役'),
+            ],
+          },
+          h('div', { className: 'csb-set-d' },
+            '退役后：它不再出现在左侧栏分组与派活下拉里，不再被唤醒；',
+            h('br'), '但**目录、AGENTS.md、记忆都会保留**，需要时可以重建。'))
+          : null,
+
+        // 在本部门新建 Bot（部门人员管理的「增」）
+        newBotDept
+          ? h(NewBotInDeptModal, {
+            deptId: newBotDept,
+            deptName: depts.find((d) => d.id === newBotDept)?.name ?? newBotDept,
+            onClose: () => setNewBotDept(null),
+            onDone: () => { setNewBotDept(null); treeQ.reload(); rosterQ.reload() },
           })
           : null,
 
         // 安排工作弹窗
         assignOpen
           ? h(Modal, {
-            title: '安排工作',
+            // 标题带部门 + 来源 Bot（2026-11-18 Boss「选择有误」：弹窗不写上下文）
+            title: `安排工作 · ${dept?.name ?? '未知部门'}`
+              + (assignForm.fromBotId ? ` / ${botNameOf(assignForm.fromBotId)}` : ''),
             onClose: () => setAssignOpen(false),
             footer: [
               h('button', { key: 'c', className: 'csb-btn', onClick: () => setAssignOpen(false) }, '取消'),
               h('button', {
                 key: 'ok', className: 'csb-btn csb-btn-p',
                 disabled: busy || !assignForm.subject.trim(), onClick: assign,
-              }, busy ? '创建中…' : '创建并派活'),
+              }, busy ? '处理中…' : (assignForm.assignee ? '创建并派活' : '仅创建任务（不派）')),
             ],
           },
           h('div', { className: 'csb-fld' },
@@ -3777,12 +4027,21 @@ window.__ModuleLoader__.load({
             })),
           h('div', { className: 'csb-fld' },
             h('label', null, '派给'),
-            h('select', {
-              className: 'csb-sel', value: assignForm.assignee,
-              onChange: (e) => setAssignForm({ ...assignForm, assignee: e.target.value }),
-            },
-            h('option', { value: '' }, '（先不派，稍后再说）'),
-            (dept?.bots ?? []).map((b) => h('option', { key: b.id, value: b.sessionId }, b.name)))),
+            h(BotPicker, {
+              value: assignForm.assignee,
+              onChange: (v) => setAssignForm({ ...assignForm, assignee: v }),
+              depts,
+              currentDeptId: dept?.id,
+              width: 260,
+            }),
+            // 跨部门派活必须喊出来：选到别的部门的人时给一行黄字
+            (() => {
+              const owner = depts.find((d2) => (d2.bots ?? []).some((b) => (b.sessionId ?? '') === assignForm.assignee))
+              if (!owner || owner.id === dept?.id) return null
+              const b = (owner.bots ?? []).find((x) => (x.sessionId ?? '') === assignForm.assignee)
+              return h('div', { className: 'csb-fld-h', style: { color: '#b45309' } },
+                `注意：你选的是「${owner.name}」的 ${b?.name ?? ''}，不是本部门的 Bot`)
+            })()),
           h('label', { className: 'csb-bar', style: { gap: 6, cursor: 'pointer' } },
             h('input', {
               type: 'checkbox', checked: assignForm.longrun,
@@ -3800,55 +4059,222 @@ window.__ModuleLoader__.load({
      * 抽成独立组件：DeptTab 里有两处要打开它（空状态 + 正常状态），
      * 内联会重复一大段 JSX。
      */
-    function DeptManageModal({ draft, setDraft, busy, onSave, onClose }) {
+    /**
+     * 在指定部门新建 Bot（部门人员管理的「增」）。
+     *
+     * 为什么不复用 BotsTab 的创建表单：那个表单有「选部门」一步，
+     * 从部门里进来的人已经表达了归属，再让他选一次就是多余且容易选错。
+     * 这里部门锁定、只填名字与预设，提交走**同一个** `POST /roster`，
+     * `department` 直接给定 ⇒ 路径由后端 `deriveBotCwd` 算，前端不拼路径。
+     */
+    function NewBotInDeptModal({ deptId, deptName, onClose, onDone }) {
+      const [name, setName] = useState('')
+      const [preset, setPreset] = useState('')
+      const [busy, setBusy] = useState(false)
+      const [err, setErr] = useState(null)
+      const { data: presetData } = useApi('/presets')
+      const presets = presetData?.presets ?? []
+      const submit = async () => {
+        if (!name.trim() || busy) return
+        setBusy(true); setErr(null)
+        try {
+          await call('/roster', {
+            method: 'POST',
+            body: {
+              name: name.trim(),
+              department: deptId,
+              ...(preset ? { preset } : {}),
+              byId: 'ui',
+            },
+          })
+          onDone?.()
+        } catch (e) {
+          setErr(`创建失败：${e.message}`)
+        } finally {
+          setBusy(false)
+        }
+      }
+      return h(Modal, {
+        title: `在「${deptName}」新建 Bot`,
+        onClose,
+        footer: [
+          h('button', { key: 'c', className: 'csb-btn', onClick: onClose }, '取消'),
+          h('button', {
+            key: 'o', className: 'csb-btn csb-btn-p',
+            disabled: busy || !name.trim(), onClick: submit,
+          }, busy ? '创建中…' : '创建'),
+        ],
+      },
+      h('div', { className: 'csb-fld' },
+        h('label', null, '名字'),
+        h('input', {
+          className: 'csb-in', placeholder: '例如：后端、前端、测试',
+          value: name, autoFocus: true,
+          onChange: (e) => setName(e.target.value),
+        }),
+        h('div', { className: 'csb-fld-h' }, `归属部门固定为「${deptName}」，目录建在主目录下的这个部门里`)),
+      h('div', { className: 'csb-fld' },
+        h('label', null, '专家身份（预设）'),
+        h('select', {
+          className: 'csb-sel', style: { maxWidth: 300 }, value: preset,
+          onChange: (e) => setPreset(e.target.value),
+        },
+        h('option', { key: '', value: '' }, '用默认（standard）'),
+        presets.map((p) => h('option', { key: p.id, value: p.id }, p.label ?? p.id)))),
+      err ? h('div', { className: 'csb-err' }, err) : null)
+    }
+
+    /**
+     * 管理部门弹窗（2026-11-18 重做，Boss 四条要求）。
+     *
+     * ## Boss 原话
+     *   1「新增部门就是一个字段，字段名称作为目录名称（当前主目录下）」
+     *   2「主管应该选择，也可以选择其他没有在其他部门的 bot」
+     *   3「管理部门是要管理部门人员，对 bot 的增删改查，同步 bot 档案」
+     *   4「删除部门前要校验并给弹窗，而不是在之后的页面展示」
+     *
+     * ## 为什么原来会报「部门「开发部」还有 14 个 Bot」
+     *
+     *   「＋ 新建」把草稿初始化成 `[{id:'',name:''}]` —— **只有一行空部门**。
+     *   保存时提交的列表里没有任何已有部门 ⇒ 后端把它当成「删掉全部部门」
+     *   ⇒ `DEPT_HAS_BOTS` 拒绝。用户想新建，系统却理解成全删，还给了个看不懂的错。
+     *   ⇒ 现在：新建 = 在现有列表后面**追加一行**，永不丢原部门。
+     *
+     * ## 删除的两级校验
+     *
+     *   点「删除」时**当场**判断，不等到保存：
+     *     · 部门里还有 Bot ⇒ 直接弹窗拦住，列出是哪些，给「去迁移」入口
+     *     · 没有 Bot     ⇒ 二次确认（说明目录文件不会删）
+     *   后端仍然会校验一遍（多端并发下前端判断会过时），但那条不该是常见路径。
+     */
+    function DeptManageModal({
+      draft, setDraft, busy, onSave, onClose,
+      bots = [], orphanedBots = [], deptBotsOf, onMigrate, onManageMembers, profileForm,
+    }) {
+      const [confirmDel, setConfirmDel] = useState(null)   // { i, id, name }
+      const [blockDel, setBlockDel] = useState(null)       // { name, bots: [...] }
+      const [memberFor, setMemberFor] = useState(null)     // 部门 id（进入人员管理）
       const upd = (i, patch) => {
         const next = [...draft]
         next[i] = { ...next[i], ...patch }
         setDraft(next)
       }
+      const removeAt = (i) => {
+        const d = draft[i]
+        const list = deptBotsOf ? deptBotsOf(d.id) : []
+        if (list.length) { setBlockDel({ name: d.name || d.id, id: d.id, bots: list }); return }
+        setConfirmDel({ i, id: d.id, name: d.name || d.id })
+      }
+
+      // 主管候选 = 本部门 Bot ∪ 未归属任何部门的 Bot（Boss 第 2 条）
+      // 主管候选 = 本部门 Bot ∪ **没归属任何部门的 Bot**（Boss 第 2 条原话）
+      //   `orphanedBots` 由调用方算好传进来（按 cwd 判不出部门的那批）。
+      const leadCandidates = (deptId) => {
+        const mine = deptBotsOf ? deptBotsOf(deptId) : []
+        return { mine, orphans: Array.isArray(orphanedBots) ? orphanedBots : [] }
+      }
+
       return h(Modal, {
-        title: '管理部门',
+        title: memberFor ? `部门人员 · ${draft.find((d) => d.id === memberFor)?.name ?? memberFor}` : '管理部门',
+        wide: true,
         onClose,
         footer: [
-          h('button', { key: 'c', className: 'csb-btn', onClick: onClose }, '取消'),
+          h('button', { key: 'c', className: 'csb-btn', onClick: onClose }, memberFor ? '返回列表' : '取消'),
           h('button', { key: 'ok', className: 'csb-btn csb-btn-p', disabled: busy, onClick: onSave },
             busy ? '保存中…' : '保存'),
         ],
       },
-      h('div', { className: 'csb-set-d', style: { marginBottom: 10 } },
-        '「id」是目录名（英文，会出现在路径里）；「显示名」是你在界面上看到的。'
-        + '删除部门前要先把它下面的 Bot 迁走 —— 否则会被拒绝。'),
-      draft.length === 0
-        ? h('div', { className: 'csb-set-d' }, '还没有部门，点下面「＋ 新增」')
-        : null,
-      draft.map((d, i) => h('div', { key: i, style: { marginBottom: 8 } },
-        h('div', { className: 'csb-bar' },
-          h('input', {
-            className: 'csb-in', style: { width: 100 }, value: d.id, placeholder: 'id（英文）',
-            onChange: (e) => upd(i, { id: e.target.value.replace(/[/\\.]/g, '') }),
-          }),
-          h('input', {
-            className: 'csb-in csb-grow', value: d.name, placeholder: '显示名（如 开发部）',
-            onChange: (e) => upd(i, { name: e.target.value }),
-          }),
+      // ── 人员管理视图（Boss 第 3 条）────────────────────────────────────────
+      memberFor
+        ? (profileForm
+          ? profileForm(memberFor)
+          : h('div', { className: 'csb-set-d' }, '人员管理组件未就绪'))
+        : h('div', null,
+          h('div', { className: 'csb-set-d', style: { marginBottom: 10 } },
+            '部门名就是目录名（建在主目录下）。删除部门前会先校验：里面还有 Bot 会被拦住，'
+            + '没有 Bot 才会删，且**磁盘目录不会被删**。'),
+          draft.length === 0
+            ? h('div', { className: 'csb-set-d' }, '还没有部门，点下面「＋ 新增」')
+            : null,
+          draft.map((d, i) => h('div', {
+            key: i,
+            style: { marginBottom: 10, padding: '8px 10px', borderRadius: 8, background: 'var(--dsw-alias-bg-secondary, #f7f7f9)' },
+          },
+          h('div', { className: 'csb-bar' },
+            // 一个字段：名字即目录名（Boss 第 1 条）
+            h('input', {
+              className: 'csb-in csb-grow', value: d.name ?? '',
+              placeholder: '部门名（就是目录名，如 开发部 / 测试部门1）',
+              onChange: (e) => upd(i, { name: e.target.value }),
+            }),
+            h('button', {
+              className: 'csb-btn csb-btn-s csb-btn-d', onClick: () => removeAt(i),
+            }, '删除'),
+            h('button', {
+              className: 'csb-btn csb-btn-s', onClick: () => setMemberFor(d.id),
+            }, '人员')),
+          // 主管：下拉选择（Boss 第 2 条）
+          h('div', { className: 'csb-bar', style: { marginTop: 6 } },
+            h('span', { className: 'csb-set-d', style: { fontSize: 11.5, flex: 'none' } }, '主管'),
+            (() => {
+              const { mine, orphans } = leadCandidates(d.id)
+              return h('select', {
+                className: 'csb-sel', style: { maxWidth: 260 }, value: d.leadBotName ?? '',
+                onChange: (e) => upd(i, { leadBotName: e.target.value }),
+              },
+              h('option', { key: '__none', value: '' }, '（没有主管，说话唤醒全部）'),
+              mine.length ? h('optgroup', { key: 'mine', label: '本部门' },
+                mine.map((b) => h('option', { key: b.id, value: b.name, title: b.cwd ?? '' }, b.name))) : null,
+              orphans.length ? h('optgroup', { key: 'orp', label: '未归属部门的 Bot' },
+                orphans.map((b) => h('option', { key: b.id, value: b.name, title: b.cwd ?? '' }, b.name))) : null)
+            })(),
+            h('span', { className: 'csb-set-d', style: { fontSize: 11 } },
+              `（本部门 ${(deptBotsOf ? deptBotsOf(d.id) : []).length} 个 Bot）`)))),
           h('button', {
-            className: 'csb-btn csb-btn-s csb-btn-d',
-            onClick: () => setDraft(draft.filter((_, j) => j !== i)),
-          }, '删除')),
-        // 部门主管（2026-11-16 Boss：必须人工设置，不能自动取第一个 Bot）
-        h('div', { className: 'csb-bar', style: { marginTop: 4, paddingLeft: 0 } },
-          h('span', { className: 'csb-set-d', style: { fontSize: 11.5, flex: 'none' } }, '主管'),
-          h('input', {
-            className: 'csb-in csb-grow', style: { fontSize: 12 },
-            value: d.leadBotName ?? '',
-            placeholder: '填这个部门当主管的 Bot 名字（留空=没有主管，说话唤醒全部）',
-            title: '填 Bot 的名字（不是 id）。有主管时群里说话只唤醒主管。',
-            onChange: (e) => upd(i, { leadBotName: e.target.value }),
-          })))),
-      h('button', {
-        className: 'csb-btn csb-btn-s',
-        onClick: () => setDraft([...draft, { id: '', name: '' }]),
-      }, '＋ 新增'))
+            className: 'csb-btn csb-btn-s',
+            // Boss 第 1 条 + 上面注释：追加一行，绝不重置整个列表
+            onClick: () => setDraft([...draft, { id: '', name: '' }]),
+          }, '＋ 新增部门')),
+
+      // ── 删除：有 Bot 拦截弹窗 ──────────────────────────────────────────────
+      blockDel
+        ? h(Modal, {
+          title: `不能删除「${blockDel.name}」`,
+          onClose: () => setBlockDel(null),
+          footer: [
+            h('button', { key: 'k', className: 'csb-btn', onClick: () => setBlockDel(null) }, '知道了'),
+            h('button', {
+              key: 'm', className: 'csb-btn csb-btn-p',
+              onClick: () => { const d = blockDel; setBlockDel(null); onMigrate?.(d.id, d.bots) },
+            }, '去迁移这些 Bot'),
+          ],
+        },
+        h('div', null,
+          h('div', { className: 'csb-set-d', style: { marginBottom: 6 } },
+            `这个部门还有 ${blockDel.bots.length} 个 Bot：`),
+          h('ul', { style: { margin: '0 0 8px 18px', padding: 0, fontSize: 12.5 } },
+            blockDel.bots.map((b) => h('li', { key: b.id }, b.name))),
+          h('div', { className: 'csb-set-d' },
+            '请先把它们迁到别的部门或退役，再回来删这个部门。')))
+        : null,
+
+      // ── 删除：无 Bot 时的二次确认 ──────────────────────────────────────────
+      confirmDel
+        ? h(Modal, {
+          title: `确认删除部门「${confirmDel.name}」？`,
+          onClose: () => setConfirmDel(null),
+          footer: [
+            h('button', { key: 'c', className: 'csb-btn', onClick: () => setConfirmDel(null) }, '取消'),
+            h('button', {
+              key: 'd', className: 'csb-btn csb-btn-d',
+              onClick: () => { setDraft(draft.filter((_, j) => j !== confirmDel.i)); setConfirmDel(null) },
+            }, '确认删除'),
+          ],
+        },
+        h('div', { className: 'csb-set-d' },
+          '这个部门下面没有 Bot，可以删。',
+          h('br'), '⚠️ 部门条目、团队名、群聊会一并清掉；**磁盘上的目录文件不会删**（要手动清理请去文件管理器）。'))
+        : null)
     }
 
     /**
@@ -4234,6 +4660,13 @@ window.__ModuleLoader__.load({
       const { data: rosterData } = useApi('/roster')
       const { data: wfData } = useApi('/library/workflows')
       const bots = rosterData?.bots ?? []
+      const { data: taskSetData } = useApi('/settings')
+      // 执行者按部门分组（口径唯一的组装函数见 groupBotsByDept）
+      const pickerDepts = groupBotsByDept({
+        bots,
+        departments: taskSetData?.values?.departments ?? [],
+        root: String(taskSetData?.values?.botWorkspaceRoot ?? ''),
+      })
       const workflows = wfData?.workflows ?? []
       const tasks = data?.tasks ?? []
       // 本地过滤（不改后端 query）：负责人 + 关键词（subject/description 子串，大小写不敏感）
@@ -4470,9 +4903,17 @@ window.__ModuleLoader__.load({
                 className: 'csb-in', style: { width: 90 }, type: 'number', placeholder: '优先级',
                 value: priority, onChange: (e) => setPriority(e.target.value),
               }),
-              h('select', { className: 'csb-sel', style: { width: 160 }, value: assignee, onChange: (e) => setAssignee(e.target.value) },
-                h('option', { value: '' }, '负责人（自动）'),
-                bots.map((b) => h('option', { key: b.id, value: b.sessionId }, b.name))))
+              // 2026-11-18 修：原来标成「系统自动分配」但 create() 里 `if (assignee)` ⇒
+              // 选这项时根本不发给后端，静默建了个无人任务。现在：
+              //   ① 文案改成「未指定（不派）」，不再承诺不存在的「自动」
+              //   ② 下面给「按部门分组」的选择器，重名也能分辨
+              h(BotPicker, {
+                value: assignee,
+                onChange: (v) => setAssignee(v),
+                depts: pickerDepts,
+                currentDeptId: '',
+                width: 200,
+              }))
           : null,
         // ── 长任务完整表单（需求3：一次到位）────────────────────────────────
         // 覆盖「边界 / 权限 / 路由」三类选项，全部是后端**已支持**的字段：
