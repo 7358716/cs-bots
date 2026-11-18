@@ -234,7 +234,8 @@ test('★0.20.5 保存前做前端自查（空名/分隔符/重名）', () => {
 test('★0.20.6 弹窗关闭走原生监听（不受宿主根容器事件委托影响）', () => {
   const body = fnBody(CLIENT, 'function Modal(')
   assert.match(body, /addEventListener\('mousedown'/, '遮罩用原生 mousedown 兜底')
-  assert.match(body, /addEventListener\('click'/, '× 按钮用原生 click 兜底')
+  // 0.20.8 起不再用 click（宿主下 click 命中会漂移），改成 mousedown 记住 + mouseup 执行
+  assert.match(body, /data-csb-close/, '关闭标记保留')
   assert.match(body, /removeEventListener\('mousedown'/, '必须清理监听')
   assert.match(body, /data-csb-close/, '× 按钮带原生监听可识别的标记')
   assert.match(body, /ref: maskRef/, '遮罩要有 ref 供原生绑定')
@@ -256,4 +257,24 @@ test('★0.20.7 装了底层事件探针（区分「事件没到」还是「回�
   }
   assert.match(body, /__csbModalDiag/, '结果挂到 window.__csbModalDiag')
   assert.match(CLIENT, /installDiagProbe\(\)/, 'apply 里要真正装上')
+})
+
+// ── 0.20.8：click 命中漂移 ⇒ 按下记住、抬起执行 ────────────────────────────
+test('★0.20.8 关闭按钮在 mousedown 记住、mouseup 执行（不依赖 click 命中）', () => {
+  const body = fnBody(CLIENT, 'function Modal(')
+  assert.match(body, /document\.addEventListener\('mousedown', onDown, true\)/, 'mousedown 需要记录')
+  assert.match(body, /document\.addEventListener\('mouseup', onUp, true\)/, 'mouseup 执行')
+  assert.match(body, /armed = pick\(e\.target\)/, '按下时记住命中的关闭元素')
+  assert.match(body, /const hit = pick\(e\.target\) \?\? armed/, '抬起时优先用记录值')
+  assert.ok(!/el\.addEventListener\('click'/.test(body), '不再只依赖 click')
+})
+
+test('★0.20.8 弹窗主按钮（取消/保存等）走 data-csb-act 原生兜底', () => {
+  const body = fnBody(CLIENT, 'function Modal(')
+  assert.match(body, /data-csb-act/, '识别动作标记')
+  assert.match(body, /actions\[name\]/, '按名字调用调用方给的动作')
+  const dept = fnBody(CLIENT, 'function DeptManageModal(')
+  assert.match(dept, /'data-csb-act': 'cancel'/, '取消按钮带标记')
+  assert.match(dept, /'data-csb-act': 'save'/, '保存按钮带标记')
+  assert.match(dept, /actions: \{ cancel: onClose, save: onSave \}/, '要把动作表交给 Modal')
 })

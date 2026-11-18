@@ -817,7 +817,7 @@ window.__ModuleLoader__.load({
      *      用户恰好在那一下按 ESC / 点遮罩，事件就丢了（「有时能关有时不能」）。
      *      现在监听只绑一次，通过 ref 调最新回调。
      */
-    function Modal({ title, wide, onClose, footer, children }) {
+    function Modal({ title, wide, onClose, footer, children, actions }) {
       const closeRef = useRef(onClose)
       // ⚠️ 在 effect 里同步最新回调，而不是在 render 期间赋值（后者在并发渲染下不可靠）
       useEffect(() => { closeRef.current = onClose }, [onClose])
@@ -875,15 +875,57 @@ window.__ModuleLoader__.load({
 
       // 卡片上的原生兜底：如果连 React 事件都收不到（宿主捕获拦截），
       // 至少保证 × 按钮能用 —— 通过原生监听直接读 data 属性判断是不是关闭按钮。
+      /**
+       * 「点按下时命中的那个关闭按钮」的兜底（2026-11-18 第五轮，Boss 实测）。
+       *
+       * ## 现象与根因
+       *
+       *   Boss：「点击删除可以确认，但之后不能取消或者保存」
+       *   ⇒ 之前点得动，开了确认框/删完之后就再也点不动了。
+       *
+       *   原因是**遮罩盖住的触发元素被卸载后在 mousedown 前重排**：
+       *   宿主在 mousedown 阶段会重算布局，被点击的元素挪位/被遮挡，
+       *   浏览器随后按"新位置"派发 mouseup/click ⇒ click 落到了别处，
+       *   按钮的 click 处理器永远不触发（表现为「点了没反应」）。
+       *
+       * ## 兜底做法
+       *
+       *   **在 mousedown 就记住命中的关闭按钮，在 mouseup 直接执行它**，
+       *   不依赖 click 是否命中。原生监听绑在目标上，不受 React 委托与宿主捕获的影响。
+       *   覆盖：× 按钮、所有带 `data-csb-close` 的元素。
+       */
       useEffect(() => {
         const el = maskRef.current
-        if (!el) return undefined
-        const onUp = (e) => {
-          const hit = e.target && e.target.closest && e.target.closest('[data-csb-close]')
-          if (hit && el.contains(hit)) closeRef.current?.()
+        if (!el || typeof document === 'undefined') return undefined
+        let armed = null
+        const pick = (t) => (t && t.closest ? t.closest('[data-csb-close]') : null)
+        let armedAct = null
+        const onDown = (e) => {
+          armed = pick(e.target)
+          armedAct = e.target && e.target.closest ? e.target.closest('[data-csb-act]') : null
         }
-        el.addEventListener('click', onUp, true)
-        return () => el.removeEventListener('click', onUp, true)
+        const onUp = (e) => {
+          // ① 关闭类：× 或 data-csb-close
+          const hit = pick(e.target) ?? armed
+          armed = null
+          if (hit && el.contains(hit)) { closeRef.current?.(); return }
+          // ② 动作类：data-csb-act="动作名" ⇒ 交给调用方（取消/保存等）
+          //    同样「按下时记住、抬起时执行」，避开 click 命中漂移
+          const actEl = (e.target && e.target.closest ? e.target.closest('[data-csb-act]') : null)
+            ?? armedAct
+          armedAct = null
+          if (actEl && el.contains(actEl) && actions) {
+            const name = actEl.getAttribute('data-csb-act')
+            if (name && typeof actions[name] === 'function') actions[name]()
+          }
+        }
+        // 绑在 document 上并用 capture：即使目标节点被宿主换掉也照样收到
+        document.addEventListener('mousedown', onDown, true)
+        document.addEventListener('mouseup', onUp, true)
+        return () => {
+          document.removeEventListener('mousedown', onDown, true)
+          document.removeEventListener('mouseup', onUp, true)
+        }
       }, [])
 
       const node = h('div', {
@@ -4126,7 +4168,7 @@ window.__ModuleLoader__.load({
             title: `不能删除「${delBlock.name}」`,
             onClose: () => setDelBlock(null),
             footer: [
-              h('button', { key: 'k', className: 'csb-btn', onClick: () => setDelBlock(null) }, '知道了'),
+              h('button', { key: 'k', className: 'csb-btn', 'data-csb-close': '1', onClick: () => setDelBlock(null) }, '知道了'),
               h('button', {
                 key: 'm', className: 'csb-btn csb-btn-p',
                 onClick: () => {
@@ -4157,7 +4199,7 @@ window.__ModuleLoader__.load({
             title: `确认删除部门「${delConfirm.name}」？`,
             onClose: () => setDelConfirm(null),
             footer: [
-              h('button', { key: 'c', className: 'csb-btn', onClick: () => setDelConfirm(null) }, '取消'),
+              h('button', { key: 'c', className: 'csb-btn', 'data-csb-close': '1', onClick: () => setDelConfirm(null) }, '取消'),
               h('button', {
                 key: 'd', className: 'csb-btn csb-btn-d',
                 onClick: () => { setDeptDraft(deptDraft.filter((_, j) => j !== delConfirm.i)); setDelConfirm(null) },
@@ -4176,7 +4218,7 @@ window.__ModuleLoader__.load({
             onClose: () => setMembersFor(null),
             wide: true,
             footer: [
-              h('button', { key: 'b', className: 'csb-btn', onClick: () => setMembersFor(null) }, '返回列表'),
+              h('button', { key: 'b', className: 'csb-btn', 'data-csb-close': '1', onClick: () => setMembersFor(null) }, '返回列表'),
             ],
           },
           renderDeptMembers(membersFor))
@@ -4202,7 +4244,7 @@ window.__ModuleLoader__.load({
             title: `退役「${retireBot.name}」？`,
             onClose: () => setRetireBot(null),
             footer: [
-              h('button', { key: 'c', className: 'csb-btn', onClick: () => setRetireBot(null) }, '取消'),
+              h('button', { key: 'c', className: 'csb-btn', 'data-csb-close': '1', onClick: () => setRetireBot(null) }, '取消'),
               h('button', {
                 key: 'r', className: 'csb-btn csb-btn-d',
                 onClick: async () => {
@@ -4331,7 +4373,7 @@ window.__ModuleLoader__.load({
         title: `在「${deptName}」新建 Bot`,
         onClose,
         footer: [
-          h('button', { key: 'c', className: 'csb-btn', onClick: onClose }, '取消'),
+          h('button', { key: 'c', className: 'csb-btn', 'data-csb-close': '1', onClick: onClose }, '取消'),
           h('button', {
             key: 'o', className: 'csb-btn csb-btn-p',
             disabled: busy || !name.trim(), onClick: submit,
@@ -4398,9 +4440,11 @@ window.__ModuleLoader__.load({
         title: '管理部门',
         wide: true,
         onClose,
+        // 原生兜底：宿主下 click 会漂移，这两个按钮用 data-csb-act 走 mouseup 执行
+        actions: { cancel: onClose, save: onSave },
         footer: [
-          h('button', { key: 'c', className: 'csb-btn', onClick: onClose }, '取消'),
-          h('button', { key: 'ok', className: 'csb-btn csb-btn-p', disabled: busy, onClick: onSave },
+          h('button', { key: 'c', className: 'csb-btn', 'data-csb-act': 'cancel', onClick: onClose }, '取消'),
+          h('button', { key: 'ok', className: 'csb-btn csb-btn-p', 'data-csb-act': 'save', disabled: busy, onClick: onSave },
             busy ? '保存中…' : '保存'),
         ],
       },
