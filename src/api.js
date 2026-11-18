@@ -17,6 +17,7 @@ import { createHash } from 'node:crypto'
 import { join, resolve, sep as pathSep } from 'node:path'
 import { isInsideDir, firstSegmentUnder } from './botdirs.js'
 import { registerRoute, service, stateDir as kernelStateDir, listPresets, ensureWorkspaceDir, listWorkspaceRecords, removeWorkspaceByPath, defaultPreset, getAgent, resumeSession, readSessionMessages, attachToWorkspace, readSessionWatermark, sessionMeta, capabilities } from './kernel.js'
+import { ensureBotHierarchy, inspectHierarchy, repairHierarchy } from './ws-hierarchy.js'
 import { createLibrary } from './library.js'
 import { createDirBrowser } from './dirbrowse.js'
 import { getServices } from './registry.js'
@@ -28,6 +29,18 @@ import { execFile } from 'node:child_process'
 
 /** 请求体上限（防大包打爆内存）。 */
 const MAX_BODY = 2 * 1024 * 1024
+/**
+ * 导入/导出端点的体积上限。
+ * 前端选择文件的上限是 600MB（`client.js` TransferImportModal）⇒ base64 后约 800MB。
+ * 这里给 800MB，并把「超过」变成明确的 413 + 提示，而不是含糊的「校核失败」。
+ */
+const MAX_TRANSFER_BODY = 800 * 1024 * 1024
+
+/** 把字节数变成人看的 MB 字符串。 */
+function fmtMb(n) {
+  const mb = n / 1024 / 1024
+  return mb >= 1 ? `${Math.round(mb)}MB` : `${(n / 1024).toFixed(0)}KB`
+}
 
 /** API 前缀。 */
 export const API_BASE = '/cs-bots/api'
@@ -75,13 +88,35 @@ function markTeamError(error) {
   throw error
 }
 
-/** 读请求体（JSON）。 */
-async function readBody(request) {
+/**
+ * 读请求体（JSON）。
+ *
+ * @param {import('node:http').IncomingMessage} request
+ * @param {{ max?: number }} [opts]
+ *   `max`：这个端点的体积上限。默认 `MAX_BODY`（2MB）。
+ *
+ * ## 为什么要有参数（2026-11-18 Boss Win 实测 P0）
+ *
+ *   导入/导出端点要传整个 zip（base64 后约 1.34 倍体积）。
+ *   前端允许选 ≤600MB 的文件，后端却写死 2MB ⇒ **334KB 的包都导不进去**，
+ *   报错还是「校核失败：请求体过大（>2MB）」，看着像包坏了。
+ *
+ *   修复不是把 2MB 改成 600MB（那等于给所有端点开了个 DoS 口子），
+ *   而是**只给确实需要大体积的那两个端点**放宽，其余保持 2MB。
+ */
+async function readBody(request, opts = {}) {
+  const limit = typeof opts.max === 'number' && opts.max > 0 ? opts.max : MAX_BODY
   const chunks = []
   let size = 0
   for await (const chunk of request) {
     size += chunk.length
-    if (size > MAX_BODY) throw new Error('请求体过大（>2MB）')
+    if (size > limit) {
+      const e = new Error(`请求体过大（>${fmtMb(limit)}）`)
+      e.code = 'BODY_TOO_LARGE'
+      e.status = 413
+      e.detail = { limit, received: size }
+      throw e
+    }
     chunks.push(chunk)
   }
   if (!chunks.length) return undefined
@@ -2398,7 +2433,21 @@ export function installApi(ctx, { warn } = {}) {
           workspaceGroup = { error: String(error?.message ?? error) }
         }
 
-        const out = { ok: true, services: {}, compat: services.compat ?? null, host, workspaceGroup }
+        // ── 三级工作区体检（2026-11-18 Boss：「要求三级展示」）────────────────
+        // 只读：启动/刷新时不写任何登记（11-15 事故的教训），
+        // 把「为什么左侧栏没层级」变成一条 GET 就能回答的事实。
+        let hierarchy = null
+        try {
+          hierarchy = inspectHierarchy({
+            root: String(services.settings?.botWorkspaceRoot ?? ''),
+            departments: Array.isArray(services.settings?.departments) ? services.settings.departments : [],
+            bots: services.roster?.list?.({ includeRetired: false }) ?? [],
+          })
+        } catch (error) {
+          hierarchy = { error: String(error?.message ?? error) }
+        }
+
+        const out = { ok: true, services: {}, compat: services.compat ?? null, host, workspaceGroup, hierarchy }
         // 状态面要覆盖**全部**域服务：新增模块若不上报，页面「系统体检」就会
         // 显示「一切正常」而实际某功能没装配 —— 那是本平台最忌讳的静默失败。
         const SERVICE_KEYS = [
@@ -2792,6 +2841,48 @@ export function installApi(ctx, { warn } = {}) {
       }
 
 
+      // ── 三级工作区：体检 / 补登记（2026-11-18）───────────────────────────
+      //
+      // Boss 的三级要求：`主目录 → 部门 → Bot`。
+      // 建 Bot / 换部门 / 导入三条路径已经自动登记（见各自端点），
+      // 这两个端点负责「存量数据」与「登记失败后的补救」。
+      //
+      // ⚠️ repair 是**幂等**的：连点 N 次，`workspace.json` 记录数不变。
+      // ⚠️ repair **只增不删**：删登记会让人以为 Bot 丢了（11-15 事故后定的纪律）。
+      if (request.method === 'GET' && path === '/workspaces/hierarchy') {
+        sendJson(response, 200, {
+          ok: true,
+          ...inspectHierarchy({
+            root: String(services.settings?.botWorkspaceRoot ?? ''),
+            departments: Array.isArray(services.settings?.departments) ? services.settings.departments : [],
+            bots: services.roster?.list?.({ includeRetired: false }) ?? [],
+          }),
+        })
+        return
+      }
+
+      if (request.method === 'POST' && path === '/workspaces/hierarchy/repair') {
+        const r = await repairHierarchy(ctx, {
+          root: String(services.settings?.botWorkspaceRoot ?? ''),
+          departments: Array.isArray(services.settings?.departments) ? services.settings.departments : [],
+          bots: services.roster?.list?.({ includeRetired: false }) ?? [],
+        })
+        // 修复后再体检一次，把「现在还剩什么」如实回给页面
+        const after = inspectHierarchy({
+          root: String(services.settings?.botWorkspaceRoot ?? ''),
+          departments: Array.isArray(services.settings?.departments) ? services.settings.departments : [],
+          bots: services.roster?.list?.({ includeRetired: false }) ?? [],
+        })
+        sendJson(response, 200, {
+          ...r,
+          after,
+          note: r.ok
+            ? (r.fixed ? `补齐 ${r.fixed} 项分组，刷新左侧栏即可看到三级结构` : '三级结构本来就完整，无需修复')
+            : `有 ${r.failed.length} 项没补成功：${r.failed.map((f) => `${f.path}（${f.reason}）`).join('；')}`,
+        })
+        return
+      }
+
       // `GET /departments/tree` —— 只读，返回三层结构：
       //   部门 → (teamId, roomId, bots[]) → Bot
       //
@@ -2805,7 +2896,8 @@ export function installApi(ctx, { warn } = {}) {
 
       // POST /transfer/inspect —— 校核一个 zip（上传 base64），返回能不能导 + 会覆盖什么
       if (request.method === 'POST' && path === '/transfer/inspect') {
-        const body = (await readBody(request)) ?? {}
+        // 大体积端点：放宽到 MAX_TRANSFER_BODY（见 readBody 注释）
+        const body = (await readBody(request, { max: MAX_TRANSFER_BODY })) ?? {}
         const { inspectPackage } = await import('./transfer.js')
         if (typeof body.zipBase64 !== 'string' || !body.zipBase64) {
           sendJson(response, 400, { ok: false, reason: 'TRANSFER_NO_ZIP', hint: 'zipBase64 必填' })
@@ -2875,7 +2967,7 @@ export function installApi(ctx, { warn } = {}) {
 
       // POST /transfer/import —— 应用（必须已先 inspect 并让用户确认）
       if (request.method === 'POST' && path === '/transfer/import') {
-        const body = (await readBody(request)) ?? {}
+        const body = (await readBody(request, { max: MAX_TRANSFER_BODY })) ?? {}
         if (body.confirm !== true) {
           sendJson(response, 400, {
             ok: false, reason: 'TRANSFER_NEEDS_CONFIRM',
@@ -2893,6 +2985,7 @@ export function installApi(ctx, { warn } = {}) {
         }
         const r = await applyImport(buf, {
           stateDir,
+          ctx,
           services: getServices(ctx),
           onConflict: body.onConflict,
           only: Array.isArray(body.only) ? body.only : undefined,
@@ -3228,6 +3321,33 @@ export function installApi(ctx, { warn } = {}) {
         const bot = await withService(services, 'roster', (r) =>
           r.create({ ...bodyWithFallback, byId: body.byId ?? 'ui' }),
         )
+        // ── 三级工作区登记（2026-11-18 Boss：「要求三级展示」）────────────────
+        // 之前这条路径**一次都不登记** ⇒ 建完 Bot 左侧栏什么都没变，
+        // 用户得自己去点「整理工作区」才知道有这回事。
+        // 现在：建 Bot 与登记是一个动作；失败降级成 warnings，绝不推翻「Bot 已建」。
+        const hierarchyWarnings = []
+        let hierarchy = null
+        try {
+          const root = String(services.settings?.botWorkspaceRoot ?? '')
+          const depts = Array.isArray(services.settings?.departments) ? services.settings.departments : []
+          const deptId = String(body.department ?? '').trim()
+          hierarchy = await ensureBotHierarchy(ctx, {
+            root,
+            deptId,
+            deptName: depts.find((d) => d?.id === deptId)?.name,
+            botCwd: String(bot?.cwd ?? ''),
+            botName: bot?.name,
+            registerBot: bot?.state !== 'retired',
+          })
+          if (!hierarchy.ok) {
+            hierarchyWarnings.push(
+              `左侧栏分组没登记成功：${hierarchy.hint ?? '未知原因'}（Bot 已建好，可稍后在「Bot 档案」点「重建分组」）`,
+            )
+          }
+        } catch (error) {
+          hierarchyWarnings.push(`左侧栏分组登记异常：${error?.message ?? error}（Bot 已建好，不影响使用）`)
+        }
+
         // 预制记忆同步（建 Bot 与改档案必须一致）
         const memory = seedBotMemory(services, bot, body.byId ?? 'ui')
         // 同目录共享检测：**允许**，但必须告知（两个 Bot 在同一目录会互相覆盖文件）
@@ -3240,18 +3360,19 @@ export function installApi(ctx, { warn } = {}) {
         } catch {
           /* 检测失败不影响创建 */
         }
+        const warnings = [
+          ...(sharedWith.length
+            ? [`目录 ${bot.cwd} 已被 ${sharedWith.map((b) => b.name).join('、')} 使用 —— 两个 Bot 会互相覆盖文件`]
+            : []),
+          ...hierarchyWarnings,
+        ]
         sendJson(response, 200, {
           ok: true,
           bot,
           ...(memory ? { memory } : {}),
-          ...(sharedWith.length
-            ? {
-                warnings: [
-                  `目录 ${bot.cwd} 已被 ${sharedWith.map((b) => b.name).join('、')} 使用 —— 两个 Bot 会互相覆盖文件`,
-                ],
-                sharedWith,
-              }
-            : {}),
+          ...(hierarchy ? { hierarchy } : {}),
+          ...(sharedWith.length ? { sharedWith } : {}),
+          ...(warnings.length ? { warnings } : {}),
         })
         return
       }

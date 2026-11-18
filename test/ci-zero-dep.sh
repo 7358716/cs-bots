@@ -147,6 +147,38 @@ else
   fail=1
 fi
 
+echo "== 检查 6：路径拼接只走 node:path（跨平台纪律，ADR-002）=="
+# 依据（2026-11-18 Boss Win 截图）：transfer.js 曾用 "${root}/<部门>/<名字>" 拼文案，
+# Win 上显示成 "…\cs-bots/<部门>/<名字>"（一半反斜杠一半正斜杠）；
+# 又有 startsWith(root) 判断主目录，盘符大小写不同就永远 false。
+# ⇒ 机械禁止「在模板串里手拼目录分隔符」这种写法。
+pathbad="$(python3 - <<'PY'
+import pathlib, re
+# 形如 `${xxx}/文字` 或 `${xxx}\文字`（模板串里直接跟分隔符）
+# 只看「路径分隔符 + 路径样文字」：排除 `\u2026` 转义、`\n` 换行、`\t` 制表符等
+T = re.compile(r'\$\{[^}]+\}/<')
+bad = []
+for path in sorted(pathlib.Path('src').rglob('*.js')):
+    if path.name == 'paths-cross.js':
+        continue                      # 这个文件就是「处理分隔符」的地方
+    for i, line in enumerate(path.read_text(encoding='utf-8').splitlines(), 1):
+        stripped = line.strip()
+        if stripped.startswith('//') or stripped.startswith('*'):
+            continue                  # 注释里说明缺陷是允许的
+        if 'displayPath' in line or 'join(' in line:
+            continue                  # 已经走 node:path / 展示层
+        if T.search(line):
+            bad.append(f'{path}:{i}: {stripped[:90]}')
+print('\n'.join(bad))
+PY
+)"
+if [ -z "$pathbad" ]; then
+  echo "  OK: 未发现模板串里手拼目录分隔符"
+else
+  echo "$pathbad" | sed 's/^/  违规: /'
+  fail=1
+fi
+
 echo "== 结果 =="
 if [ "$fail" -eq 0 ]; then
   echo "CI PASS"

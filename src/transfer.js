@@ -33,6 +33,8 @@ import { join, relative } from 'node:path'
 import { createHash } from 'node:crypto'
 
 import { createZip, readZip } from './zip.js'
+import { displayPath, isInside, normPath, safeSegment, checkSegment } from './paths-cross.js'
+import { ensureBotHierarchy } from './ws-hierarchy.js'
 
 /** 包格式版本。不兼容时导入要明确拒绝。 */
 export const EXPORT_FORMAT = 'cs-bots-export'
@@ -208,6 +210,17 @@ export function buildExport({ stateDir, services, sections, includeFiles }) {
     const bots = (services?.roster?.list?.() ?? []).map((b) => ({
       name: b.name,
       cwd: b.cwd,                 // 只作参考，导入时按本机主目录重算
+      // 部门 id：导入时靠它算「主目录/部门/名字」。
+      // ⚠️ 不能仅凭 cwd 反推 —— 包可能来自别的平台、别的盘符。
+      deptId: (() => {
+        const root = String(services?.settings?.botWorkspaceRoot ?? '').replace(/[\\/]+$/, '')
+        const cwd = String(b.cwd ?? '')
+        if (!root || !isInside(root, cwd)) return null
+        const rel = normPath(cwd).slice(normPath(root).length + 1)
+        const first = rel.split('/')[0]
+        return first || null
+      })(),
+      state: b.state ?? null,
       preset: b.preset ?? null,
       label: b.label ?? null,
       instructions: b.instructions ?? null,
@@ -383,12 +396,16 @@ export function inspectPackage(buffer, services) {
   if (root) {
     const foreign = incBots.filter((b) => {
       const cwd = String(b.cwd ?? '')
-      return cwd && !cwd.startsWith(root)
+      // ⚠️ 跨平台：不能用 startsWith（Win 盘符大小写/分隔符不同就会误判成「外来」）
+      return cwd && !isInside(root, cwd)
     })
     if (foreign.length) {
+      // ⚠️ 2026-11-18 Boss Win 截图：这里原来写死 `'/'`，Win 上显示成
+      //    `C:\Users\Song\.dsh\cs-bots/<部门>/<名字>`（一半反斜杠一半正斜杠）。
+      //    现在示例路径同样走 displayPath，按本机分隔符输出。
       warnings.push(
         `${foreign.length} 个 Bot 的工作目录不在本机主目录下（${foreign.slice(0, 3).map((b) => b.name).join('、')}${foreign.length > 3 ? '…' : ''}）`
-        + ` —— 导入后会改到 ${root}/<部门>/<名字>`,
+        + ` —— 导入后会改到 ${displayPath(join(root, '<部门>', '<名字>'))}`,
       )
     }
   } else {
@@ -410,8 +427,10 @@ export function inspectPackage(buffer, services) {
     counts: manifest.counts ?? {},
     deptDup,
     botDup,
-    includedBots: incBots.map((b) => ({ name: b.name, cwd: b.cwd, preset: b.preset ?? null })),
+    includedBots: incBots.map((b) => ({ name: b.name, cwd: b.cwd, preset: b.preset ?? null, deptId: b.deptId ?? null })),
     includedDepts: incDepts,
+    // 本机落点（页面直接显示，避免用户以为会继承来源路径）
+    localRoot: root ? displayPath(root) : '',
   })
 
   return { ok: blocking.length === 0, blocking, warnings, info }
@@ -438,11 +457,12 @@ export function inspectPackage(buffer, services) {
  * @param {object} opts
  * @param {string} opts.stateDir
  * @param {object} opts.services
+ * @param {object} [opts.ctx] 插件 ctx（登记三级分组要拿 workspaceRegistry）
  * @param {'overwrite'|'skip'|'rename'} [opts.onConflict]
  * @param {string[]} [opts.only] 只导入这些段（用户可取消勾选）
  * @returns {Promise<{ok: boolean, applied: object, skipped: object, errors: string[]}>}
  */
-export async function applyImport(buffer, { stateDir, services, onConflict = 'overwrite', only }) {
+export async function applyImport(buffer, { stateDir, services, ctx, onConflict = 'overwrite', only }) {
   const mode = ['overwrite', 'skip', 'rename'].includes(onConflict) ? onConflict : 'overwrite'
   const check = inspectPackage(buffer, services)
   if (!check.ok) {
@@ -488,27 +508,131 @@ export async function applyImport(buffer, { stateDir, services, onConflict = 'ov
     }
 
     // ② Bot（含档案）
+    // ─────────────────────────────────────────────────────────────────────────
+    // ⚠️ 2026-11-18 Boss Win 实测：这一段原来**只产出 plan、从不落地**
+    //    （`applied.bots = { added, overwritten, ... plan }` 之后就没了）。
+    //    结果是「导入完成 ✅ 已加 N 个 Bot」，而 registry 里一个都没多 —— 假成功。
+    //    现在：plan 之后必须真的调 `roster.create` / `roster.setProfile`。
+    //
+    //    路径一律**按本机主目录重算**（Boss 2026-11-18 定：目录名用 Bot 名）：
+    //      `${botWorkspaceRoot}/${deptId}/${Bot 名}`
+    //    来源机器的 `C:\Users\Song\...` 绝不带进来。
     if (picked.includes('bots')) {
       const inc = (() => {
         try { return JSON.parse(byName.get(SECTIONS.bots.file)?.toString('utf8') ?? '[]') } catch { return [] }
       })()
       const cur = services?.roster?.list?.() ?? []
-      let added = 0; let overwritten = 0; let kept = 0; let renamed = 0
-      const plan = []
+      const root = String(services?.settings?.botWorkspaceRoot ?? '').replace(/[\\/]+$/, '')
+      const depts = Array.isArray(services?.settings?.departments) ? services.settings.departments : []
+      const defaultDept = String(services?.settings?.defaultDepartment ?? '').trim() || depts[0]?.id || ''
+      const created = []
+      const updated = []
+      const renamed = []
+      const failed = []
+      let kept = 0
+
       for (const b of inc) {
-        if (!b || typeof b.name !== 'string' || !b.name.trim()) { errors.push(`Bot 条目非法：${JSON.stringify(b)}`); continue }
-        const hit = cur.find((c) => c.name === b.name)
-        if (hit) {
-          if (mode === 'skip') { kept += 1; continue }
-          if (mode === 'rename') { plan.push({ ...b, name: `${b.name}_2` }); renamed += 1; continue }
-          plan.push({ ...b, _replace: hit.id })
-          overwritten += 1
+        if (!b || typeof b.name !== 'string' || !b.name.trim()) {
+          errors.push(`Bot 条目非法：${JSON.stringify(b)}`)
           continue
         }
-        plan.push(b)
-        added += 1
+        // 部门：包里带了就用，没带退回默认部门（导入环境必须至少有它才能算路径）
+        const deptId = String(b.deptId ?? defaultDept ?? '').trim()
+        if (!deptId) {
+          failed.push({ name: b.name, reason: '包里没带部门，本机也没有默认部门 —— 先建一个部门再导入' })
+          continue
+        }
+        if (!depts.some((d) => d?.id === deptId)) {
+          failed.push({ name: b.name, reason: `部门「${deptId}」在本机不存在 —— 先导入/新建这个部门` })
+          continue
+        }
+        // 目录段：Bot 名要洗成安全目录名（汉字放行，Win 保留名/非法字符拦掉）
+        const seg = safeSegment(b.name)
+        if (!seg) { failed.push({ name: b.name, reason: 'Bot 名洗成目录名后为空' }); continue }
+        if (!root) { failed.push({ name: b.name, reason: '本机未设置主目录 —— 先到「设置 → Bot 主目录」指定' }); continue }
+
+        // 同名冲突：**按名字匹配**（Boss 2026-11-18：「名称不一样也给覆盖」= 同名就覆盖）
+        const hit = cur.find((c) => c.name === b.name)
+        let mode2 = mode
+        let finalName = seg
+        if (hit) {
+          if (mode2 === 'skip') { kept += 1; continue }
+          if (mode2 === 'rename') {
+            let n2 = 2
+            while (cur.some((c) => c.name === `${seg}_${n2}`)) n2 += 1
+            finalName = `${seg}_${n2}`
+            mode2 = 'create'
+          }
+        }
+
+        try {
+          if (hit && mode2 === 'overwrite') {
+            // 覆盖：更新档案 + 保留原会话与 id（不重建，避免丢上下文）
+            const prof = { ...(b.profile ?? {}) }
+            if (services?.roster?.setProfile) {
+              await services.roster.setProfile({
+                id: hit.id, profile: prof, byId: 'import', expectedRev: hit.rev,
+              })
+            }
+            updated.push(hit.name)
+            // 覆盖也要保证三级分组在位（Boss 的三级要求对存量同样成立）
+            try {
+              await ensureBotHierarchy(ctx, {
+                root, deptId, deptName: depts.find((d) => d?.id === deptId)?.name,
+                botCwd: String(hit.cwd), botName: hit.name,
+                registerBot: hit.state !== 'retired',
+              })
+            } catch { /* 分组失败不影响导入成功 */ }
+            continue
+          }
+          // 新建：走与「建 Bot」完全同一条路径（cwd 由主目录+部门+名字派生）
+          const bot = await services.roster.create({
+            name: finalName,
+            department: deptId,
+            preset: b.preset ?? undefined,
+            label: b.label ?? undefined,
+            instructions: b.instructions ?? undefined,
+            byId: 'import',
+          })
+          created.push(bot.name)
+          const prof = { ...(b.profile ?? {}) }
+          if (Object.keys(prof).length && services?.roster?.setProfile) {
+            try {
+              await services.roster.setProfile({
+                id: bot.id, profile: prof, byId: 'import', expectedRev: bot.rev,
+              })
+            } catch (error) {
+              failed.push({ name: bot.name, reason: `Bot 已建，但档案写入失败：${error?.message ?? error}` })
+            }
+          }
+          // 三级分组（失败只记录，不推翻「Bot 已建」这个事实）
+          try {
+            const h = await ensureBotHierarchy(ctx, {
+              root, deptId, deptName: depts.find((d) => d?.id === deptId)?.name,
+              botCwd: String(bot.cwd), botName: bot.name,
+            })
+            if (!h.ok) failed.push({ name: bot.name, reason: h.hint ?? '分组未登记' })
+          } catch (error) {
+            failed.push({ name: bot.name, reason: `Bot 已建，分组登记异常：${error?.message ?? error}` })
+          }
+          if (finalName !== seg) renamed.push({ from: seg, to: finalName })
+        } catch (error) {
+          // 单条失败不影响其它条目（用户要的是「能带的都带过来」）
+          failed.push({ name: b.name, reason: String(error?.message ?? error) })
+        }
       }
-      applied.bots = { added, overwritten, kept, renamed, plan }
+
+      applied.bots = {
+        added: created.length,
+        overwritten: updated.length,
+        kept,
+        renamed: renamed.length,
+        failed: failed.length,
+        created,
+        updated,
+        renamedDetail: renamed,
+        failedDetail: failed,
+      }
     }
 
     // ③ 记忆 / 纪律 / 提示词 / 任务板（按行合并，事件流是追加式的）

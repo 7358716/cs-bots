@@ -13,6 +13,69 @@
 
 ---
 
+## [0.20.0] - 2026-11-18
+
+Boss（Windows 桌面版 DSH 实测四张截图 + 三条拍板）：
+「1 截图中报错，2 左侧栏展示不对」
+「从 linux 导出的到 win，bot 没有带入」
+「没有出现 cs-bots 主目录，我要求三级展示：部门目录在 csbots 主目录下，bot 工作区在部门目录下」
+「1 部门名称可以汉字，2 按你建议，3 退役的分组不显示」
+
+### Added
+
+- **`src/ws-hierarchy.js` —— 三级工作区登记（主目录 → 部门 → Bot）**
+  为什么：左树只剩 `misc/ops/qa/dev` 四个平级空文件夹。根因不是宿主不嵌套
+  （`owningParentFolder` 一直支持），而是**三级登记逻辑只藏在「整理工作区」一个按钮里**，
+  建 Bot / 换部门 / 导入三条路径一次都不登记。
+  实现要点：顺序固定、全局串行锁（重演 2026-11-15 `domain inconsistent` 的路径已被堵死）、
+  磁盘优先判重（内存态 `entities` 在域初始化期不可靠）、先 mkdir 再 create（Win 首次安装坑）、
+  只建分组不挂会话、失败降级不抛穿。
+  retired Bot：**目录保留、分组不建**（Boss 第 3 条）。
+
+- **`src/paths-cross.js` + ADR-002 —— 跨平台路径纪律**
+  为什么：`transfer.js` 用模板串拼 `'/'`，Win 上显示成 `…\.dsh\cs-bots/<部门>/<名字>`；
+  「是否在主目录下」用 `startsWith` 判断，Win 盘符大小写不同就永远 false ⇒ 每个 Bot 都被当成外来目录。
+  现在：拼路径走 `node:path`；比路径走 `isInside/pathsEqual`（大小写+分隔符归一）；
+  显示走 `displayPath()`（按本机分隔符）；目录名走 `safeSegment/checkSegment`。
+
+- **目录名中文支持 + Windows 合规**
+  为什么：Boss 第 1 条「部门名称可以汉字」。同时必须挡住 Windows 保留设备名
+  （`CON/PRN/AUX/NUL/COM1-9/LPT1-9`，带扩展名也算）、非法字符 `: * ? " < > |`、
+  结尾点/空格（Win 静默丢弃）、超长段。并做 NFC 归一（macOS 导出的 NFD 名字到 Win 会变成两个目录）。
+
+- **`GET /workspaces/hierarchy` / `POST /workspaces/hierarchy/repair`**
+  只读体检 + 幂等补登记。左侧栏「为什么没层级」从「靠猜」变成「一条 GET 就有答案」。
+  页面新增两个按钮：「检查左侧栏层级」「重建分组」。
+
+- **`test/win-regress.mjs` —— 目标机自证脚本（30 项）**
+  为什么：四个故障全在 Win 上，而 CI 只跑 Linux。「我这边好使」不能作为验收依据。
+
+- **CI 检查 6：禁止模板串里手拼目录分隔符**
+  为什么：这类缺陷本地不复现、只在 Win 出现，只能靠机械检查。
+
+### Fixed
+
+- **P0 · 导入报「请求体过大（>2MB）」，334KB 的包都导不进去**
+  根因：后端 `MAX_BODY=2MB`，前端允许选 600MB 文件，两个上限互相矛盾。
+  修复：只给 `/transfer/inspect`、`/transfer/import` 放宽到 800MB（base64 ×1.34 余量），
+  其余端点仍守 2MB；超限返回 `413 + BODY_TOO_LARGE + 可读提示`，不再伪装成「校核失败」。
+
+- **P0 · 导入「完成 ✅ 已加 N 个 Bot」，实际一个都没建**
+  根因：`applyImport` 的 bots 分支只把条目塞进 `applied.bots.plan`，**从未调用 `roster.create`**。
+  修复：真正落地，走与「建 Bot」同一条路径（`department` → 派生 cwd），并按本机主目录重算；
+  来源机器的 `C:\Users\...` 绝不带进来；逐条上报新增/覆盖/跳过/改名/**失败原因**。
+
+- **P1 · 建 Bot 后左侧栏毫无变化，用户完全不知情**
+  修复：`POST /roster` 建完即登记三级，并把结果作为 `hierarchy` 返回；
+  页面当场显示 `✅ 主目录分组 ✅ 部门分组 ✅ Bot 分组`，哪步没成给原因。
+
+- **P1 · 导入的三种同名策略形同虚设**
+  修复：`overwrite` 更新档案并**保留原 id 与会话**（不重建，不丢上下文）；
+  `skip` 不动本机；`rename` 新建 `名字_2`。
+
+- **P2 · 导入确认页的跨平台警告文案用错分隔符**
+  修复：示例路径走 `displayPath()`；确认页新增「本机落点」一行。
+
 ## [0.19.0] - 2026-11-16
 
 Boss：「我说话只唤醒部门主任（主管），没有主管的话唤醒全部，有主管的话由主管处理」

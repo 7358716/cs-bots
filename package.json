@@ -1,6 +1,6 @@
 {
   "name": "cs-bots",
-  "version": "0.19.2",
+  "version": "0.20.0",
   "type": "module",
   "description": "跨团队桥 + 定向唤醒 + 升级可回滚。",
   "main": "src/index.js",
@@ -17,7 +17,8 @@
     "cordis.patch.agent-team.yml",
     "install.sh",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "test/win-regress.mjs"
   ],
   "dsh": {
     "bundle": {

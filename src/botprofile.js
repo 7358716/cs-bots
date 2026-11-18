@@ -345,7 +345,9 @@ export function renderManagedSection(profile) {
   if (Array.isArray(p.skills) && p.skills.length) {
     lines.push('', '## 可用技能', '')
     for (const s of p.skills) lines.push(`- \`${s}\``)
-    lines.push('', `技能文件位于本工作目录的 \`${SKILLS_DIR}/<技能名>/SKILL.md\`，用 skill 工具加载。`)
+    // 跨平台：Bot 在 Win 上也会读这句，路径分隔符必须按本机来（0.20.0）
+    const skillPathHint = join(SKILLS_DIR, '<技能名>', 'SKILL.md')
+    lines.push('', `技能文件位于本工作目录的 \`${skillPathHint}\`，用 skill 工具加载。`)
   }
 
   // 关联纪律只放 id：正文由纪律体系按层级合并注入，这里重复正文会导致「同一纪律两份、还可能互相矛盾」

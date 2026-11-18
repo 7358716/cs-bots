@@ -123,6 +123,17 @@ window.__ModuleLoader__.load({
 
     // ── 请求 ────────────────────────────────────────────────────────────────
 
+    /**
+     * 前端路径归一（只用于展示）。
+     *
+     * 为什么不自己判断平台：前端跑在浏览器里，**拿不到服务端 OS**。
+     * 后端已经在 `transfer.inspect` 的 `localRoot` 里按平台拼好了分隔符，
+     * 前端只要原样显示，不做二次转换 —— 这是「路径只在一个地方决定」的纪律。
+     */
+    function displayPathClient(p) {
+      return typeof p === 'string' ? p : ''
+    }
+
     async function call(path, options) {
       const hasBody = options?.body !== undefined
       const res = await fetch(API + path, {
@@ -149,10 +160,15 @@ window.__ModuleLoader__.load({
         throw new Error(`接口返回非 JSON（HTTP ${res.status}）—— 可能是插件未启动或网关错误`)
       }
       if (!data || data.ok === false) {
-        const err = new Error(data?.reason ?? data?.message ?? `HTTP ${res.status}`)
+        // 提示优先级：hint（后端给的可执行下一步）> reason > 状态码。
+        // ⚠️ 2026-11-18 Boss 图 1：导入失败只显示「校核失败：请求体过大（>2MB）」，
+        //    用户不知道该改什么。后端现在会给 hint，这里必须把它带出来。
+        const msg = data?.hint ?? data?.reason ?? data?.message ?? `HTTP ${res.status}`
+        const err = new Error(msg)
         // 后端 code 必须带出来：humanizeError 靠它映射「人话 + 下一步」
         if (data?.code) err.code = data.code
         if (data?.details) err.details = data.details
+        if (data?.hint) err.hint = data.hint
         throw err
       }
       return data
@@ -3991,7 +4007,14 @@ window.__ModuleLoader__.load({
 
       const pickFile = async (file) => {
         if (!file) return
-        if (file.size > 600 * 1024 * 1024) { setErr('文件过大（>600MB），请手动解压后选择需要的部分'); return }
+        // 600MB 与后端 MAX_TRANSFER_BODY（800MB，base64 后约 1.34 倍）对齐：
+        // 前端先拦，用户看到的是「文件多大/上限多少」，而不是等 10 秒后的「请求体过大」。
+        const LIMIT = 600 * 1024 * 1024
+        if (file.size > LIMIT) {
+          setErr(`文件过大：${(file.size / 1024 / 1024).toFixed(0)}MB，上限 ${LIMIT / 1024 / 1024}MB。`
+            + '请只导出需要的段（如不含工作目录文件），或手动解压后分批导入。')
+          return
+        }
         setErr(null); setRep(null)
         const buf = await file.arrayBuffer()
         const bytes = new Uint8Array(buf)
@@ -4073,7 +4096,13 @@ window.__ModuleLoader__.load({
             `来自 ${rep.info?.manifest?.host?.platform ?? '?'} · 插件 v${rep.info?.manifest?.pluginVersion ?? '?'}`
             + ` · ${new Date(rep.info?.manifest?.exportedAt ?? 0).toLocaleString('zh-CN')}`),
           h('div', { className: 'csb-set-d' },
-            `包含：${(rep.info?.manifest?.sections ?? []).join('、') || '无'}`)),
+            `包含：${(rep.info?.manifest?.sections ?? []).join('、') || '无'}`),
+          // 本机落点：Bot 一定落在「本机主目录/部门/名字」，把这一句写死在页面上，
+          // 免得用户以为会继承来源机器的路径（Boss 2026-11-18 图 2 的困惑点）。
+          rep.info?.localRoot
+            ? h('div', { className: 'csb-set-d' }, ['本机落点：', displayPathClient(rep.info.localRoot), ' / ', '‹部门› / ‹Bot 名›'].join(''))
+            : h('div', { className: 'csb-set-d', style: { color: '#b45309' } },
+              '⚠️ 本机还没设置主目录 —— 导入 Bot 前先在「设置 → Bot 主目录」指定')),
 
           // 阻断项
           rep.blocking?.length
@@ -4107,10 +4136,37 @@ window.__ModuleLoader__.load({
           done
             ? h('div', { style: { marginTop: 10, padding: '8px 10px', borderRadius: 6, background: '#dcfce7', fontSize: 12 } },
               h('div', { style: { fontWeight: 600, marginBottom: 4 } }, '✅ 导入完成'),
-              Object.entries(done.applied ?? {}).map(([k, v]) => h('div', { key: k },
-                `${k}：${JSON.stringify(v).slice(0, 120)}`)),
+              // 原实现只 `JSON.stringify(applied).slice(0,120)` —— 用户看不到
+              // 「到底哪几个 Bot 建了、哪几个失败了」。Boss 2026-11-18 图 3 的疑问就来自这里。
+              (() => {
+                const b = done.applied?.bots
+                if (!b) return null
+                return h('div', { style: { marginTop: 4 } },
+                  h('div', null, `Bot：新增 ${b.added ?? 0} · 覆盖 ${b.overwritten ?? 0} · 跳过 ${b.kept ?? 0} · 改名 ${b.renamed ?? 0}`
+                    + (b.failed ? ` · 失败 ${b.failed}` : '')),
+                  (b.created ?? []).length
+                    ? h('div', { className: 'csb-set-d' }, `新增：${b.created.join('、')}`)
+                    : null,
+                  (b.updated ?? []).length
+                    ? h('div', { className: 'csb-set-d' }, `覆盖：${b.updated.join('、')}`)
+                    : null,
+                  (b.renamedDetail ?? []).length
+                    ? h('div', { className: 'csb-set-d' }, `改名：${b.renamedDetail.map((x) => `${x.from}→${x.to}`).join('、')}`)
+                    : null,
+                  (b.failedDetail ?? []).length
+                    ? h('div', { style: { color: '#b91c1c', marginTop: 2 } },
+                      ...(b.failedDetail.map((x, i) => h('div', { key: `bf${i}` }, `失败：${x.name} —— ${x.reason}`))))
+                    : null)
+              })(),
+              Object.entries(done.applied ?? {}).filter(([k]) => k !== 'bots').map(([k, v]) => h('div', { key: k, className: 'csb-set-d' },
+                `${k}：${JSON.stringify(v).slice(0, 160)}`)),
               done.errors?.length
                 ? h('div', { style: { color: '#b91c1c', marginTop: 4 } }, `错误：${done.errors.join('；')}`)
+                : null,
+              // 导入完成后给「去补分组」的直达提示（三级结构没登记时会出现在这里）
+              done.after?.missing?.length
+                ? h('div', { style: { marginTop: 6, color: '#b45309' } },
+                  `还有 ${done.after.missing.length} 项没进左侧栏 —— 到「Bot 档案」点「重建分组」即可补齐`)
                 : null)
             : null)
         : null,
@@ -5219,6 +5275,8 @@ window.__ModuleLoader__.load({
       // 把 Bot 会话挂进工作区（2026-11-09）：存量 Bot 从没挂过，永远躺在「未分组」。
       const [attaching, setAttaching] = useState(false)
       const [attachMsg, setAttachMsg] = useState(null)
+      // 建 Bot 成功后返回的三级状态（目录 / 分组 / 会话）
+      const [created, setCreated] = useState(null)
       // 改造04：Bot 卡片上的「派任务」「发消息」
       const [assignFor, setAssignFor] = useState(null)
       const [msgFor, setMsgFor] = useState(null)
@@ -5257,7 +5315,12 @@ window.__ModuleLoader__.load({
             },
           })
           setForm({ name: '', cwd: '', preset: '', department: '' })
+          // 三级状态回显（2026-11-18 Boss：「要求三级展示」）——
+          // 建完当场告诉用户「目录建了 / 分组登记了 / 会话起来了」，
+          // 而不是让他去左侧栏找（以前找不到就只能猜是不是没生效）。
+          setCreated(res)
           if (res.warnings?.length) setWarn(res.warnings.join('\n'))
+          else setWarn(null)
           reload()
         } catch (e) {
           setErr(e.message)
@@ -5365,6 +5428,49 @@ window.__ModuleLoader__.load({
         }
       }
 
+      /**
+       * 三级工作区体检（只读）。
+       *
+       * 为什么要页面自己查：Boss 2026-11-18 的困惑是「左侧栏怎么没有 cs-bots」，
+       * 而这此前**在页面里完全不可见** —— 只能靠重启/猜。
+       */
+      const [hier, setHier] = useState(null)
+      const [hierBusy, setHierBusy] = useState(false)
+      const checkHierarchy = async () => {
+        setHierBusy(true)
+        try {
+          const d = await call('/workspaces/hierarchy')
+          setHier(d)
+        } catch (e) {
+          setHier({ ok: false, hint: `体检失败：${e.message}` })
+        } finally {
+          setHierBusy(false)
+        }
+      }
+
+      /**
+       * 一键补齐三级分组（幂等）。
+       *
+       * 与「把会话挂进工作区」的分工：
+       *   · 补分组（本函数）= 建 `主目录/部门/Bot` 三个 Workspace 记录（左侧栏出现层级）
+       *   · 挂会话         = 把已有会话挂进已有分组（左侧栏分组里出现会话）
+       * 顺序：先补分组，再挂会话，否则「挂」会因为没有分组而全部跳过（历史死循环）。
+       */
+      const repairHierarchy = async () => {
+        setHierBusy(true)
+        setAttachMsg(null)
+        try {
+          const d = await call('/workspaces/hierarchy/repair', { method: 'POST', body: {} })
+          setHier(d.after ?? null)
+          setAttachMsg({ kind: d.ok ? 'ok' : 'err', text: d.note ?? (d.ok ? '已补齐' : '有项目没补成功') })
+          reload()
+        } catch (e) {
+          setAttachMsg({ kind: 'err', text: `补齐分组失败：${e.message}` })
+        } finally {
+          setHierBusy(false)
+        }
+      }
+
       return h('div', { className: 'csb-wrap' },
         sessionPicker
           ? h(Modal, {
@@ -5396,16 +5502,59 @@ window.__ModuleLoader__.load({
         // 改造05 §3.3：重启 dsh-web 后一键把所有 Bot 会话拉起来（否则派活必报 agent-not-live）
         h('div', { className: 'csb-bar', style: { marginTop: 8 } },
           h('button', { className: 'csb-btn', disabled: busy, onClick: reviveAll }, busy ? '启动中…' : '全部启动'),
-          h('button', { className: 'csb-btn csb-btn-p', disabled: attaching, onClick: attachWorkspaces },
+          h('button', { className: 'csb-btn', disabled: hierBusy, onClick: checkHierarchy },
+            hierBusy ? '体检中…' : '检查左侧栏层级'),
+          h('button', { className: 'csb-btn csb-btn-p', disabled: hierBusy, onClick: repairHierarchy },
+            hierBusy ? '补齐中…' : '重建分组'),
+          h('button', { className: 'csb-btn', disabled: attaching, onClick: attachWorkspaces },
             attaching ? '补挂中…' : '把会话挂进工作区'),
           h('span', { className: 'csb-set-d' },
-            '「全部启动」把 Bot 会话拉起来；「挂进工作区」把它们放进左侧栏各自的工作目录分组'
-            + '（存量 Bot 从没挂过，会一直待在「未分组」里）')),
+            '左侧栏三级 = 主目录 → 部门 → Bot。先点「重建分组」（幂等），再点「挂进工作区」把会话放进去。'
+            + '「全部启动」只是把 Bot 会话拉起来。')),
+
+        // 体检结果：缺什么就直说，别让用户靠猜
+        hier
+          ? h(Notice, {
+              kind: hier.ok === false || hier.missing?.length ? 'err' : 'ok',
+              onClose: () => setHier(null),
+            },
+          h('div', null, hier.hint ?? ''),
+          hier.departments?.length
+            ? h('div', { className: 'csb-set-d' },
+              '部门：' + hier.departments.map((d) => `${d.name ?? d.id}（${d.botsRegistered}/${d.bots} 已分组）`).join('、'))
+            : null,
+          hier.missing?.length
+            ? h('div', { className: 'csb-set-d' },
+              '待补：' + hier.missing.slice(0, 6).map((m) => `${m.level}:${m.path}`).join('；')
+              + (hier.missing.length > 6 ? ` …共 ${hier.missing.length} 项` : ''))
+            : null)
+          : null,
         reviveMsg
           ? h(Notice, { kind: reviveMsg.kind, onClose: () => setReviveMsg(null) }, reviveMsg.text)
           : null,
         attachMsg
           ? h(Notice, { kind: attachMsg.kind, onClose: () => setAttachMsg(null) }, attachMsg.text)
+          : null,
+
+        // ── 建 Bot 成功后的三级状态回显（2026-11-18）─────────────────────────
+        // 「目录 / 分组 / 会话」三件事各自有独立状态：哪一步没成，用户当场就能看到，
+        // 不用去左侧栏猜。这也把「建了 Bot 但左侧栏没变化」从谜团变成事实。
+        created
+          ? h(Notice, { kind: 'ok', onClose: () => setCreated(null) },
+            h('div', null, `已创建 Bot「${created.bot?.name ?? ''}」`),
+            h('div', { className: 'csb-set-d' }, `目录：${created.bot?.cwd ?? '—'}`),
+            (() => {
+              const steps = created.hierarchy?.steps ?? []
+              if (!steps.length) return null
+              const icon = (s2) => (s2.ok ? '✅' : '⚠️')
+              const label = { root: '主目录分组', dept: '部门分组', bot: 'Bot 分组' }
+              return h('div', { className: 'csb-set-d' },
+                steps.map((s2) => `${icon(s2)} ${label[s2.level] ?? s2.level}`).join('  '),
+                created.hierarchy?.ok
+                  ? '  —— 左侧栏刷新后可见三级'
+                  : `  —— ${created.hierarchy?.hint ?? '部分未登记，可点上方「重建分组」补齐'}`)
+            })(),
+            h('div', { className: 'csb-set-d' }, '会话：已创建（点这个 Bot 的「打开对话」进入）'))
           : null,
 
         h(Section, { title: '新建 Bot' }),
