@@ -6,26 +6,9 @@ DSH 多智能体协作平台：跨会话任务板、房间群聊、分层记忆/
 
 ---
 
-## 安装
-
-```bash
-# 推荐：git 通道（npm 版本可能滞后）
-dsh plugin --profile web add github:7358716/cs-bots#v0.8.0
-
-# 或离线包
-dsh plugin --profile web add ./cs-bots-0.8.0.tgz
-
-# 自检（强烈建议）
-bash install.sh --channel git --ref v0.8.0
-```
-
-> ⚠️ **bundle 层序**：本插件需排在 `@deepseek-ai/dsh-experimental-agent-team-profile` 之后，否则 `maxMembers` 覆盖失效。`install.sh` 会自动检测并重排。
-
----
-
 ## 核心能力
 
-**28 个模型可见工具**（`bot_` 前缀）：
+**45 个模型可见工具**（`bot_` 前缀）：
 
 ### 任务板（跨会话）
 | 工具 | 用途 |
@@ -37,7 +20,11 @@ bash install.sh --channel git --ref v0.8.0
 | `bot_task_update` | 改任务（CAS） |
 | `bot_task_phase` | 边做边交阶段产物 |
 | `bot_task_accept` | 验收（pass/reject） |
+| `bot_task_room` | 给任务开议事厅 |
+| `bot_task_notes` | 拉任务笔记 |
 | `bot_task_subscribe` | 任务订阅房间消息 |
+| `bot_task_unsubscribe` | 取消订阅 |
+| `bot_task_subscriptions` | 查订阅 |
 
 ### 团队与房间
 | 工具 | 用途 |
@@ -45,9 +32,12 @@ bash install.sh --channel git --ref v0.8.0
 | `bot_teams_create` | 建团队（big/small） |
 | `bot_teams_list` | 列团队 |
 | `bot_teams_add` | 加成员 |
+| `bot_team_route` | 跨团队定向路由 |
 | `bot_room_create` | 建房间 |
 | `bot_room_post` | 发言 |
 | `bot_room_read` | 读消息 |
+| `bot_room_body` | 读长正文全文 |
+| `bot_wake` | 定向唤醒会话 |
 
 ### Bot 注册表
 | 工具 | 用途 |
@@ -55,6 +45,7 @@ bash install.sh --channel git --ref v0.8.0
 | `bot_roster_create` | 注册 Bot（指定 cwd、preset） |
 | `bot_roster_list` | 列 Bot |
 | `bot_roster_manage` | claim/release/心跳/退役 |
+| `bot_roster_purge` | 清理已退役 Bot |
 
 ### 记忆与纪律
 | 工具 | 用途 |
@@ -68,11 +59,14 @@ bash install.sh --channel git --ref v0.8.0
 |---|---|
 | `bot_todo_add/list/update` | 四象限待办 |
 | `bot_cycle_start/advance/check/review` | PDCA 复盘 |
+| `bot_scratch_read/write` | 便签 |
+| `bot_prompt_list/get` | 提示词模板 |
 
-### 度量
+### 度量与校验
 | 工具 | 用途 |
 |---|---|
 | `bot_metrics_record/aggregate` | 指标记录/聚合 |
+| `bot_verify_evaluate` | 产出物存在性检查 |
 
 ---
 
@@ -89,5 +83,5 @@ bash install.sh --channel git --ref v0.8.0
 ## 测试
 
 ```bash
-bash test/run-all.sh   # 1242 项（v0.8.0），exit 0 才通过
+bash test/run-all.sh   # 1581 项（v0.20.0），exit 0 才通过
 ```
