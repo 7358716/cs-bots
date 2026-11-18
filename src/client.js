@@ -757,6 +757,40 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * 逃生舱（2026-11-18 第八轮）。
+     *
+     * ## 为什么需要它
+     *
+     *   Boss 连续七轮反馈「取消/关闭点不动」，各层兜底（React onClick、
+     *   文档级捕获、遮罩节点原生监听）在宿主上都失效，而控制台**一条我们的日志都没有**
+     *   ⇒ 无法再靠日志取证。
+     *
+     *   ⇒ 最后一招：**点击遮罩之外的地方就关**。
+     *   在 document 捕获阶段监听 `mousedown`，只要按下的位置**不在弹窗卡片内部**，
+     *   就关掉最上层弹窗。这条路径只需要「事件能到 document」，不依赖按钮命中、
+     *   不依赖 React、不依赖任何元素被正确派发。
+     *
+     *   用户动作变成：**点弹窗外面的灰底 → 弹窗关掉**。这比要求他精确点中按钮可靠得多。
+     */
+    function installEscapeHatch() {
+      try {
+        if (typeof document === 'undefined' || document.__csbEscapeHatch) return
+        document.__csbEscapeHatch = true
+        document.addEventListener('mousedown', (e) => {
+          const t = e.target
+          if (!t || typeof t.closest !== 'function') return
+          // 按在卡片里 ⇒ 不关（正常交互）
+          if (t.closest('[data-csb-modal]')) return
+          // 按在遮罩上或页面任何地方 ⇒ 关最上层弹窗
+          const masks = document.querySelectorAll('[data-csb-mask]')
+          const top = masks[masks.length - 1]
+          if (!top) return
+          try { top.__csbCloseTop?.() } catch {}
+        }, true)
+      } catch {}
+    }
+
+    /**
      * 文档级原生触发处理器（2026-11-18 第六轮）。
      *
      * ## 为什么还要再兜一层
@@ -781,6 +815,37 @@ window.__ModuleLoader__.load({
      *
      * 所有绑定都用 `capture: true` 挂在 document 上，抢在任何宿主处理器之前。
      */
+    /**
+     * 一键诊断自报（2026-11-18 第七轮）。
+     *
+     * ## 为什么改成「自动打日志」而不是「让用户在控制台敲命令」
+     *
+     *   Boss 第七轮贴了控制台截图，但那里只有 WebSocket 报错，没有探针输出。
+     *   原因很简单：让他去敲一行 `JSON.stringify(...)` 本身也是负担，
+     *   而且敲错、敲在过滤框里都会白跑一趟。
+     *
+     * ⇒ 现在：**用户什么都不用做**。打开「管理部门」弹窗后，
+     *   点任意一下或按一下键，控制台里就会出现一行以 `[cs-bots 诊断]` 开头的 JSON。
+     *   直接截图/复制那一行即可。
+     */
+    function diagLog(extra) {
+      try {
+        const d = (typeof window !== 'undefined' && window.__csbModalDiag) || {}
+        const line = '[cs-bots 诊断] ' + JSON.stringify({
+          modalMounted: !!document.querySelector?.('[data-csb-modal]'),
+          modalCount: document.querySelectorAll?.('[data-csb-modal]')?.length ?? -1,
+          lastEvent: d.last ?? null,
+          escSeen: d.escSeen === true,
+          events: Array.isArray(d.events) ? d.events.slice(-6) : [],
+          version: '0.20.11',
+          ...extra,
+        })
+        // eslint-disable-next-line no-console
+        console.log(line)
+        d.logged = line
+      } catch {}
+    }
+
     function installNativeTrigger() {
       try {
         if (typeof document === 'undefined' || document.__csbNativeTrigger) return
@@ -813,7 +878,14 @@ window.__ModuleLoader__.load({
           }
         }
         let armed = null
-        document.addEventListener('mousedown', (e) => { armed = pickAny(e.target) }, true)
+        document.addEventListener('mousedown', (e) => {
+          armed = pickAny(e.target)
+          const now = Date.now()
+          if (now - (document.__csbLastDiag ?? 0) > 2000) {
+            document.__csbLastDiag = now
+            diagLog({ phase: 'mousedown', target: e.target?.tagName ?? '?', armed: !!armed })
+          }
+        }, true)
         document.addEventListener('mouseup', (e) => {
           const el = pickAny(e.target) ?? armed
           armed = null
@@ -1017,8 +1089,56 @@ window.__ModuleLoader__.load({
         return () => clearTimeout(t)
       }, [actions])
 
+      // 弹窗每次挂载都自报一次身份 —— 用来确认「用户装的确实是新版」
+      useEffect(() => { diagLog({ phase: 'modal-mounted', title: String(title ?? '') }) }, [title])
+      // 逃生舱要调用的关闭入口（见 installEscapeHatch）
+      useEffect(() => {
+        const el = maskRef.current
+        if (!el) return undefined
+        el.__csbCloseTop = () => closeRef.current?.()
+        return () => { try { delete el.__csbCloseTop } catch {} }
+      }, [])
+
+      /**
+       * 弹窗自身再绑一次原生监听（2026-11-18 第七轮）。
+       *
+       * 前面几版分别把监听挂在 window / document / 文档级兜底上，都不见效。
+       * 这一版兜到最保守的位置：**遮罩节点自己**。它一定存在（弹窗都渲染出来了），
+       * 也一定在事件冒泡路径上。任何一环断了，这一环仍然可能通。
+       */
+      useEffect(() => {
+        const el = maskRef.current
+        if (!el) return undefined
+        const hit = (t) => (t && typeof t.closest === 'function'
+          ? (t.closest('[data-csb-close], .csb-btn-x') ?? t.closest('[data-csb-act]'))
+          : null)
+        const run = (t) => {
+          const n = hit(t)
+          if (!n) return
+          const act = n.getAttribute?.('data-csb-act')
+          if (act) {
+            const fn = actions?.[act]
+            if (typeof fn === 'function') { fn(); return }
+          }
+          closeRef.current?.()
+        }
+        // 直接绑在遮罩上（冒泡阶段即可，弹窗内部点击必然经过它）
+        const onUp = (e) => run(e.target)
+        const onDn = (e) => { el.__csbArmed = hit(e.target) }
+        const onUp2 = (e) => { run(e.target); if (!hit(e.target) && el.__csbArmed) run(el.__csbArmed); el.__csbArmed = null }
+        el.addEventListener('mousedown', onDn)
+        el.addEventListener('mouseup', onUp2)
+        el.addEventListener('click', onUp)
+        return () => {
+          el.removeEventListener('mousedown', onDn)
+          el.removeEventListener('mouseup', onUp2)
+          el.removeEventListener('click', onUp)
+        }
+      }, [actions])
+
       const node = h('div', {
         className: 'csb-mask',
+        'data-csb-mask': '1',
         ref: maskRef,
       },
       h('div', { className: `csb-modal${wide ? ' csb-modal-w' : ''}`, 'data-csb-modal': '1' },
@@ -10466,6 +10586,8 @@ window.__ModuleLoader__.load({
       installDiagProbe()
       // 文档级原生触发：不依赖弹窗自身的 effect 是否挂上（见 installNativeTrigger）
       installNativeTrigger()
+      // 逃生舱：点遮罩外即可关闭（见 installEscapeHatch）
+      installEscapeHatch()
       const disposers = []
       try {
         const d = installStyles()

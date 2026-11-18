@@ -266,7 +266,8 @@ test('★0.20.8 关闭按钮在 mousedown 记住、mouseup 执行（不依赖 cl
   assert.match(body, /document\.addEventListener\('mouseup', onUp, true\)/, 'mouseup 执行')
   assert.match(body, /armed = pick\(e\.target\)/, '按下时记住命中的关闭元素')
   assert.match(body, /const hit = pick\(e\.target\) \?\? armed/, '抬起时优先用记录值')
-  assert.ok(!/el\.addEventListener\('click'/.test(body), '不再只依赖 click')
+  // 0.20.11 起遮罩节点自己也绑了 click 兜底（多一层），这里只保证 mouseup 路径仍在
+  assert.match(body, /onUp2/, '遮罩节点上用门 mouseup 兜底')
 })
 
 test('★0.20.8 弹窗主按钮（取消/保存等）走 data-csb-act 原生兜底', () => {
@@ -309,4 +310,22 @@ test('★0.20.9 空状态（还没有部门）也要有导入/导出入口', () 
   assert.match(empty, /setImportOpen\(true\)/, '按钮要真的打开导入弹窗')
   assert.match(empty, /h\(TransferImportModal/, '空状态要渲染导入弹窗')
   assert.match(empty, /h\(TransferExportModal/, '空状态要渲染导出弹窗')
+})
+
+// ── 0.20.11：逃生舱（点弹窗外任意位置即关闭）────────────────────────────────
+test('★0.20.11 点弹窗卡片以外的地方必须能关掉（不依赖按钮命中）', () => {
+  assert.match(CLIENT, /function installEscapeHatch/, '要有逃生舱')
+  const body = fnBody(CLIENT, 'function installEscapeHatch(')
+  assert.match(body, /closest\('\[data-csb-modal\]'\)/, '按在卡片内不关')
+  assert.match(body, /querySelectorAll\('\[data-csb-mask\]'\)/, '找最上层弹窗')
+  assert.match(body, /__csbCloseTop/, '调用关闭入口')
+  assert.match(CLIENT, /installEscapeHatch\(\)/, 'apply 里要装上')
+  assert.match(CLIENT, /'data-csb-mask': '1'/, '遮罩要带标记')
+})
+
+test('★0.20.11 诊断自动打日志（用户不用敲命令）', () => {
+  const body = fnBody(CLIENT, 'function diagLog(')
+  assert.match(body, /\[cs-bots 诊断\]/, '日志带可检索前缀')
+  assert.match(body, /modalMounted/, '报告弹窗是否挂载')
+  assert.match(body, /version/, '报告版本号，用来确认装的是新版')
 })
