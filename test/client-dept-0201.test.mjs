@@ -75,9 +75,10 @@ test('★1 跨部门派活要显式提示', () => {
 // ── 2. 「＋ 新建」不再清空列表 ───────────────────────────────────────────────
 test('★2 「＋ 新增部门」是追加，不是重置（原来点击新建会误判为删全部部门）', () => {
   const body = fnBody(CLIENT, 'function DeptManageModal(')
-  assert.match(body, /setDraft\(\[\.\.\.draft, \{ id: '', name: '' \}\]\)/, '必须基于现有 draft 追加')
+  assert.match(body, /setDraft\(\[\.\.\.draft, withUid\(\{ id: '', name: '' \}\)\]\)/, '必须基于现有 draft 追加（0.20.12 起带稳定 uid）')
   // 空状态（depts.length===0）下重置成一行空行是正确行为；只禁止「已有部门时」重置
-  const resetAt = [...CLIENT.matchAll(/setDeptDraft\(\[\{ id: '', name: '' \}\]\)/g)].length
+  // 0.20.12 起空状态那处也带 withUid，正则同时接受两种写法
+  const resetAt = [...CLIENT.matchAll(/setDeptDraft\(\[withUid\(\{ id: '', name: '' \}\)\]\)/g)].length
   const withDepts = [...CLIENT.matchAll(/setDeptDraft\(\[\.\.\.depts\.map/g)].length
   assert.equal(resetAt, 1, `「只有一个空行」的写法只允许出现在空状态，实际 ${resetAt} 处`)
   assert.ok(withDepts >= 1, '有部门时必须带上现有部门')
@@ -328,4 +329,18 @@ test('★0.20.11 诊断自动打日志（用户不用敲命令）', () => {
   assert.match(body, /\[cs-bots 诊断\]/, '日志带可检索前缀')
   assert.match(body, /modalMounted/, '报告弹窗是否挂载')
   assert.match(body, /version/, '报告版本号，用来确认装的是新版')
+})
+
+// ── 0.20.12：删行后按钮失效 = 行 key 不稳定导致重挂 ──────────────────────────
+test('★0.20.12 部门列表的行 key 必须稳定（不能随索引/输入变化）', () => {
+  const body = fnBody(CLIENT, 'function DeptManageModal(')
+  assert.match(body, /key: d\.__uid/, '用一次性分配的稳定 uid 作 key')
+  assert.ok(!/key: `\$\{d\.id \|\| 'new'\}-\$\{i\}`/.test(body), '不许再用「id 或 new + 索引」当 key')
+  assert.match(CLIENT, /const withUid = /, '要有补 uid 的辅助')
+  assert.match(body, /withUid\(\{ id: '', name: '' \}\)/, '新增行也要带 uid')
+})
+
+test('★0.20.12 打开管理部门时给已有部门补 uid（否则已有行 key 也不稳）', () => {
+  const tab = fnBody(CLIENT, 'function DeptTab(')
+  assert.match(tab, /withUid\(\{ id: d\.id, name: d\.name \}\)/, '打开时统一补 uid')
 })

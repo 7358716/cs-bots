@@ -837,7 +837,7 @@ window.__ModuleLoader__.load({
           lastEvent: d.last ?? null,
           escSeen: d.escSeen === true,
           events: Array.isArray(d.events) ? d.events.slice(-6) : [],
-          version: '0.20.11',
+          version: '0.20.12',
           ...extra,
         })
         // eslint-disable-next-line no-console
@@ -4071,7 +4071,7 @@ window.__ModuleLoader__.load({
               h('button', {
                 className: 'csb-btn csb-btn-p',
                 // 空状态：本来就没有部门，重置成一行空行是**正确**行为（不是 bug）。
-                onClick: () => { setDeptDraft([{ id: '', name: '' }]); setManageOpen(true) },
+                onClick: () => { setDeptDraft([withUid({ id: '', name: '' })]); setManageOpen(true) },
               }, '＋ 新建第一个部门'),
               // 2026-11-18 Boss：空状态下也要能导入/导出
               //   —— 否则「新机器什么都没有」时，唯一的救回路径（导入备份包）恰恰不可达。
@@ -4157,7 +4157,7 @@ window.__ModuleLoader__.load({
           h('div', { className: 'csb-bar', style: { marginTop: 8 } },
             h('button', {
               className: 'csb-btn csb-btn-s',
-              onClick: () => { setManageMsg(null); setDeptDraft(depts.map((d) => ({ id: d.id, name: d.name }))); setManageOpen(true) },
+              onClick: () => { setManageMsg(null); setDeptDraft(depts.map((d) => withUid({ id: d.id, name: d.name }))); setManageOpen(true) },
             }, '⚙ 管理部门'),
             h('button', {
               className: 'csb-btn csb-btn-s',
@@ -4165,7 +4165,7 @@ window.__ModuleLoader__.load({
               //    保存时提交的列表里没有任何已有部门 ⇒ 后端当成「删掉全部部门」
               //    ⇒ 报「部门「开发部」还有 14 个 Bot」，用户完全看不懂。
               //    现在：打开弹窗时**带上现有部门**并追加一行空行。
-              onClick: () => { setManageMsg(null); setDeptDraft([...depts.map((d) => ({ id: d.id, name: d.name })), { id: '', name: '' }]); setManageOpen(true) },
+              onClick: () => { setManageMsg(null); setDeptDraft([...depts.map((d) => withUid({ id: d.id, name: d.name })), withUid({ id: '', name: '' })]); setManageOpen(true) },
             }, '＋ 新建')),
           // 导入导出（2026-11-16 Boss：都要有确认页）
           h('div', { className: 'csb-bar', style: { marginTop: 6 } },
@@ -4651,6 +4651,11 @@ window.__ModuleLoader__.load({
      *   删除拦截、删除确认、人员视图三件事都通过回调交给 `DeptTab` 去渲染 ——
      *   每次只挂一个顶层 Modal，不存在嵌套，也就不可能再卡死。
      */
+    // 新增行的稳定身份：一旦分配就跟着那一行走，不随输入变化
+    let __deptRowSeq = 0
+    const nextRowUid = () => { __deptRowSeq += 1; return `r${__deptRowSeq}` }
+    const withUid = (d) => ({ __uid: d?.__uid ?? nextRowUid(), ...d })
+
     function DeptManageModal({
       draft, setDraft, busy, onSave, onClose, msg, onDismissMsg,
       bots = [], orphanedBots = [], deptBotsOf, onRequestDelete, onManageMembers,
@@ -4700,7 +4705,12 @@ window.__ModuleLoader__.load({
         ? h('div', { className: 'csb-set-d' }, '还没有部门，点下面「＋ 新增部门」')
         : null,
       draft.map((d, i) => h('div', {
-        key: `${d.id || 'new'}-${i}`,
+        // ⚠️ 0.20.12：原来用 `${d.id || 'new'}-${i}`。对**新增行**（id 为空）来说，
+        //    key = `new-3`；一旦它被删掉，后面那行 i 会前移，key 变成别的值 ⇒ React 判为
+        //    新行并**重挂节点** ⇒ 旧的弹窗被卸载、按钮元素被替换。
+        //    这正是 Boss 看到「删除后按钮点不动」的直接原因（诊断日志里 click 命中的
+        //    .csb-btn 已经不是当前挂载的那一个）。改成一次性分配的稳定 uid。
+        key: d.__uid ?? `idx-${i}`,
         style: { marginBottom: 10, padding: '8px 10px', borderRadius: 8, background: 'var(--dsw-alias-bg-secondary, #f7f7f9)' },
       },
       h('div', { className: 'csb-bar' },
@@ -4738,7 +4748,7 @@ window.__ModuleLoader__.load({
       h('button', {
         className: 'csb-btn csb-btn-s',
         // Boss 第 3 条 + 0.20.1 修复：追加一行，绝不重置整个列表
-        onClick: () => setDraft([...draft, { id: '', name: '' }]),
+        onClick: () => setDraft([...draft, withUid({ id: '', name: '' })]),
       }, '＋ 新增部门'))
     }
 
