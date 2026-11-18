@@ -22,7 +22,7 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -213,9 +213,8 @@ test('同名 + rename：新建一个带 _2 后缀的，原名不动', async (t) 
 })
 
 // ── 失败不假成功 ────────────────────────────────────────────────────────────
-test('导入：部门在本机不存在 ⇒ 该条失败并给出原因，其它条照常导入', async (t) => {
+test('导入：包里的部门本机没有 ⇒ 自动补建（0.20.10 起，不再整条失败）', async (t) => {
   const src = sourceMachine(t)
-  // 目标机删掉「测试部门1」这个部门
   const tgt = targetMachine(t)
   tgt.services.settings.departments = [{ id: 'dev', name: '开发部' }]
   writeFileSync(join(tgt.stateDir, 'settings.json'), JSON.stringify({
@@ -223,9 +222,8 @@ test('导入：部门在本机不存在 ⇒ 该条失败并给出原因，其它
   }), 'utf8')
   const r = await applyImport(exportPkg(src), { stateDir: tgt.stateDir, services: tgt.services, ctx: fakeCtx().ctx })
   assert.equal(r.ok, true)
-  assert.equal(r.applied.bots.added, 1, '只有「甲」能进')
-  assert.equal(r.applied.bots.failed, 1, '「乙」必须算失败，不能静默丢掉')
-  assert.match(r.applied.bots.failedDetail[0].reason, /部门/)
+  assert.equal(r.applied.bots.added, 2, '两条都应成功')
+  assert.ok((r.applied.bots.autoCreatedDepts ?? []).some((d) => d.id === '测试部门1'), '要上报自动补建的部门')
 })
 
 test('导入：本机未设主目录 ⇒ 全部失败并说明下一步（不产生半成品目录）', async (t) => {
@@ -277,4 +275,26 @@ test('导入：applyImport 对「包里没有 bots 段」不报错也不建东�
   const r = await applyImport(buf, { stateDir: tgt.stateDir, services: tgt.services, ctx: fakeCtx().ctx })
   assert.equal(r.ok, true)
   assert.equal(tgt.createCalls.length, 0)
+})
+// ── 0.20.10：包里的部门本机没有时，必须自动补齐而不是整批失败 ────────────────
+test('★0.20.10 包里 Bot 引用的部门本机不存在 ⇒ 自动补建并如实上报', async (t) => {
+  const src = sourceMachine(t)
+  const buf = exportPkg(src)
+  // 目标机只有 dev，没有「测试部门1」
+  const tgt = targetMachine(t)
+  tgt.services.settings.departments = [{ id: 'dev', name: '开发部' }]
+  writeFileSync(join(tgt.stateDir, 'settings.json'), JSON.stringify({
+    botWorkspaceRoot: tgt.root, departments: tgt.services.settings.departments,
+  }), 'utf8')
+
+  const r = await applyImport(buf, { stateDir: tgt.stateDir, services: tgt.services, ctx: fakeCtx().ctx })
+  assert.equal(r.ok, true, JSON.stringify(r.errors))
+  assert.equal(r.applied.bots.added, 2, '两个 Bot 都要建出来（不再因缺部门失败）')
+  assert.equal(r.applied.bots.failed, 0, '不该有失败项')
+  const auto = r.applied.bots.autoCreatedDepts ?? []
+  assert.equal(auto.length, 1, `应自动补建 1 个部门，实际 ${JSON.stringify(auto)}`)
+  assert.equal(auto[0].id, '测试部门1')
+  // 磁盘上的设置也要真的写进去
+  const saved = JSON.parse(readFileSync(join(tgt.stateDir, 'settings.json'), 'utf8'))
+  assert.ok(saved.departments.some((d) => d.id === '测试部门1'), '部门要落盘')
 })

@@ -35,6 +35,7 @@ import { createHash } from 'node:crypto'
 import { createZip, readZip } from './zip.js'
 import { displayPath, isInside, normPath, safeSegment, checkSegment } from './paths-cross.js'
 import { ensureBotHierarchy } from './ws-hierarchy.js'
+import { saveSettings } from './settings.js'
 
 /** 包格式版本。不兼容时导入要明确拒绝。 */
 export const EXPORT_FORMAT = 'cs-bots-export'
@@ -523,7 +524,12 @@ export async function applyImport(buffer, { stateDir, services, ctx, onConflict 
       })()
       const cur = services?.roster?.list?.() ?? []
       const root = String(services?.settings?.botWorkspaceRoot ?? '').replace(/[\\/]+$/, '')
-      const depts = Array.isArray(services?.settings?.departments) ? services.settings.departments : []
+      const depts = Array.isArray(services?.settings?.departments) ? [...services.settings.departments] : []
+      // 包里的部门定义（Bot 引用了本机没有的部门时，用它自动补齐）
+      const incDeptsForBots = (() => {
+        try { return JSON.parse(byName.get(SECTIONS.departments.file)?.toString('utf8') ?? '[]') } catch { return [] }
+      })()
+      const autoDepts = []
       const defaultDept = String(services?.settings?.defaultDepartment ?? '').trim() || depts[0]?.id || ''
       const created = []
       const updated = []
@@ -542,9 +548,31 @@ export async function applyImport(buffer, { stateDir, services, ctx, onConflict 
           failed.push({ name: b.name, reason: '包里没带部门，本机也没有默认部门 —— 先建一个部门再导入' })
           continue
         }
+        // ⚠️ 2026-11-18 Boss Win 实测：从 Linux 导出的包里有 misc 部门，本机部门表是
+        //    dev/qa/ops（用户选的「跳过」保留了本机的），于是「工作岗/私人助理岗/任务调度岗」
+        //    三个 Bot 全部导入失败 —— 报「部门 misc 不存在」。
+        //    对用户来说这是莫名其妙的失败：他明明在导入一个完整的备份包。
+        // ⇒ 现在：包里的 Bot 引用了本机没有的部门，**按包里的部门定义自动补齐**，
+        //    并在结果里如实列出「因导入自动新建了哪些部门」。这比让他先手工建好再导一次合理。
         if (!depts.some((d) => d?.id === deptId)) {
-          failed.push({ name: b.name, reason: `部门「${deptId}」在本机不存在 —— 先导入/新建这个部门` })
-          continue
+          const fromPkg = (Array.isArray(incDeptsForBots) ? incDeptsForBots : [])
+            .find((x) => x && x.id === deptId)
+          const deptName = fromPkg?.name ?? deptId
+          if (!fromPkg) {
+            failed.push({ name: b.name, reason: `部门「${deptId}」在本机与包里都不存在 —— 数据包不完整` })
+            continue
+          }
+          try {
+            const next = [...depts, { id: deptId, name: deptName }]
+            const saved = saveSettings(stateDir, { departments: next })
+            if (!saved.ok) throw new Error(saved.reason ?? '写设置失败')
+            depts.push({ id: deptId, name: deptName })
+            if (services.settings) services.settings.departments = next
+            autoDepts.push({ id: deptId, name: deptName })
+          } catch (error) {
+            failed.push({ name: b.name, reason: `自动补建部门「${deptId}」失败：${error?.message ?? error}` })
+            continue
+          }
         }
         // 目录段：Bot 名要洗成安全目录名（汉字放行，Win 保留名/非法字符拦掉）
         const seg = safeSegment(b.name)
@@ -632,6 +660,7 @@ export async function applyImport(buffer, { stateDir, services, ctx, onConflict 
         updated,
         renamedDetail: renamed,
         failedDetail: failed,
+        autoCreatedDepts: autoDepts,
       }
     }
 

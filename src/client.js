@@ -3685,6 +3685,8 @@ window.__ModuleLoader__.load({
       // 导入导出（2026-11-16）
       const [exportOpen, setExportOpen] = useState(false)
       const [importOpen, setImportOpen] = useState(false)
+      // 导入面板的重挂键：导入期间父组件会重渲染，若不复位会让弹窗状态错乱
+      const [importNonce, setImportNonce] = useState(0)
       // 部门人员管理（2026-11-18 Boss 第 3 条）
       // 0.20.3：这三个 + 部门人员列表都改由**本组件**渲染顶层 Modal。
       //   原因见 DeptManageModal 头顶注释：子 Modal 塞进父 Modal 的 children 会卡死。
@@ -3755,9 +3757,10 @@ window.__ModuleLoader__.load({
         // 前端先自查一遍，能本地拦住的就别发请求（发出去也只会 400）
         const bad = []
         const seen = new Set()
-        for (const d of list) {
+        for (let i = 0; i < list.length; i += 1) {
+          const d = list[i]
           const name = String(d?.name ?? '').trim()
-          if (!name) { bad.push('有部门名字是空的'); continue }
+          if (!name) { bad.push(`第 ${i + 1} 个部门的名字是空的 —— 填上，或点它的「删除」去掉这一行`); continue }
           if (/[/\\]/.test(name)) { bad.push(`「${name}」含路径分隔符`); continue }
           if (seen.has(name)) bad.push(`「${name}」重复了`)
           seen.add(name)
@@ -3970,6 +3973,7 @@ window.__ModuleLoader__.load({
             : null,
           importOpen
             ? h(TransferImportModal, {
+              key: `imp-${importNonce}`,
               onClose: () => setImportOpen(false),
               onDone: () => { treeQ.reload(); rosterQ.reload(); legacyQ.reload() },
             })
@@ -4242,6 +4246,7 @@ window.__ModuleLoader__.load({
         // 导入确认页
         importOpen
           ? h(TransferImportModal, {
+            key: `imp-${importNonce}`,
             onClose: () => setImportOpen(false),
             onDone: () => { treeQ.reload(); rosterQ.reload(); legacyQ.reload() },
           })
@@ -4550,8 +4555,18 @@ window.__ModuleLoader__.load({
         actions: { cancel: onClose, save: onSave },
         footer: [
           h('button', { key: 'c', className: 'csb-btn', 'data-csb-act': 'cancel', onClick: onClose }, '取消'),
-          h('button', { key: 'ok', className: 'csb-btn csb-btn-p', 'data-csb-act': 'save', disabled: busy, onClick: onSave },
-            busy ? '保存中…' : '保存'),
+          h('button', {
+            key: 'ok',
+            className: 'csb-btn csb-btn-p',
+            'data-csb-act': 'save',
+            // 有空白行时不给点：点了只会拿到后端「必须有非空 id 与 name」，用户看不懂。
+            // 先禁用，并把原因写在 title 上。
+            disabled: busy || draft.some((d) => !String(d?.name ?? '').trim()),
+            title: draft.some((d) => !String(d?.name ?? '').trim())
+              ? '有部门名字空着 —— 填上或删掉那一行再保存'
+              : '',
+            onClick: onSave,
+          }, busy ? '保存中…' : '保存'),
         ],
       },
       // ⚠️ 保存结果必须显示在**弹窗内部**（0.20.5）：原来它渲染在页面上，
@@ -4804,7 +4819,10 @@ window.__ModuleLoader__.load({
               ...(only ? { only } : {}),
             },
           })
+          // ⚠️ 先落结果再通知刷新（2026-11-18 Boss：导入完「跳转到导入导出弹窗页面」）。
+          //    原来 onDone 先跑，父组件重渲染可能把本弹窗重挂 ⇒ 用户看不到逐条结果。
           setDone(r)
+          await Promise.resolve()
           onDone?.()
         } catch (e) {
           setErr(`导入失败：${e.message}`)
@@ -4908,6 +4926,10 @@ window.__ModuleLoader__.load({
                     : null,
                   (b.renamedDetail ?? []).length
                     ? h('div', { className: 'csb-set-d' }, `改名：${b.renamedDetail.map((x) => `${x.from}→${x.to}`).join('、')}`)
+                    : null,
+                  (b.autoCreatedDepts ?? []).length
+                    ? h('div', { className: 'csb-set-d', style: { color: '#b45309' } },
+                      `自动补建部门：${b.autoCreatedDepts.map((d) => d.name ?? d.id).join('、')}`)
                     : null,
                   (b.failedDetail ?? []).length
                     ? h('div', { style: { color: '#b91c1c', marginTop: 2 } },
