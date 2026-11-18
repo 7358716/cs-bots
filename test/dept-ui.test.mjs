@@ -71,8 +71,11 @@ test('部门管理：新建/改名/删除都在独立弹窗里（0.20.1 口径�
   assert.ok(!/id（英文）/.test(MANAGE), '不再出现「id（英文）」双字段')
   assert.match(MANAGE, /＋ 新增/, '要有新增按钮')
   // 删除约束从「文字提示」升级为「前置拦截弹窗」
-  assert.match(MANAGE, /不能删除「/, '删除前置拦截弹窗')
-  assert.match(MANAGE, /去迁移这些 Bot/, '拦截弹窗要能一键去迁移')
+  // 0.20.3：拦截/确认弹窗上提到 DeptTab 渲染（子 Modal 塞进父 Modal 会卡死），
+  //   所以这两句文案在 DEPT 里，不在 MANAGE 里。
+  assert.match(DEPT, /不能删除「/, '删除前置拦截弹窗')
+  assert.match(DEPT, /去迁移这些 Bot/, '拦截弹窗要能一键去迁移')
+  assert.match(MANAGE, /onRequestDelete/, '部门弹窗把删除交给上层校验')
 })
 
 test('部门管理：保存走 /departments/save（有 Bot 不许删的保护在后端）', () => {

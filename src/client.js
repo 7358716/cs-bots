@@ -3413,6 +3413,11 @@ window.__ModuleLoader__.load({
       const [exportOpen, setExportOpen] = useState(false)
       const [importOpen, setImportOpen] = useState(false)
       // 部门人员管理（2026-11-18 Boss 第 3 条）
+      // 0.20.3：这三个 + 部门人员列表都改由**本组件**渲染顶层 Modal。
+      //   原因见 DeptManageModal 头顶注释：子 Modal 塞进父 Modal 的 children 会卡死。
+      const [delBlock, setDelBlock] = useState(null)   // { i, id, name, bots: [] } 有 Bot 拦截
+      const [delConfirm, setDelConfirm] = useState(null) // { i, id, name } 无 Bot 二次确认
+      const [membersFor, setMembersFor] = useState(null) // 部门 id（人员视图）
       const [memberProfile, setMemberProfile] = useState(null)  // { id } 展开档案编辑
       const [retireBot, setRetireBot] = useState(null)          // 待退役的 Bot
       const [newBotDept, setNewBotDept] = useState(null)        // 在本部门新建 Bot
@@ -3935,18 +3940,76 @@ window.__ModuleLoader__.load({
               root: String(setData?.values?.botWorkspaceRoot ?? ''),
             }).find((g) => g.id === '__orphan')?.bots ?? [],
             deptBotsOf: (id) => (depts.find((d) => d.id === id)?.bots ?? []),
-            onMigrate: (deptId) => {
-              // 「去迁移」：把该部门的 Bot 全部勾上，引导用户去批量移动
-              const list = (depts.find((d) => d.id === deptId)?.bots ?? [])
-              const next = {}
-              for (const b of list) next[b.id] = true
-              setChecked(next)
-              setManageOpen(false)
-              setMsg({ kind: 'ok', text: `已勾选「${depts.find((d) => d.id === deptId)?.name ?? deptId}」的 ${list.length} 个 Bot，用上方「移到部门…」批量迁走` })
+            // 删除：有 Bot 就拦截，没 Bot 才确认 —— 两个弹窗都由 DeptTab 渲染
+            onRequestDelete: ({ i, id, name }) => {
+              const list = id ? (depts.find((d) => d.id === id)?.bots ?? []) : []
+              if (list.length) setDelBlock({ i, id, name, bots: list })
+              else setDelConfirm({ i, id, name })
             },
-            onManageMembers: (deptId) => { setSelected({ type: 'dept', id: deptId }); setManageOpen(false) },
-            profileForm: renderDeptMembers,
+            onManageMembers: (deptId) => setMembersFor(deptId),
           })
+          : null,
+
+        // ── 删除：有 Bot 拦截（顶层 Modal，不与部门弹窗嵌套）──────────────────
+        delBlock
+          ? h(Modal, {
+            title: `不能删除「${delBlock.name}」`,
+            onClose: () => setDelBlock(null),
+            footer: [
+              h('button', { key: 'k', className: 'csb-btn', onClick: () => setDelBlock(null) }, '知道了'),
+              h('button', {
+                key: 'm', className: 'csb-btn csb-btn-p',
+                onClick: () => {
+                  const d = delBlock
+                  setDelBlock(null)
+                  const list = d.bots ?? []
+                  const next = {}
+                  for (const b of list) next[b.id] = true
+                  setChecked(next)
+                  setManageOpen(false)
+                  setMsg({ kind: 'ok', text: `已勾选「${d.name}」的 ${list.length} 个 Bot，用上方「移到部门…」批量迁走` })
+                },
+              }, '去迁移这些 Bot'),
+            ],
+          },
+          h('div', null,
+            h('div', { className: 'csb-set-d', style: { marginBottom: 6 } },
+              `这个部门还有 ${(delBlock.bots ?? []).length} 个 Bot：`),
+            h('ul', { style: { margin: '0 0 8px 18px', padding: 0, fontSize: 12.5 } },
+              (delBlock.bots ?? []).map((b) => h('li', { key: b.id }, b.name))),
+            h('div', { className: 'csb-set-d' },
+              '请先把它们迁到别的部门或退役，再回来删这个部门。')))
+          : null,
+
+        // ── 删除：无 Bot 的二次确认 ────────────────────────────────────────────
+        delConfirm
+          ? h(Modal, {
+            title: `确认删除部门「${delConfirm.name}」？`,
+            onClose: () => setDelConfirm(null),
+            footer: [
+              h('button', { key: 'c', className: 'csb-btn', onClick: () => setDelConfirm(null) }, '取消'),
+              h('button', {
+                key: 'd', className: 'csb-btn csb-btn-d',
+                onClick: () => { setDeptDraft(deptDraft.filter((_, j) => j !== delConfirm.i)); setDelConfirm(null) },
+              }, '确认删除'),
+            ],
+          },
+          h('div', { className: 'csb-set-d' },
+            '这个部门下面没有 Bot，可以删。',
+            h('br'), '部门条目、团队名、群聊会一并清掉；磁盘上的目录文件不会删。'))
+          : null,
+
+        // ── 部门人员（顶层 Modal：列表 + 增删改查）──────────────────────────────
+        membersFor
+          ? h(Modal, {
+            title: `部门人员 · ${depts.find((d) => d.id === membersFor)?.name ?? membersFor}`,
+            onClose: () => setMembersFor(null),
+            wide: true,
+            footer: [
+              h('button', { key: 'b', className: 'csb-btn', onClick: () => setMembersFor(null) }, '返回列表'),
+            ],
+          },
+          renderDeptMembers(membersFor))
           : null,
 
         // 部门人员 → 改档案：**复用 Bot 档案抽屉本身**（B 方案的唯一正确做法）
@@ -4125,49 +4188,36 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * 管理部门弹窗（2026-11-18 重做，Boss 四条要求）。
+     * 管理部门弹窗（0.20.3 重写 —— 修 0.20.2 把弹窗套弹窗导致的死锁）。
      *
-     * ## Boss 原话
-     *   1「新增部门就是一个字段，字段名称作为目录名称（当前主目录下）」
-     *   2「主管应该选择，也可以选择其他没有在其他部门的 bot」
-     *   3「管理部门是要管理部门人员，对 bot 的增删改查，同步 bot 档案」
-     *   4「删除部门前要校验并给弹窗，而不是在之后的页面展示」
+     * ## 0.20.2 的真实故障（Boss 2026-11-18 Win 截图）
      *
-     * ## 为什么原来会报「部门「开发部」还有 14 个 Bot」
+     *   「1 点击进去卡住了，无法退出。2 点击保存没反应，点击进入管理部门就没反应」
      *
-     *   「＋ 新建」把草稿初始化成 `[{id:'',name:''}]` —— **只有一行空部门**。
-     *   保存时提交的列表里没有任何已有部门 ⇒ 后端把它当成「删掉全部部门」
-     *   ⇒ `DEPT_HAS_BOTS` 拒绝。用户想新建，系统却理解成全删，还给了个看不懂的错。
-     *   ⇒ 现在：新建 = 在现有列表后面**追加一行**，永不丢原部门。
+     *   根因：我在 `return h(Modal, {...}, 内容, 确认框, 拦截框)` 里把**子 Modal 当成了
+     *   Modal 的 children**（第三个及以后的参数）。而 `Modal` 只渲染一个 children，
+     *   于是：
+     *     · 拦截框 / 确认框被塞进 Modal 内部的**滚动容器**里，被内容挤到看不见；
+     *     · 但拦截框的状态一旦被设上，它就一直渲染在内容末尾 —— 视觉上「点了没反应」；
+     *     · 更糟的是子 Modal 自己的遮罩/ESC 处理与父 Modal 抢事件 ⇒ 父弹窗关不掉 = 卡死。
+     *   ⇒ 规则：**一个组件一次只返回一个 Modal**。子框要改由父级（DeptTab）渲染。
      *
-     * ## 删除的两级校验
+     * ## 现在的分工
      *
-     *   点「删除」时**当场**判断，不等到保存：
-     *     · 部门里还有 Bot ⇒ 直接弹窗拦住，列出是哪些，给「去迁移」入口
-     *     · 没有 Bot     ⇒ 二次确认（说明目录文件不会删）
-     *   后端仍然会校验一遍（多端并发下前端判断会过时），但那条不该是常见路径。
+     *   本组件**只负责列表视图**：显示部门行、编辑名字、选主管、点删除/人员。
+     *   删除拦截、删除确认、人员视图三件事都通过回调交给 `DeptTab` 去渲染 ——
+     *   每次只挂一个顶层 Modal，不存在嵌套，也就不可能再卡死。
      */
     function DeptManageModal({
       draft, setDraft, busy, onSave, onClose,
-      bots = [], orphanedBots = [], deptBotsOf, onMigrate, onManageMembers, profileForm,
+      bots = [], orphanedBots = [], deptBotsOf, onRequestDelete, onManageMembers,
     }) {
-      const [confirmDel, setConfirmDel] = useState(null)   // { i, id, name }
-      const [blockDel, setBlockDel] = useState(null)       // { name, bots: [...] }
-      const [memberFor, setMemberFor] = useState(null)     // 部门 id（进入人员管理）
       const upd = (i, patch) => {
         const next = [...draft]
         next[i] = { ...next[i], ...patch }
         setDraft(next)
       }
-      const removeAt = (i) => {
-        const d = draft[i]
-        const list = deptBotsOf ? deptBotsOf(d.id) : []
-        if (list.length) { setBlockDel({ name: d.name || d.id, id: d.id, bots: list }); return }
-        setConfirmDel({ i, id: d.id, name: d.name || d.id })
-      }
-
-      // 主管候选 = 本部门 Bot ∪ 未归属任何部门的 Bot（Boss 第 2 条）
-      // 主管候选 = 本部门 Bot ∪ **没归属任何部门的 Bot**（Boss 第 2 条原话）
+      // 主管候选 = 本部门 Bot ∪ 没归属任何部门的 Bot（Boss 第 2 条原话）
       //   `orphanedBots` 由调用方算好传进来（按 cwd 判不出部门的那批）。
       const leadCandidates = (deptId) => {
         const mine = deptBotsOf ? deptBotsOf(deptId) : []
@@ -4175,106 +4225,61 @@ window.__ModuleLoader__.load({
       }
 
       return h(Modal, {
-        title: memberFor ? `部门人员 · ${draft.find((d) => d.id === memberFor)?.name ?? memberFor}` : '管理部门',
+        title: '管理部门',
         wide: true,
         onClose,
         footer: [
-          h('button', { key: 'c', className: 'csb-btn', onClick: onClose }, memberFor ? '返回列表' : '取消'),
+          h('button', { key: 'c', className: 'csb-btn', onClick: onClose }, '取消'),
           h('button', { key: 'ok', className: 'csb-btn csb-btn-p', disabled: busy, onClick: onSave },
             busy ? '保存中…' : '保存'),
         ],
       },
-      // ── 人员管理视图（Boss 第 3 条）────────────────────────────────────────
-      memberFor
-        ? (profileForm
-          ? profileForm(memberFor)
-          : h('div', { className: 'csb-set-d' }, '人员管理组件未就绪'))
-        : h('div', null,
-          h('div', { className: 'csb-set-d', style: { marginBottom: 10 } },
-            '部门名就是目录名（建在主目录下）。删除部门前会先校验：里面还有 Bot 会被拦住，'
-            + '没有 Bot 才会删，且**磁盘目录不会被删**。'),
-          draft.length === 0
-            ? h('div', { className: 'csb-set-d' }, '还没有部门，点下面「＋ 新增」')
-            : null,
-          draft.map((d, i) => h('div', {
-            key: i,
-            style: { marginBottom: 10, padding: '8px 10px', borderRadius: 8, background: 'var(--dsw-alias-bg-secondary, #f7f7f9)' },
-          },
-          h('div', { className: 'csb-bar' },
-            // 一个字段：名字即目录名（Boss 第 1 条）
-            h('input', {
-              className: 'csb-in csb-grow', value: d.name ?? '',
-              placeholder: '部门名（就是目录名，如 开发部 / 测试部门1）',
-              onChange: (e) => upd(i, { name: e.target.value }),
-            }),
-            h('button', {
-              className: 'csb-btn csb-btn-s csb-btn-d', onClick: () => removeAt(i),
-            }, '删除'),
-            h('button', {
-              className: 'csb-btn csb-btn-s', onClick: () => setMemberFor(d.id),
-            }, '人员')),
-          // 主管：下拉选择（Boss 第 2 条）
-          h('div', { className: 'csb-bar', style: { marginTop: 6 } },
-            h('span', { className: 'csb-set-d', style: { fontSize: 11.5, flex: 'none' } }, '主管'),
-            (() => {
-              const { mine, orphans } = leadCandidates(d.id)
-              return h('select', {
-                className: 'csb-sel', style: { maxWidth: 260 }, value: d.leadBotName ?? '',
-                onChange: (e) => upd(i, { leadBotName: e.target.value }),
-              },
-              h('option', { key: '__none', value: '' }, '（没有主管，说话唤醒全部）'),
-              mine.length ? h('optgroup', { key: 'mine', label: '本部门' },
-                mine.map((b) => h('option', { key: b.id, value: b.name, title: b.cwd ?? '' }, b.name))) : null,
-              orphans.length ? h('optgroup', { key: 'orp', label: '未归属部门的 Bot' },
-                orphans.map((b) => h('option', { key: b.id, value: b.name, title: b.cwd ?? '' }, b.name))) : null)
-            })(),
-            h('span', { className: 'csb-set-d', style: { fontSize: 11 } },
-              `（本部门 ${(deptBotsOf ? deptBotsOf(d.id) : []).length} 个 Bot）`)))),
-          h('button', {
-            className: 'csb-btn csb-btn-s',
-            // Boss 第 1 条 + 上面注释：追加一行，绝不重置整个列表
-            onClick: () => setDraft([...draft, { id: '', name: '' }]),
-          }, '＋ 新增部门')),
-
-      // ── 删除：有 Bot 拦截弹窗 ──────────────────────────────────────────────
-      blockDel
-        ? h(Modal, {
-          title: `不能删除「${blockDel.name}」`,
-          onClose: () => setBlockDel(null),
-          footer: [
-            h('button', { key: 'k', className: 'csb-btn', onClick: () => setBlockDel(null) }, '知道了'),
-            h('button', {
-              key: 'm', className: 'csb-btn csb-btn-p',
-              onClick: () => { const d = blockDel; setBlockDel(null); onMigrate?.(d.id, d.bots) },
-            }, '去迁移这些 Bot'),
-          ],
-        },
-        h('div', null,
-          h('div', { className: 'csb-set-d', style: { marginBottom: 6 } },
-            `这个部门还有 ${blockDel.bots.length} 个 Bot：`),
-          h('ul', { style: { margin: '0 0 8px 18px', padding: 0, fontSize: 12.5 } },
-            blockDel.bots.map((b) => h('li', { key: b.id }, b.name))),
-          h('div', { className: 'csb-set-d' },
-            '请先把它们迁到别的部门或退役，再回来删这个部门。')))
+      h('div', { className: 'csb-set-d', style: { marginBottom: 10 } },
+        '部门名就是目录名（建在主目录下）。删除前会先校验：里面还有 Bot 会被拦住，没有 Bot 才会删，且磁盘目录不会被删。'),
+      draft.length === 0
+        ? h('div', { className: 'csb-set-d' }, '还没有部门，点下面「＋ 新增部门」')
         : null,
-
-      // ── 删除：无 Bot 时的二次确认 ──────────────────────────────────────────
-      confirmDel
-        ? h(Modal, {
-          title: `确认删除部门「${confirmDel.name}」？`,
-          onClose: () => setConfirmDel(null),
-          footer: [
-            h('button', { key: 'c', className: 'csb-btn', onClick: () => setConfirmDel(null) }, '取消'),
-            h('button', {
-              key: 'd', className: 'csb-btn csb-btn-d',
-              onClick: () => { setDraft(draft.filter((_, j) => j !== confirmDel.i)); setConfirmDel(null) },
-            }, '确认删除'),
-          ],
-        },
-        h('div', { className: 'csb-set-d' },
-          '这个部门下面没有 Bot，可以删。',
-          h('br'), '⚠️ 部门条目、团队名、群聊会一并清掉；**磁盘上的目录文件不会删**（要手动清理请去文件管理器）。'))
-        : null)
+      draft.map((d, i) => h('div', {
+        key: `${d.id || 'new'}-${i}`,
+        style: { marginBottom: 10, padding: '8px 10px', borderRadius: 8, background: 'var(--dsw-alias-bg-secondary, #f7f7f9)' },
+      },
+      h('div', { className: 'csb-bar' },
+        // 一个字段：名字即目录名（Boss 第 3 条）
+        h('input', {
+          className: 'csb-in csb-grow', value: d.name ?? '',
+          placeholder: '部门名（就是目录名，如 开发部 / 测试部门1）',
+          onChange: (e) => upd(i, { name: e.target.value }),
+        }),
+        h('button', {
+          className: 'csb-btn csb-btn-s csb-btn-d',
+          onClick: () => onRequestDelete?.({ i, id: d.id, name: d.name || d.id }),
+        }, '删除'),
+        h('button', {
+          className: 'csb-btn csb-btn-s',
+          onClick: () => onManageMembers?.(d.id),
+        }, '人员')),
+      // 主管：下拉选择（Boss 第 4 条）
+      h('div', { className: 'csb-bar', style: { marginTop: 6 } },
+        h('span', { className: 'csb-set-d', style: { fontSize: 11.5, flex: 'none' } }, '主管'),
+        (() => {
+          const { mine, orphans } = leadCandidates(d.id)
+          return h('select', {
+            className: 'csb-sel', style: { maxWidth: 260 }, value: d.leadBotName ?? '',
+            onChange: (e) => upd(i, { leadBotName: e.target.value }),
+          },
+          h('option', { key: '__none', value: '' }, '（没有主管，说话唤醒全部）'),
+          mine.length ? h('optgroup', { key: 'mine', label: '本部门' },
+            mine.map((b) => h('option', { key: b.id, value: b.name, title: b.cwd ?? '' }, b.name))) : null,
+          orphans.length ? h('optgroup', { key: 'orp', label: '未归属部门的 Bot' },
+            orphans.map((b) => h('option', { key: b.id, value: b.name, title: b.cwd ?? '' }, b.name))) : null)
+        })(),
+        h('span', { className: 'csb-set-d', style: { fontSize: 11 } },
+          `（本部门 ${(deptBotsOf ? deptBotsOf(d.id) : []).length} 个 Bot）`)))),
+      h('button', {
+        className: 'csb-btn csb-btn-s',
+        // Boss 第 3 条 + 0.20.1 修复：追加一行，绝不重置整个列表
+        onClick: () => setDraft([...draft, { id: '', name: '' }]),
+      }, '＋ 新增部门'))
     }
 
     /**

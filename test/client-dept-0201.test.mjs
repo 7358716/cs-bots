@@ -107,12 +107,14 @@ test('★4 主管按名字找不到时降级为空，绝不静默挑第一个', 
 
 // ── 5. 删部门前置校验 ───────────────────────────────────────────────────────
 test('★5 删除部门：先校验再弹窗，不在保存后才报错', () => {
-  const body = fnBody(CLIENT, 'function DeptManageModal(')
-  assert.match(body, /removeAt/, '删除走统一入口')
-  assert.match(body, /不能删除「/, '有 Bot 时前置拦截')
-  assert.match(body, /去迁移这些 Bot/, '拦截后给出迁移入口')
-  assert.match(body, /确认删除/, '无 Bot 时二次确认')
-  assert.match(body, /磁盘上的目录文件不会删/, '必须说清目录不删')
+  // 0.20.3：拦截/确认弹窗上提到 DeptTab，断言改为「两处各司其职」
+  const modal = fnBody(CLIENT, 'function DeptManageModal(')
+  assert.match(modal, /onRequestDelete/, '部门弹窗把删除请求交给上层判断')
+  assert.ok(!/直接 setDraft\(draft\.filter/.test(modal), '部门弹窗不得自己直接删（必须经过校验）')
+  assert.match(CLIENT, /不能删除「\$\{delBlock\.name\}」/, '有 Bot 时前置拦截')
+  assert.match(CLIENT, /去迁移这些 Bot/, '拦截后给出迁移入口')
+  assert.match(CLIENT, /确认删除部门/, '无 Bot 时二次确认')
+  assert.match(CLIENT, /磁盘上的目录文件不会删/, '必须说清目录不删')
 })
 
 test('★5 后端：保存时仍自校验一遍，并回报「这次删了谁」', () => {
@@ -160,4 +162,32 @@ test('Bot 按部门归类的组装只有一个函数（口径唯一）', () => {
   assert.ok(!/startsWith\(`\$\{root\}\/`\)/.test(body), '不能写死正斜杠前缀（Win 会错）')
   // 目标行：const norm = (x) => String(x ?? '').replace(/\\/g, '/') …
   assert.ok(body.includes(".replace(/\\\\/g, '/')"), '要先归一分隔符再比（Win 的反斜杠）')
+})
+// ── 0.20.3 回归：Modal 不许嵌套（0.20.2 卡死的根因）─────────────────────────
+test('★0.20.3 部门管理弹窗里不许再出现第二个 Modal（会导致弹窗套弹窗卡死）', () => {
+  const body = fnBody(CLIENT, 'function DeptManageModal(')
+  const modals = body.match(/h\(Modal/g) ?? []
+  assert.equal(modals.length, 1, `DeptManageModal 必须只返回一个 Modal，实际 ${modals.length} 个`)
+  // 不允许把子框当 children 传进去（原写法：h(Modal, {...}, 内容, 确认框, 拦截框)）
+  assert.ok(!/onMigrate|blockDel|confirmDel/.test(body), '删除拦截/确认框已上提到 DeptTab，不该留在子组件')
+})
+
+test('★0.20.3 删除拦截 / 删除确认 / 部门人员都由 DeptTab 各自渲染为顶层 Modal', () => {
+  for (const [name, sig] of [
+    ['delBlock', 'delBlock'],
+    ['delConfirm', 'delConfirm'],
+    ['membersFor', 'membersFor'],
+  ]) {
+    assert.ok(CLIENT.includes(`const [${name}, set`), `${name} 状态要挂在 DeptTab`)
+  }
+  assert.match(CLIENT, /不能删除「\$\{delBlock\.name\}」/, '拦截弹窗文案在 DeptTab 里')
+  assert.match(CLIENT, /确认删除部门「\$\{delConfirm\.name\}」/, '确认弹窗文案在 DeptTab 里')
+  assert.match(CLIENT, /部门人员 · \$\{depts\.find/, '人员弹窗标题在 DeptTab 里')
+})
+
+test('★0.20.3 管理部门弹窗必须有可用的关闭路径（取消按钮 + onClose）', () => {
+  const body = fnBody(CLIENT, 'function DeptManageModal(')
+  assert.match(body, /onClose,/, '必须接 onClose')
+  assert.match(body, /'取消'/, '必须有取消按钮')
+  assert.match(body, /'保存'/, '必须有保存按钮')
 })
