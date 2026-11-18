@@ -1,8 +1,8 @@
 {
   "name": "cs-bots",
-  "version": "0.20.2",
+  "version": "0.20.3",
   "type": "module",
-  "description": "跨团队桥 + 定向唤醒 + 升级可回滚。",
+  "description": "DSH 多智能体协作平台",
   "main": "src/index.js",
   "exports": {
     ".": "./src/index.js",
