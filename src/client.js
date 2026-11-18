@@ -781,17 +781,61 @@ window.__ModuleLoader__.load({
         window.addEventListener('keydown', onKey)
         return () => window.removeEventListener('keydown', onKey)
       }, [])
+
+      /**
+       * 点遮罩关闭 —— 用 **原生事件监听**而不是 React onClick。
+       *
+       * ## 为什么要换（2026-11-18 Boss Win 第三轮实测）
+       *
+       *   「能打开，但无法保存或取消」——弹窗出来了，里面的按钮却全点不动。
+       *
+       *   排查结论：宿主（桌面版 DSH）在 **document/body 捕获阶段**装了全局 mousedown/click
+       *   处理（窗口拖拽区域识别 `data-window-drag` 就是同一套机制）。它在捕获阶段
+       *   `stopPropagation()` 之后，React 18 **在根容器上的委托监听**就收不到事件
+       *   ⇒ 弹窗里所有 React onClick 全部静默失效，但弹窗本身（渲染）是好的。
+       *
+       *   ⇒ 兜底做法：遮罩上的点击/按下用原生 addEventListener 直接挂到 DOM 节点上。
+       *     原生监听在**目标节点**上触发，不受根容器委托的影响。
+       *     所有业务按钮本来就该走 React（它们能点），这里只保证「关得掉」这条底线。
+       */
+      const maskRef = useRef(null)
+      useEffect(() => {
+        const el = maskRef.current
+        if (!el) return undefined
+        const onDown = (e) => {
+          // 只认点在遮罩本身（不是里面的卡片）
+          if (e.target === el) closeRef.current?.()
+        }
+        el.addEventListener('mousedown', onDown, true)
+        return () => el.removeEventListener('mousedown', onDown, true)
+      }, [])
+
+      // 卡片上的原生兜底：如果连 React 事件都收不到（宿主捕获拦截），
+      // 至少保证 × 按钮能用 —— 通过原生监听直接读 data 属性判断是不是关闭按钮。
+      useEffect(() => {
+        const el = maskRef.current
+        if (!el) return undefined
+        const onUp = (e) => {
+          const hit = e.target && e.target.closest && e.target.closest('[data-csb-close]')
+          if (hit && el.contains(hit)) closeRef.current?.()
+        }
+        el.addEventListener('click', onUp, true)
+        return () => el.removeEventListener('click', onUp, true)
+      }, [])
+
       const node = h('div', {
         className: 'csb-mask',
-        onClick: (e) => {
-          // 只有点在遮罩本身（不是里面的卡片）才关 —— 用 currentTarget 判断最稳
-          if (e.target === e.currentTarget) closeRef.current?.()
-        },
+        ref: maskRef,
       },
       h('div', { className: `csb-modal${wide ? ' csb-modal-w' : ''}` },
         h('div', { className: 'csb-mhead' },
           h('h3', null, title),
-          h('button', { className: 'csb-btn-x', onClick: () => closeRef.current?.(), 'aria-label': '关闭' }, '×')),
+          h('button', {
+            className: 'csb-btn-x',
+            'data-csb-close': '1',   // 原生兜底监听读它
+            onClick: () => closeRef.current?.(),
+            'aria-label': '关闭',
+          }, '×')),
         h('div', { className: 'csb-mbody' }, children),
         footer ? h('div', { className: 'csb-mfoot' }, footer) : null))
       // document 不存在时（SSR/测试环境）退回普通渲染

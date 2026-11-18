@@ -210,8 +210,9 @@ test('★0.20.5 弹窗 ESC 监听只绑一次，通过 ref 调最新回调', () 
 })
 
 test('★0.20.5 遮罩只在点遮罩本身时关闭', () => {
+  // 0.20.6 起改成原生监听：判据从 e.currentTarget 换成 e.target === 遮罩元素本身
   const body = fnBody(CLIENT, 'function Modal(')
-  assert.match(body, /e\.target === e\.currentTarget/, '只认点在遮罩本身')
+  assert.match(body, /e\.target === el/, '只认点在遮罩本身（不是里面的卡片）')
 })
 
 test('★0.20.5 保存结果渲染在弹窗内部，不在被遮住的页面上', () => {
@@ -227,4 +228,14 @@ test('★0.20.5 保存结果渲染在弹窗内部，不在被遮住的页面上'
 test('★0.20.5 保存前做前端自查（空名/分隔符/重名）', () => {
   const save = fnBody(CLIENT, 'const saveDepts = async')
   assert.match(save, /含路径分隔符|名字是空的|重复了/, '本地先拦常见错误')
+})
+
+// ── 0.20.6：宿主捕获阶段拦截时，弹窗仍必须关得掉 ────────────────────────────
+test('★0.20.6 弹窗关闭走原生监听（不受宿主根容器事件委托影响）', () => {
+  const body = fnBody(CLIENT, 'function Modal(')
+  assert.match(body, /addEventListener\('mousedown'/, '遮罩用原生 mousedown 兜底')
+  assert.match(body, /addEventListener\('click'/, '× 按钮用原生 click 兜底')
+  assert.match(body, /removeEventListener\('mousedown'/, '必须清理监听')
+  assert.match(body, /data-csb-close/, '× 按钮带原生监听可识别的标记')
+  assert.match(body, /ref: maskRef/, '遮罩要有 ref 供原生绑定')
 })
