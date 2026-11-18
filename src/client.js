@@ -757,6 +757,76 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * 文档级原生触发处理器（2026-11-18 第六轮）。
+     *
+     * ## 为什么还要再兜一层
+     *
+     *   Boss 第六轮实测：「第 3 步点击没反应」——按下记住 + 抬起执行**仍然无效**。
+     *   说明问题不在「click 命中漂移」，而在更根本的地方：**那次鼠标点击的
+     *   mousedown/mouseup 压根没有到达我们的元素**（否则前一版就该生效）。
+     *
+     *   已经确认的事实链路：
+     *     · 遮罩和卡片都是 `position:fixed`，z-index 够高 ⇒ 视觉遮挡不是原因
+     *     · 宿主在 mousedown 阶段有窗口拖拽/重排机制
+     *     · Boss 的 Console 里 **没有任何报错** ⇒ 不是 JS 异常中断
+     *
+     * ## 做法：把处理器挂到 document，而不是挂到弹窗自身
+     *
+     *   1. `mousedown`（capture）若命中 `[data-csb-close]`/`[data-csb-act]`，
+     *      记下「点的是哪个按钮」
+     *   2. `mouseup`（capture）**无论落在哪个元素上**，只要上一次 mousedown
+     *      记下过按钮，就执行它 —— 这样即使 mouseup 被重排漂到别处也照样生效
+     *   3. `click`（capture）再兜一次
+     *   三个阶段任一命中都算数，且**同一次点击只执行一次**（用时间戳去重）。
+     *
+     * 所有绑定都用 `capture: true` 挂在 document 上，抢在任何宿主处理器之前。
+     */
+    function installNativeTrigger() {
+      try {
+        if (typeof document === 'undefined' || document.__csbNativeTrigger) return
+        document.__csbNativeTrigger = true
+        const CLOSE = '[data-csb-close], .csb-btn-x'
+        const ACT = '[data-csb-act]'
+        const pickAny = (t) => {
+          if (!t || typeof t.closest !== 'function') return null
+          return t.closest(CLOSE) ?? t.closest(ACT)
+        }
+        const fire = (el) => {
+          if (!el || !document.contains(el)) return
+          const now = Date.now()
+          const last = document.__csbLastFire ?? 0
+          if (now - last < 250) return              // 同一次点击只执行一次
+          document.__csbLastFire = now
+          try {
+            const act = el.getAttribute?.('data-csb-act')
+            if (act) {
+              const fn = el.__csbAct
+              if (typeof fn === 'function') fn()
+              else el.dispatchEvent(new CustomEvent('csb-act', { bubbles: false }))
+              return
+            }
+            // 关闭类：走它自己的 click 处理器（若可用），否则派发一次 click
+            if (typeof el.__csbClose === 'function') el.__csbClose()
+            else el.click?.()
+          } catch (e) {
+            try { (window.__csbModalDiag ??= {}).fireError = String(e?.message ?? e) } catch {}
+          }
+        }
+        let armed = null
+        document.addEventListener('mousedown', (e) => { armed = pickAny(e.target) }, true)
+        document.addEventListener('mouseup', (e) => {
+          const el = pickAny(e.target) ?? armed
+          armed = null
+          fire(el)
+        }, true)
+        document.addEventListener('click', (e) => {
+          const el = pickAny(e.target)
+          if (el) fire(el)
+        }, true)
+      } catch {}
+    }
+
+    /**
      * 事件系统探针（2026-11-18 第四轮，Boss：「按 Esc 也关不掉」）。
      *
      * ## 为什么要这个东西
@@ -928,11 +998,30 @@ window.__ModuleLoader__.load({
         }
       }, [])
 
+      // 给关闭/动作元素挂上「可被文档级处理器直接调用」的函数引用。
+      // 这样即使 React 的 onClick 完全收不到事件，document 上的原生处理器也能触发同一动作。
+      useEffect(() => {
+        const el = maskRef.current
+        if (!el) return undefined
+        const tag = () => {
+          el.querySelectorAll('[data-csb-close], .csb-btn-x').forEach((n) => { n.__csbClose = () => closeRef.current?.() })
+          el.querySelectorAll('[data-csb-act]').forEach((n) => {
+            const name = n.getAttribute('data-csb-act')
+            const fn = actions?.[name]
+            if (typeof fn === 'function') n.__csbAct = fn
+          })
+        }
+        tag()
+        // footer 可能在首个 effect 之后才渲染，补一次
+        const t = setTimeout(tag, 0)
+        return () => clearTimeout(t)
+      }, [actions])
+
       const node = h('div', {
         className: 'csb-mask',
         ref: maskRef,
       },
-      h('div', { className: `csb-modal${wide ? ' csb-modal-w' : ''}` },
+      h('div', { className: `csb-modal${wide ? ' csb-modal-w' : ''}`, 'data-csb-modal': '1' },
         h('div', { className: 'csb-mhead' },
           h('h3', null, title),
           h('button', {
@@ -3855,17 +3944,34 @@ window.__ModuleLoader__.load({
             h('div', { className: 'csb-set-d', style: { marginBottom: 16 } },
               '部门是 Bot 的分组容器：每个 Bot 会落在「主目录 / 部门 / Bot名」下，'
               + '同一部门的 Bot 共享一个群聊，你可以在群里直接派活。'),
-            h('button', {
-              className: 'csb-btn csb-btn-p',
-              // 空状态：本来就没有部门，重置成一行空行是**正确**行为（不是 bug）。
-              onClick: () => { setDeptDraft([{ id: '', name: '' }]); setManageOpen(true) },
-            }, '＋ 新建第一个部门')),
+            h('div', { className: 'csb-bar', style: { justifyContent: 'center' } },
+              h('button', {
+                className: 'csb-btn csb-btn-p',
+                // 空状态：本来就没有部门，重置成一行空行是**正确**行为（不是 bug）。
+                onClick: () => { setDeptDraft([{ id: '', name: '' }]); setManageOpen(true) },
+              }, '＋ 新建第一个部门'),
+              // 2026-11-18 Boss：空状态下也要能导入/导出
+              //   —— 否则「新机器什么都没有」时，唯一的救回路径（导入备份包）恰恰不可达。
+              h('button', { className: 'csb-btn', onClick: () => setImportOpen(true) }, '⬆ 导入'),
+              h('button', { className: 'csb-btn', onClick: () => setExportOpen(true) }, '⬇ 导出')),
+            h('div', { className: 'csb-set-d', style: { marginTop: 10, textAlign: 'center' } },
+              '已经有导出包（比如从另一台机器备份的）？直接点「导入」就能把部门、Bot 和档案带回来。')),
           manageOpen
             ? h(DeptManageModal, {
               draft: deptDraft, setDraft: setDeptDraft, busy: manageBusy, msg: manageMsg,
             onDismissMsg: () => setManageMsg(null),
               onSave: () => saveDepts(deptDraft),
             onClose: () => { setManageOpen(false); setManageMsg(null) },
+            })
+            : null,
+          // 空状态的导入/导出弹窗（与正常状态共用同一组件）
+          exportOpen
+            ? h(TransferExportModal, { onClose: () => setExportOpen(false) })
+            : null,
+          importOpen
+            ? h(TransferImportModal, {
+              onClose: () => setImportOpen(false),
+              onDone: () => { treeQ.reload(); rosterQ.reload(); legacyQ.reload() },
             })
             : null,
           msg ? h(Notice, { kind: msg.kind === 'ok' ? 'ok' : 'err', onClose: () => setMsg(null) }, msg.text) : null,
@@ -10336,6 +10442,8 @@ window.__ModuleLoader__.load({
       bindHost(ctx)
       // 事件探针：安装在最早期，用来抓宿主是否在底层吞掉了事件（见 installDiagProbe）
       installDiagProbe()
+      // 文档级原生触发：不依赖弹窗自身的 effect 是否挂上（见 installNativeTrigger）
+      installNativeTrigger()
       const disposers = []
       try {
         const d = installStyles()

@@ -278,3 +278,35 @@ test('★0.20.8 弹窗主按钮（取消/保存等）走 data-csb-act 原生兜�
   assert.match(dept, /'data-csb-act': 'save'/, '保存按钮带标记')
   assert.match(dept, /actions: \{ cancel: onClose, save: onSave \}/, '要把动作表交给 Modal')
 })
+
+// ── 0.20.9：文档级原生触发（不依赖弹窗自身 effect 与 React onClick）──────────
+test('★0.20.9 关闭/动作元素挂载可直接调用的函数引用', () => {
+  const body = fnBody(CLIENT, 'function Modal(')
+  assert.match(body, /__csbClose/, '关闭元素挂 __csbClose')
+  assert.match(body, /__csbAct/, '动作元素挂 __csbAct')
+  assert.match(body, /data-csb-modal/, '卡片带标记便于定位')
+})
+
+test('★0.20.9 文档级处理器三阶段兜底（mousedown/mouseup/click 全捕获）', () => {
+  assert.match(CLIENT, /function installNativeTrigger/, '要有文档级处理器')
+  const body = fnBody(CLIENT, 'function installNativeTrigger(')
+  for (const k of ['mousedown', 'mouseup', 'click']) {
+    assert.ok(body.includes(`'${k}'`), `要监听 ${k}`)
+  }
+  assert.match(body, /capture|, true\)/, '必须捕获阶段')
+  assert.match(body, /__csbLastFire/, '同一次点击只执行一次（去重）')
+  assert.match(CLIENT, /installNativeTrigger\(\)/, 'apply 里要装上')
+})
+
+// ── 0.20.9：空状态下也要能导入/导出（新机器唯一救回路径）──────────────────
+test('★0.20.9 空状态（还没有部门）也要有导入/导出入口', () => {
+  const empty = CLIENT.slice(
+    CLIENT.indexOf("if (depts.length === 0) {"),
+    CLIENT.indexOf('// ── 正常：左侧树 + 右侧详情'),
+  )
+  assert.match(empty, /'⬆ 导入'/, '空状态要有导入按钮')
+  assert.match(empty, /'⬇ 导出'/, '空状态要有导出按钮')
+  assert.match(empty, /setImportOpen\(true\)/, '按钮要真的打开导入弹窗')
+  assert.match(empty, /h\(TransferImportModal/, '空状态要渲染导入弹窗')
+  assert.match(empty, /h\(TransferExportModal/, '空状态要渲染导出弹窗')
+})
