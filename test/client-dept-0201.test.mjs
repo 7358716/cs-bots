@@ -344,3 +344,24 @@ test('★0.20.12 打开管理部门时给已有部门补 uid（否则已有行 k
   const tab = fnBody(CLIENT, 'function DeptTab(')
   assert.match(tab, /withUid\(\{ id: d\.id, name: d\.name \}\)/, '打开时统一补 uid')
 })
+
+// ── 0.20.13：footer 被正文盖住（Boss Win：取消/保存点不到）────────────────────
+test('★0.20.13 弹窗必须是 grid 三行布局（正文滚动、footer 永远可见）', () => {
+  const css = CLIENT.slice(CLIENT.indexOf('.csb-modal{'), CLIENT.indexOf('.csb-modal{') + 400)
+  assert.match(css, /display:grid/, '卡片用 grid')
+  assert.match(css, /grid-template-rows:auto minmax\(0,1fr\) auto/, '三行：头/正文/脚')
+  assert.match(css, /overflow:hidden/, '卡片自身不滚')
+})
+
+test('★0.20.13 footer 必须独立背景 + 高层级，不能被正文压下', () => {
+  const css = CLIENT.slice(CLIENT.indexOf('.csb-mfoot{'), CLIENT.indexOf('.csb-mfoot{') + 300)
+  assert.match(css, /z-index:2/, 'footer 层级高于正文')
+  assert.match(css, /background:var\(--dsw-alias-bg-layer-2\)/, 'footer 有不透明背景')
+  assert.match(css, /border-top/, '有分隔线')
+})
+
+test('★0.20.13 正文必须 min-height:0（grid 子项默认 auto 会撑破容器）', () => {
+  const css = CLIENT.slice(CLIENT.indexOf('.csb-mbody{'), CLIENT.indexOf('.csb-mbody{') + 200)
+  assert.match(css, /min-height:0/, '正文要能收缩')
+  assert.match(css, /overflow-y:auto/, '正文自己滚')
+})

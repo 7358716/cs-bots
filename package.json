@@ -1,6 +1,6 @@
 {
   "name": "cs-bots",
-  "version": "0.20.12",
+  "version": "0.20.13",
   "type": "module",
   "description": "DSH 多智能体协作平台",
   "main": "src/index.js",

@@ -304,7 +304,11 @@ window.__ModuleLoader__.load({
 .csb-mask{position:fixed;inset:0;z-index:2147483000;display:flex;align-items:center;justify-content:center;
   padding:24px;background:color-mix(in srgb,#000 34%,transparent)}
 .csb-mask-r{align-items:stretch;justify-content:flex-end;padding:0}
-.csb-modal{width:min(520px,100%);max-height:calc(100vh - 48px);display:flex;flex-direction:column;
+/* 2026-11-18 Boss Win：footer 的「取消/保存」被正文盖住 —— 正文滚出可见区后压到 footer 上。
+   改成 grid 三行（auto / 1fr / auto）：正文独占 1fr 并在内部滚动，footer 永远在自己的行里。
+   ⚠️ grid 子项默认 min-height:auto 会撑破容器，正文必须显式 min-height:0。 */
+.csb-modal{width:min(520px,100%);max-height:calc(100vh - 48px);display:grid;
+  grid-template-rows:auto minmax(0,1fr) auto;overflow:hidden;
   border-radius:16px;border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-2)}
 .csb-modal-w{width:min(760px,100%)}
 .csb-drawer{width:min(660px,100%);height:100%;display:flex;flex-direction:column;
@@ -312,8 +316,9 @@ window.__ModuleLoader__.load({
 .csb-mhead{flex:none;display:flex;align-items:center;gap:10px;padding:14px 18px;
   border-bottom:1px solid var(--dsw-alias-border-l1)}
 .csb-mhead h3{margin:0;font-size:14px;font-weight:600;flex:1}
-.csb-mbody{flex:1;overflow-y:auto;padding:16px 18px;min-height:0}
-.csb-mfoot{flex:none;display:flex;gap:8px;justify-content:flex-end;padding:12px 18px;
+.csb-mbody{overflow-y:auto;overflow-x:hidden;padding:16px 18px;min-height:0;position:relative;z-index:0}
+.csb-mfoot{display:flex;gap:8px;justify-content:flex-end;padding:12px 18px;
+  position:relative;z-index:2;background:var(--dsw-alias-bg-layer-2);
   border-top:1px solid var(--dsw-alias-border-l1)}
 
 .csb-kv{display:grid;grid-template-columns:110px 1fr;gap:8px 14px;font-size:12.5px;margin-bottom:16px}
@@ -837,7 +842,7 @@ window.__ModuleLoader__.load({
           lastEvent: d.last ?? null,
           escSeen: d.escSeen === true,
           events: Array.isArray(d.events) ? d.events.slice(-6) : [],
-          version: '0.20.12',
+          version: '0.20.13',
           ...extra,
         })
         // eslint-disable-next-line no-console
