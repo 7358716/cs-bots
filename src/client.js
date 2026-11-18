@@ -25,6 +25,10 @@ window.__ModuleLoader__.load({
     Object.defineProperty(exports, Symbol.toStringTag, { value: 'Module' })
 
     const React = require('react')
+    // react-dom 只用来把弹窗挂到 body（见 Modal 注释：祖先带 transform 会让 fixed 失效）
+    // ⚠️ 用 try 包住：老宿主若没暴露 react-dom，弹窗退回普通渲染，不能让整页白屏。
+    let ReactDOM = null
+    try { ReactDOM = require('react-dom') } catch { ReactDOM = null }
     const h = React.createElement
     const { useState, useEffect, useCallback, useRef } = React
 
@@ -297,7 +301,7 @@ window.__ModuleLoader__.load({
 @keyframes csb-sk{0%{background-position:100% 0}100%{background-position:0 0}}
 
 /* 弹窗与抽屉 */
-.csb-mask{position:fixed;inset:0;z-index:60;display:flex;align-items:center;justify-content:center;
+.csb-mask{position:fixed;inset:0;z-index:2147483000;display:flex;align-items:center;justify-content:center;
   padding:24px;background:color-mix(in srgb,#000 34%,transparent)}
 .csb-mask-r{align-items:stretch;justify-content:flex-end;padding:0}
 .csb-modal{width:min(520px,100%);max-height:calc(100vh - 48px);display:flex;flex-direction:column;
@@ -752,18 +756,47 @@ window.__ModuleLoader__.load({
       } catch { return Promise.resolve(false) }
     }
 
-    /** 站内弹窗：**取代 window.confirm**（沙箱里 confirm 被静默屏蔽）。 */
+    /**
+     * 弹窗：**取代 window.confirm**（沙箱里 confirm 被静默屏蔽）。
+     *
+     * ## 2026-11-18 Boss Win 实测两处修复（0.20.5）
+     *
+     *   「点击取消不能关掉，后来又能进了」「点击保存没反应」
+     *
+     *   ① **渲染到 body**：原来直接 `return h('div.csb-mask')`，它会挂在当前组件的位置上。
+     *      只要祖先有 `transform` / `overflow:hidden` / `position:relative`，`position:fixed`
+     *      的遮罩就不再覆盖全屏 —— 点击落在祖先上，「按钮没反应」就是这么来的。
+     *      改用 `createPortal(..., document.body)` 保证覆盖整屏、点击不被任何祖先截走。
+     *   ② **ESC 监听不再依赖 onClose 的引用**：原来 `useEffect(..., [onClose])`，
+     *      而 `onClose` 是每次渲染都新建的箭头函数 ⇒ 每次重渲染都解绑重绑。
+     *      用户恰好在那一下按 ESC / 点遮罩，事件就丢了（「有时能关有时不能」）。
+     *      现在监听只绑一次，通过 ref 调最新回调。
+     */
     function Modal({ title, wide, onClose, footer, children }) {
+      const closeRef = useRef(onClose)
+      // ⚠️ 在 effect 里同步最新回调，而不是在 render 期间赋值（后者在并发渲染下不可靠）
+      useEffect(() => { closeRef.current = onClose }, [onClose])
       useEffect(() => {
-        const onKey = (e) => e.key === 'Escape' && onClose?.()
+        const onKey = (e) => { if (e.key === 'Escape') closeRef.current?.() }
         window.addEventListener('keydown', onKey)
         return () => window.removeEventListener('keydown', onKey)
-      }, [onClose])
-      return h('div', { className: 'csb-mask', onClick: (e) => e.target === e.currentTarget && onClose?.() },
-        h('div', { className: `csb-modal${wide ? ' csb-modal-w' : ''}` },
-          h('div', { className: 'csb-mhead' }, h('h3', null, title), h('button', { className: 'csb-btn-x', onClick: onClose, 'aria-label': '关闭' }, '×')),
-          h('div', { className: 'csb-mbody' }, children),
-          footer ? h('div', { className: 'csb-mfoot' }, footer) : null))
+      }, [])
+      const node = h('div', {
+        className: 'csb-mask',
+        onClick: (e) => {
+          // 只有点在遮罩本身（不是里面的卡片）才关 —— 用 currentTarget 判断最稳
+          if (e.target === e.currentTarget) closeRef.current?.()
+        },
+      },
+      h('div', { className: `csb-modal${wide ? ' csb-modal-w' : ''}` },
+        h('div', { className: 'csb-mhead' },
+          h('h3', null, title),
+          h('button', { className: 'csb-btn-x', onClick: () => closeRef.current?.(), 'aria-label': '关闭' }, '×')),
+        h('div', { className: 'csb-mbody' }, children),
+        footer ? h('div', { className: 'csb-mfoot' }, footer) : null))
+      // document 不存在时（SSR/测试环境）退回普通渲染
+      const canPortal = Boolean(ReactDOM?.createPortal) && typeof document !== 'undefined' && document.body
+      return canPortal ? ReactDOM.createPortal(node, document.body) : node
     }
 
     /** 抽屉（右侧滑出，用于详情）。 */
@@ -3400,6 +3433,8 @@ window.__ModuleLoader__.load({
       const [manageOpen, setManageOpen] = useState(false)
       const [deptDraft, setDeptDraft] = useState([])
       const [manageBusy, setManageBusy] = useState(false)
+      // 弹窗内的保存结果（0.20.5：错误必须出现在弹窗里，不能落在被它遮住的页面上）
+      const [manageMsg, setManageMsg] = useState(null)
       // 安排工作
       // `fromBotId` = 用户是点哪个 Bot 进来的。默认值只认它，不再用 dept.bots[0]。
       const [assignOpen, setAssignOpen] = useState(false)
@@ -3467,18 +3502,44 @@ window.__ModuleLoader__.load({
       const checkedIds = Object.keys(checked).filter((k) => checked[k])
 
       // 建部门 / 删部门 / 改名 都走同一个端点（它自带「有 Bot 不许删」保护）
+      /**
+       * 保存部门。
+       *
+       * ## 2026-11-18 Boss：「点击保存没反应」的真实原因
+       *
+       *   原来的 catch 把错误 `setMsg(...)` 送去了**部门页面**上，
+       *   而管理弹窗还盖在最上层 —— **弹窗盖住了自己的报错**，
+       *   用户看到的就是「点了没反应」。后端到底说了什么，他一个字都看不到。
+       *
+       * ⇒ 现在结果写进 `manageMsg`，渲染在弹窗内部顶部；成功也留在弹窗里给确认。
+       */
       const saveDepts = async (list) => {
+        // 前端先自查一遍，能本地拦住的就别发请求（发出去也只会 400）
+        const bad = []
+        const seen = new Set()
+        for (const d of list) {
+          const name = String(d?.name ?? '').trim()
+          if (!name) { bad.push('有部门名字是空的'); continue }
+          if (/[/\\]/.test(name)) { bad.push(`「${name}」含路径分隔符`); continue }
+          if (seen.has(name)) bad.push(`「${name}」重复了`)
+          seen.add(name)
+        }
+        if (bad.length) { setManageMsg({ kind: 'err', text: bad.join('；') }); return }
+
         setManageBusy(true)
-        setMsg(null)
+        setManageMsg(null)
         try {
           const r = await call('/departments/save', { method: 'POST', body: { departments: list, by: 'ui' } })
-          if (r.warnings?.length) setMsg({ kind: 'err', text: r.warnings.join('；') })
-          else setMsg({ kind: 'ok', text: '部门已保存' })
-          setManageOpen(false)
+          if (r.warnings?.length) {
+            setManageMsg({ kind: 'err', text: r.warnings.join('；') })
+          } else {
+            setManageMsg({ kind: 'ok', text: '部门已保存' })
+          }
           treeQ.reload()
           rosterQ.reload()
         } catch (e) {
-          setMsg({ kind: 'err', text: `保存部门失败：${e.message}` })
+          // 后端错误原样显示（含 hint/原因），绝不吞
+          setManageMsg({ kind: 'err', text: `保存失败：${e.message}` })
         } finally {
           setManageBusy(false)
         }
@@ -3652,8 +3713,10 @@ window.__ModuleLoader__.load({
             }, '＋ 新建第一个部门')),
           manageOpen
             ? h(DeptManageModal, {
-              draft: deptDraft, setDraft: setDeptDraft, busy: manageBusy,
-              onSave: () => saveDepts(deptDraft), onClose: () => setManageOpen(false),
+              draft: deptDraft, setDraft: setDeptDraft, busy: manageBusy, msg: manageMsg,
+            onDismissMsg: () => setManageMsg(null),
+              onSave: () => saveDepts(deptDraft),
+            onClose: () => { setManageOpen(false); setManageMsg(null) },
             })
             : null,
           msg ? h(Notice, { kind: msg.kind === 'ok' ? 'ok' : 'err', onClose: () => setMsg(null) }, msg.text) : null,
@@ -3715,7 +3778,7 @@ window.__ModuleLoader__.load({
           h('div', { className: 'csb-bar', style: { marginTop: 8 } },
             h('button', {
               className: 'csb-btn csb-btn-s',
-              onClick: () => { setDeptDraft(depts.map((d) => ({ id: d.id, name: d.name }))); setManageOpen(true) },
+              onClick: () => { setManageMsg(null); setDeptDraft(depts.map((d) => ({ id: d.id, name: d.name }))); setManageOpen(true) },
             }, '⚙ 管理部门'),
             h('button', {
               className: 'csb-btn csb-btn-s',
@@ -3723,7 +3786,7 @@ window.__ModuleLoader__.load({
               //    保存时提交的列表里没有任何已有部门 ⇒ 后端当成「删掉全部部门」
               //    ⇒ 报「部门「开发部」还有 14 个 Bot」，用户完全看不懂。
               //    现在：打开弹窗时**带上现有部门**并追加一行空行。
-              onClick: () => { setDeptDraft([...depts.map((d) => ({ id: d.id, name: d.name })), { id: '', name: '' }]); setManageOpen(true) },
+              onClick: () => { setManageMsg(null); setDeptDraft([...depts.map((d) => ({ id: d.id, name: d.name })), { id: '', name: '' }]); setManageOpen(true) },
             }, '＋ 新建')),
           // 导入导出（2026-11-16 Boss：都要有确认页）
           h('div', { className: 'csb-bar', style: { marginTop: 6 } },
@@ -4209,7 +4272,7 @@ window.__ModuleLoader__.load({
      *   每次只挂一个顶层 Modal，不存在嵌套，也就不可能再卡死。
      */
     function DeptManageModal({
-      draft, setDraft, busy, onSave, onClose,
+      draft, setDraft, busy, onSave, onClose, msg, onDismissMsg,
       bots = [], orphanedBots = [], deptBotsOf, onRequestDelete, onManageMembers,
     }) {
       const upd = (i, patch) => {
@@ -4234,6 +4297,11 @@ window.__ModuleLoader__.load({
             busy ? '保存中…' : '保存'),
         ],
       },
+      // ⚠️ 保存结果必须显示在**弹窗内部**（0.20.5）：原来它渲染在页面上，
+      //    被这个弹窗整个盖住 ⇒ 用户看到的是「保存没反应」。
+      msg
+        ? h(Notice, { kind: msg.kind, onClose: () => onDismissMsg?.() }, msg.text)
+        : null,
       h('div', { className: 'csb-set-d', style: { marginBottom: 10 } },
         '部门名就是目录名（建在主目录下）。删除前会先校验：里面还有 Bot 会被拦住，没有 Bot 才会删，且磁盘目录不会被删。'),
       draft.length === 0

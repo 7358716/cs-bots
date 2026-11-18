@@ -191,3 +191,40 @@ test('★0.20.3 管理部门弹窗必须有可用的关闭路径（取消按钮 
   assert.match(body, /'取消'/, '必须有取消按钮')
   assert.match(body, /'保存'/, '必须有保存按钮')
 })
+
+// ── 0.20.5 回归：弹窗必须挂到 body、ESC 稳定、保存结果在弹窗里 ────────────────
+test('★0.20.5 弹窗用 createPortal 挂到 body（祖先带 transform/overflow 也不会点不到）', () => {
+  const body = fnBody(CLIENT, 'function Modal(')
+  assert.match(body, /ReactDOM\.createPortal/, '必须 portal 到 body')
+  assert.match(body, /document\.body/, '容器是 document.body')
+  assert.match(CLIENT, /require\('react-dom'\)/, 'react-dom 由宿主模块表提供（已核实）')
+})
+
+test('★0.20.5 弹窗 ESC 监听只绑一次，通过 ref 调最新回调', () => {
+  const body = fnBody(CLIENT, 'function Modal(')
+  assert.match(body, /closeRef\.current = onClose/, '回调存 ref')
+  assert.match(body, /\[\]\)/, 'ESC 监听的依赖是空数组（只绑一次）')
+  // 同步 ref 的那个 effect 用 [onClose] 是对的；错的是把 ESC 监听依赖写成 [onClose]
+  const esc = body.slice(body.indexOf("window.addEventListener('keydown'"))
+  assert.ok(!/\}, \[onClose\]\)/.test(esc), 'ESC 监听的依赖不能是 [onClose]')
+})
+
+test('★0.20.5 遮罩只在点遮罩本身时关闭', () => {
+  const body = fnBody(CLIENT, 'function Modal(')
+  assert.match(body, /e\.target === e\.currentTarget/, '只认点在遮罩本身')
+})
+
+test('★0.20.5 保存结果渲染在弹窗内部，不在被遮住的页面上', () => {
+  const body = fnBody(CLIENT, 'function DeptManageModal(')
+  assert.match(body, /\bmsg\b/, '弹窗要接 msg')
+  assert.match(body, /h\(Notice, \{ kind: msg\.kind/, '在弹窗顶部渲染结果')
+  // 原来 catch 里写 setMsg(...) 会把错误送去页面
+  const save = fnBody(CLIENT, 'const saveDepts = async')
+  assert.match(save, /setManageMsg\(\{ kind: 'err'/, '错误要进弹窗状态')
+  assert.ok(!/catch \(e\) \{\s*setMsg\(\{ kind: 'err', text: `保存部门失败/.test(save), '不许再把保存错误写到页面')
+})
+
+test('★0.20.5 保存前做前端自查（空名/分隔符/重名）', () => {
+  const save = fnBody(CLIENT, 'const saveDepts = async')
+  assert.match(save, /含路径分隔符|名字是空的|重复了/, '本地先拦常见错误')
+})
