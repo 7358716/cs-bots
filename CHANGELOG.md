@@ -13,6 +13,22 @@
 
 ---
 
+## [0.20.7] - 2026-11-18
+
+Boss：「不能关，没有反应」「按 Esc 也关不掉」
+
+### Changed
+
+- **停止猜测，先取证**：三代修复（portal / ref / 原生监听）都没解决，说明此前一直在
+  推测宿主拦截机制而没有拿到事实。本版在插件最早期装一个**底层事件探针**
+  （`installDiagProbe`），在 `document` 捕获阶段记录 `pointerdown / mousedown / click / keydown`，
+  结果挂到 `window.__csbModalDiag`，用户一行命令即可拷回。
+
+### Fixed
+
+- **ESC 监听提到捕获阶段**：`document` + `window` 双绑 `capture: true`。
+  若宿主在冒泡前拦截，捕获阶段仍有机会拿到；同时把「ESC 是否真的到达」记进探针。
+
 ## [0.20.6] - 2026-11-18
 
 Boss（Win 第三轮）：「能打开，但无法保存或取消，第2步不行」

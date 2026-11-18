@@ -239,3 +239,21 @@ test('★0.20.6 弹窗关闭走原生监听（不受宿主根容器事件委托�
   assert.match(body, /data-csb-close/, '× 按钮带原生监听可识别的标记')
   assert.match(body, /ref: maskRef/, '遮罩要有 ref 供原生绑定')
 })
+
+// ── 0.20.7：Esc 也关不掉 ⇒ 上探针 + 捕获阶段监听 ────────────────────────────
+test('★0.20.7 ESC 监听必须在捕获阶段（宿主在冒泡阶段前拦截时仍能收到）', () => {
+  const body = fnBody(CLIENT, 'function Modal(')
+  assert.match(body, /document\.addEventListener\('keydown', onKey, true\)/, 'document 捕获监听')
+  assert.match(body, /window\.addEventListener\('keydown', onKey, true\)/, 'window 捕获监听')
+  assert.match(body, /__csbModalDiag/, '记录是否真的收到 ESC，便于一次定位')
+})
+
+test('★0.20.7 装了底层事件探针（区分「事件没到」还是「回调没跑」）', () => {
+  assert.match(CLIENT, /function installDiagProbe/, '要有探针函数')
+  const body = fnBody(CLIENT, 'function installDiagProbe(')
+  for (const k of ['pointerdown', 'mousedown', 'click', 'keydown']) {
+    assert.ok(body.includes(`'${k}'`), `要监听 ${k}`)
+  }
+  assert.match(body, /__csbModalDiag/, '结果挂到 window.__csbModalDiag')
+  assert.match(CLIENT, /installDiagProbe\(\)/, 'apply 里要真正装上')
+})

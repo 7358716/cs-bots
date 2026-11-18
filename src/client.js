@@ -757,6 +757,51 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * 事件系统探针（2026-11-18 第四轮，Boss：「按 Esc 也关不掉」）。
+     *
+     * ## 为什么要这个东西
+     *
+     *   三代修复都没解决，说明我一直在**猜**宿主的拦截机制，而没有拿到事实。
+     *   现在装一个最底层的探针：在 document 捕获阶段记录
+     *     · 有没有收到 pointerdown / mousedown / click / keydown
+     *     · 每次目标元素是什么
+     *   结果挂在 `window.__csbModalDiag`，用户在控制台一行命令就能拷回来。
+     *
+     *   有了事实才能判断是三类中的哪一种：
+     *     A 事件根本没到 DOM      → 宿主在更底层（浏览器/Electron 层）拦了
+     *     B 事件到了但 React 没响应 → 委托被截断（我们已用原生兜底，应已解决）
+     *     C 事件到了、回调也跑了、但状态没变 → 组件被重置/重新挂载
+     *
+     * 只在插件启用时装一次，开销是 4 个监听，可忽略。
+     */
+    function installDiagProbe() {
+      try {
+        if (typeof window === 'undefined' || typeof document === 'undefined') return
+        if (window.__csbDiagInstalled) return
+        window.__csbDiagInstalled = true
+        const rec = (kind) => (e) => {
+          try {
+            const d = window.__csbModalDiag ?? (window.__csbModalDiag = {})
+            const t = e.target
+            d.events = Array.isArray(d.events) ? d.events : []
+            d.events.push({
+              kind,
+              tag: t?.tagName ?? '?',
+              cls: typeof t?.className === 'string' ? t.className.slice(0, 40) : '',
+              phase: e.eventPhase,
+              at: Date.now(),
+            })
+            if (d.events.length > 40) d.events = d.events.slice(-40)
+            d.last = kind
+          } catch {}
+        }
+        for (const k of ['pointerdown', 'mousedown', 'click', 'keydown']) {
+          document.addEventListener(k, rec(k), true)
+        }
+      } catch {}
+    }
+
+    /**
      * 弹窗：**取代 window.confirm**（沙箱里 confirm 被静默屏蔽）。
      *
      * ## 2026-11-18 Boss Win 实测两处修复（0.20.5）
@@ -776,10 +821,28 @@ window.__ModuleLoader__.load({
       const closeRef = useRef(onClose)
       // ⚠️ 在 effect 里同步最新回调，而不是在 render 期间赋值（后者在并发渲染下不可靠）
       useEffect(() => { closeRef.current = onClose }, [onClose])
+      // ⚠️ 2026-11-18 第四轮：Boss 实测「按 Esc 也关不掉」。
+      //    说明连 window 上的键盘监听都没收到 ⇒ 宿主可能在**捕获阶段**就把
+      //    键盘事件吞了/重定向了。改用 document 捕获阶段 + 阻止后续处理器，
+      //    并把监听到的事实写进 window.__csbModalDiag，便于一次拷回根因。
       useEffect(() => {
-        const onKey = (e) => { if (e.key === 'Escape') closeRef.current?.() }
-        window.addEventListener('keydown', onKey)
-        return () => window.removeEventListener('keydown', onKey)
+        const onKey = (e) => {
+          if (e.key !== 'Escape' && e.code !== 'Escape') return
+          try {
+            const w = typeof window !== 'undefined' ? window : null
+            if (w) {
+              w.__csbModalDiag = { ...(w.__csbModalDiag ?? {}), escSeen: true, escAt: Date.now() }
+            }
+          } catch {}
+          closeRef.current?.()
+        }
+        // capture: true ⇒ 抢在宿主冒泡处理之前拿到
+        document.addEventListener('keydown', onKey, true)
+        window.addEventListener('keydown', onKey, true)
+        return () => {
+          document.removeEventListener('keydown', onKey, true)
+          window.removeEventListener('keydown', onKey, true)
+        }
       }, [])
 
       /**
@@ -10227,6 +10290,8 @@ window.__ModuleLoader__.load({
 
     function apply(ctx) {
       bindHost(ctx)
+      // 事件探针：安装在最早期，用来抓宿主是否在底层吞掉了事件（见 installDiagProbe）
+      installDiagProbe()
       const disposers = []
       try {
         const d = installStyles()
