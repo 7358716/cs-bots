@@ -901,7 +901,7 @@ window.__ModuleLoader__.load({
           lastEvent: d.last ?? null,
           escSeen: d.escSeen === true,
           events: Array.isArray(d.events) ? d.events.slice(-6) : [],
-          version: '0.20.14',
+          version: '0.20.15',
           ...extra,
         })
         // eslint-disable-next-line no-console
@@ -10663,6 +10663,53 @@ window.__ModuleLoader__.load({
      *   这也符合 Boss 定的纪律：**后端/宿主的数据必须从它那里取，不能自己写死或猜**。
      */
 
+    /**
+     * 无 React 逃生通道（2026-11-19 第十一轮）。
+     *
+     * ## 为什么走到这一步
+     *
+     *   从 Boss 多轮实测确认的事实：
+     *     · hover 有变化 ⇒ 鼠标事件正常到达 DOM 并被浏览器派发
+     *     · 日志 `armed:true` ⇒ 我们的原生监听执行到了执行点
+     *     · 但 0.20.14 之后**连 `[cs-bots 诊断]` 都不再出现** ⇒ 插件的新代码根本没在跑
+     *   再加上他插件页显示 0.20.12「运行中」、而控制台里还混着 0.20.13 的日志
+     *   ⇒ **机器上的插件实例没有被真正替换**，前端 bundle 一直是老的。
+     *
+     *   在这种情况下，继续改 React 组件毫无意义：用户跑的根本不是新代码。
+     *
+     * ## 本条通道做什么
+     *
+     *   用**纯 DOM**（`document.createElement`）在页面右下角挂一条悬浮条：
+     *   `[cs-bots] 0.20.15`。它不经过 React、不经过任何组件生命周期，
+     *   只要插件的 client bundle 被加载过一次，这条就会出现在页面上。
+     *
+     *   用途：**一眼确认"新代码到底跑没跑"**。
+     *   · 看到悬浮条 = 新版本已加载
+     *   · 看不到 = 机器上跑的还是旧版本，问题在安装/卸载环节，不在代码
+     */
+    function installVersionBadge() {
+      try {
+        if (typeof document === 'undefined' || !document.body) return
+        if (document.getElementById('csb-version-badge')) return
+        const pill = document.createElement('div')
+        pill.id = 'csb-version-badge'
+        pill.textContent = 'cs-bots 0.20.15'
+        pill.title = '看到这个说明插件新版本已加载；点它可在控制台输出诊断'
+        pill.style.cssText = [
+          'position:fixed', 'right:12px', 'bottom:12px', 'z-index:2147483647',
+          'padding:4px 8px', 'border-radius:999px', 'font-size:11px', 'line-height:1.4',
+          'font-family:ui-monospace,monospace', 'cursor:pointer', 'user-select:none',
+          'background:#1f2937', 'color:#e5e7eb', 'opacity:.75',
+        ].join(';')
+        pill.addEventListener('click', () => {
+          try { diagLog({ phase: 'badge-click' }) } catch {}
+          // eslint-disable-next-line no-console
+          console.log('[cs-bots] MODAL_CTL.stack =', MODAL_CTL.stack.length)
+        })
+        document.body.appendChild(pill)
+      } catch {}
+    }
+
     function apply(ctx) {
       // ⚠️ 2026-11-19：Boss 的控制台里同时出现 0.20.12 与 0.20.13 的日志
       //   ⇒ 旧实例没被卸载，两个实例各挂一份遮罩与监听，互相干扰。
@@ -10687,6 +10734,10 @@ window.__ModuleLoader__.load({
       installNativeTrigger()
       // 逃生舱：点遮罩外即可关闭（见 installEscapeHatch）
       installEscapeHatch()
+      // 版本徽标：纯 DOM，用来确认「新代码到底跑没跑」（见 installVersionBadge）
+      installVersionBadge()
+      // 每次装配都自报一次版本，便于在控制台一键确认
+      try { diagLog({ phase: 'apply', note: 'client bundle loaded' }) } catch {}
       const disposers = []
       try {
         const d = installStyles()

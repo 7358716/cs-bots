@@ -393,3 +393,13 @@ test('★0.20.14 装配时清理上一实例残留（防两版并存）', () => 
   assert.match(body, /querySelectorAll\('\[data-csb-mask\]'\)/, '清残留遮罩')
   assert.match(body, /__csbDiagInstalled = false/, '复位探针标记')
 })
+
+// ── 0.20.15：纯 DOM 版本徽标（用来判断新代码到底跑没跑）────────────────────
+test('★0.20.15 装配时挂一个不依赖 React 的版本徽标', () => {
+  assert.match(CLIENT, /function installVersionBadge/, '要有徽标函数')
+  const body = fnBody(CLIENT, 'function installVersionBadge(')
+  assert.match(body, /document\.createElement/, '纯 DOM 创建，不经过 React')
+  assert.match(body, /csb-version-badge/, '有稳定 id')
+  assert.match(body, /appendChild/, '挂到 body')
+  assert.match(CLIENT, /installVersionBadge\(\)/, 'apply 里要调用')
+})
