@@ -762,6 +762,59 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * 模块级弹窗控制器（2026-11-19 第十轮，Boss：「鼠标有 hover 变化但点了没反应」）。
+     *
+     * ## 为什么必须这样做
+     *
+     *   hover 有变化 ⇒ 事件到了 DOM、浏览器正常派发 ⇒ 问题**不在事件层**。
+     *   日志里 `armed:true` 也证明我们的处理器执行到了执行点。
+     *   ⇒ 那唯一剩下的可能：**执行的那个回调属于一个已经卸载的组件**，
+     *     `setState` 被 React 静默丢弃 —— 表现就是「点了没反应」。
+     *
+     *   之前几版的 `closeRef.current` / `actions[name]` 都来自 `DeptTab` 的闭包，
+     *   组件一旦重挂（两个版本实例并存、或删除行触发重排），这些闭包就指向旧组件。
+     *
+     * ## 做法
+     *
+     *   弹窗挂载时把自己的 `close()` / `save()` 注册进这个**模块级登记表**；
+     *   原生处理器只认这张表，不认任何组件闭包。
+     *   每个动作执行前后都打日志（`fired` / `threw`），把执行链路变成可观测的。
+     */
+    const MODAL_CTL = {
+      stack: [],          // 当前挂载的弹窗（按挂载顺序）
+      register(id, handle) {
+        this.stack = this.stack.filter((x) => x.id !== id)
+        this.stack.push({ id, ...handle })
+        return () => { this.stack = this.stack.filter((x) => x.id !== id) }
+      },
+      top() {
+        return this.stack.length ? this.stack[this.stack.length - 1] : null
+      },
+      /** 执行一个动作，并把结果写进诊断（成功/抛错都要看得见）。 */
+      fire(kind) {
+        const t = this.top()
+        const diag = (typeof window !== 'undefined') ? (window.__csbModalDiag ??= {}) : {}
+        diag.fired = Array.isArray(diag.fired) ? diag.fired : []
+        if (!t) {
+          diag.fired.push({ kind, stack: 0, at: Date.now() })
+          diagLog({ phase: 'fire-no-modal', kind })
+          return false
+        }
+        try {
+          if (kind === 'close') t.close?.()
+          else t.act?.(kind)
+          diag.fired.push({ kind, ok: true, at: Date.now() })
+          diagLog({ phase: 'fired', kind, ok: true })
+          return true
+        } catch (e) {
+          diag.fired.push({ kind, ok: false, err: String(e?.message ?? e), at: Date.now() })
+          diagLog({ phase: 'fired', kind, ok: false, err: String(e?.message ?? e) })
+          return false
+        }
+      },
+    }
+
+    /**
      * 逃生舱（2026-11-18 第八轮）。
      *
      * ## 为什么需要它
@@ -790,7 +843,7 @@ window.__ModuleLoader__.load({
           const masks = document.querySelectorAll('[data-csb-mask]')
           const top = masks[masks.length - 1]
           if (!top) return
-          try { top.__csbCloseTop?.() } catch {}
+          try { MODAL_CTL.fire('close') } catch {}
         }, true)
       } catch {}
     }
@@ -838,11 +891,17 @@ window.__ModuleLoader__.load({
         const d = (typeof window !== 'undefined' && window.__csbModalDiag) || {}
         const line = '[cs-bots 诊断] ' + JSON.stringify({
           modalMounted: !!document.querySelector?.('[data-csb-modal]'),
-          modalCount: document.querySelectorAll?.('[data-csb-modal]')?.length ?? -1,
+          // 只数**可见**的弹窗：隐藏后代残留节点会把计数虚高，误导排查
+          modalCount: (() => {
+            try {
+              return [...document.querySelectorAll('[data-csb-mask]')].filter((n) => n.offsetParent !== null).length
+            } catch { return -1 }
+          })(),
+          ctlStack: MODAL_CTL.stack.length,
           lastEvent: d.last ?? null,
           escSeen: d.escSeen === true,
           events: Array.isArray(d.events) ? d.events.slice(-6) : [],
-          version: '0.20.13',
+          version: '0.20.14',
           ...extra,
         })
         // eslint-disable-next-line no-console
@@ -869,15 +928,8 @@ window.__ModuleLoader__.load({
           document.__csbLastFire = now
           try {
             const act = el.getAttribute?.('data-csb-act')
-            if (act) {
-              const fn = el.__csbAct
-              if (typeof fn === 'function') fn()
-              else el.dispatchEvent(new CustomEvent('csb-act', { bubbles: false }))
-              return
-            }
-            // 关闭类：走它自己的 click 处理器（若可用），否则派发一次 click
-            if (typeof el.__csbClose === 'function') el.__csbClose()
-            else el.click?.()
+            if (act) { MODAL_CTL.fire(act); return }
+            MODAL_CTL.fire('close')
           } catch (e) {
             try { (window.__csbModalDiag ??= {}).fireError = String(e?.message ?? e) } catch {}
           }
@@ -1096,6 +1148,25 @@ window.__ModuleLoader__.load({
 
       // 弹窗每次挂载都自报一次身份 —— 用来确认「用户装的确实是新版」
       useEffect(() => { diagLog({ phase: 'modal-mounted', title: String(title ?? '') }) }, [title])
+
+      /**
+       * 把本弹窗的关闭/动作注册进模块级控制器（0.20.14）。
+       *
+       * ⚠️ 这是本次修复的核心：之前的执行入口是组件闭包（closeRef / actions），
+       *    组件一旦重挂，闭包指向旧组件，setState 被丢弃 ⇒「点了没反应」。
+       *    现在原生处理器只调 MODAL_CTL.fire()，由它按「当前挂载的弹窗」取回调。
+       */
+      const modalIdRef = useRef(`m${Date.now()}${Math.random().toString(36).slice(2, 7)}`)
+      useEffect(() => {
+        const unreg = MODAL_CTL.register(modalIdRef.current, {
+          close: () => closeRef.current?.(),
+          act: (name) => {
+            const fn = actions?.[name]
+            if (typeof fn === 'function') fn()
+          },
+        })
+        return unreg
+      }, [actions])
       // 逃生舱要调用的关闭入口（见 installEscapeHatch）
       useEffect(() => {
         const el = maskRef.current
@@ -1121,11 +1192,8 @@ window.__ModuleLoader__.load({
           const n = hit(t)
           if (!n) return
           const act = n.getAttribute?.('data-csb-act')
-          if (act) {
-            const fn = actions?.[act]
-            if (typeof fn === 'function') { fn(); return }
-          }
-          closeRef.current?.()
+          if (act) { MODAL_CTL.fire(act); return }
+          MODAL_CTL.fire('close')
         }
         // 直接绑在遮罩上（冒泡阶段即可，弹窗内部点击必然经过它）
         const onUp = (e) => run(e.target)
@@ -10596,6 +10664,22 @@ window.__ModuleLoader__.load({
      */
 
     function apply(ctx) {
+      // ⚠️ 2026-11-19：Boss 的控制台里同时出现 0.20.12 与 0.20.13 的日志
+      //   ⇒ 旧实例没被卸载，两个实例各挂一份遮罩与监听，互相干扰。
+      //   这里在装配时清掉上一次实例留下的全局标记与残留遮罩（幂等，不会误删别人的）。
+      try {
+        if (typeof document !== 'undefined') {
+          for (const n of document.querySelectorAll('[data-csb-mask]')) {
+            try { n.remove() } catch {}
+          }
+        }
+        if (typeof window !== 'undefined') {
+          window.__csbDiagInstalled = false
+          if (document) document.__csbNativeTrigger = false
+          if (document) document.__csbEscapeHatch = false
+        }
+      } catch {}
+
       bindHost(ctx)
       // 事件探针：安装在最早期，用来抓宿主是否在底层吞掉了事件（见 installDiagProbe）
       installDiagProbe()

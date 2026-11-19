@@ -319,7 +319,8 @@ test('★0.20.11 点弹窗卡片以外的地方必须能关掉（不依赖按钮
   const body = fnBody(CLIENT, 'function installEscapeHatch(')
   assert.match(body, /closest\('\[data-csb-modal\]'\)/, '按在卡片内不关')
   assert.match(body, /querySelectorAll\('\[data-csb-mask\]'\)/, '找最上层弹窗')
-  assert.match(body, /__csbCloseTop/, '调用关闭入口')
+  // 0.20.14 起统一走模块级控制器，不再用元素上的 __csbCloseTop
+  assert.match(body, /MODAL_CTL\.fire\('close'\)/, '调用控制器关闭')
   assert.match(CLIENT, /installEscapeHatch\(\)/, 'apply 里要装上')
   assert.match(CLIENT, /'data-csb-mask': '1'/, '遮罩要带标记')
 })
@@ -364,4 +365,31 @@ test('★0.20.13 正文必须 min-height:0（grid 子项默认 auto 会撑破容
   const css = CLIENT.slice(CLIENT.indexOf('.csb-mbody{'), CLIENT.indexOf('.csb-mbody{') + 200)
   assert.match(css, /min-height:0/, '正文要能收缩')
   assert.match(css, /overflow-y:auto/, '正文自己滚')
+})
+
+// ── 0.20.14：执行层不再依赖组件闭包 ────────────────────────────────────────
+test('★0.20.14 弹窗动作走模块级控制器（不经过 DeptTab 闭包）', () => {
+  assert.match(CLIENT, /const MODAL_CTL = \{/, '要有模块级控制器')
+  assert.match(CLIENT, /MODAL_CTL\.register\(/, '弹窗挂载时注册')
+  const fires = (CLIENT.match(/MODAL_CTL\.fire\(/g) ?? []).length
+  assert.ok(fires >= 4, `所有原生触发都应走控制器，实际 ${fires} 处`)
+  assert.ok(!/el\.__csbClose\?\.\.\(\)/.test(CLIENT), '不再直接调元素上的闭包')
+})
+
+test('★0.20.14 fire 前后必须留痕（成功/抛错都能看见）', () => {
+  const body = fnBody(CLIENT, 'const MODAL_CTL = {')
+  assert.match(body, /diag\.fired/, '记录执行结果')
+  assert.match(body, /phase: 'fired'/, '日志里能看到 fired')
+  assert.match(body, /catch \(e\)/, '抛错也要记录，不能吞')
+})
+
+test('★0.20.14 modalCount 只数可见遮罩 + 报告控制器栈深', () => {
+  assert.match(CLIENT, /n\.offsetParent !== null/, '只数可见弹窗')
+  assert.match(CLIENT, /ctlStack: MODAL_CTL\.stack\.length/, '报告控制器栈深')
+})
+
+test('★0.20.14 装配时清理上一实例残留（防两版并存）', () => {
+  const body = fnBody(CLIENT, 'function apply(ctx)')
+  assert.match(body, /querySelectorAll\('\[data-csb-mask\]'\)/, '清残留遮罩')
+  assert.match(body, /__csbDiagInstalled = false/, '复位探针标记')
 })
