@@ -165,11 +165,12 @@ test('Bot 按部门归类的组装只有一个函数（口径唯一）', () => {
   assert.ok(body.includes(".replace(/\\\\/g, '/')"), '要先归一分隔符再比（Win 的反斜杠）')
 })
 // ── 0.20.3 回归：Modal 不许嵌套（0.20.2 卡死的根因）─────────────────────────
-test('★0.20.3 部门管理弹窗里不许再出现第二个 Modal（会导致弹窗套弹窗卡死）', () => {
+test('★0.20.18 部门管理改为侧边抽屉：只返回一个 Drawer，内部不出现 Modal', () => {
   const body = fnBody(CLIENT, 'function DeptManageModal(')
+  const drawers = body.match(/h\(Drawer/g) ?? []
   const modals = body.match(/h\(Modal/g) ?? []
-  assert.equal(modals.length, 1, `DeptManageModal 必须只返回一个 Modal，实际 ${modals.length} 个`)
-  // 不允许把子框当 children 传进去（原写法：h(Modal, {...}, 内容, 确认框, 拦截框)）
+  assert.equal(drawers.length, 1, `DeptManageModal 必须只返回一个 Drawer，实际 ${drawers.length} 个`)
+  assert.equal(modals.length, 0, '部门管理内部不得再出现 Modal（确认框由 DeptTab 顶层渲染）')
   assert.ok(!/onMigrate|blockDel|confirmDel/.test(body), '删除拦截/确认框已上提到 DeptTab，不该留在子组件')
 })
 
@@ -191,6 +192,14 @@ test('★0.20.3 管理部门弹窗必须有可用的关闭路径（取消按钮 
   assert.match(body, /onClose,/, '必须接 onClose')
   assert.match(body, /'取消'/, '必须有取消按钮')
   assert.match(body, /'保存'/, '必须有保存按钮')
+})
+
+// ── 0.20.18 验收发现的真实缺陷：新建部门时 id 为空 ⇒ /departments/save 必 400 ──
+test('★0.20.18 新增部门行在提交前必须补齐安全且唯一的目录 id', () => {
+  const body = fnBody(CLIENT, 'function DeptTab(')
+  assert.ok(body.includes('ensureDeptIds'), 'DeptTab 里必须有 id 补齐逻辑')
+  assert.match(body, /ensureDeptIds\(list, depts\.map/, '保存前要用现有部门 id 做唯一性去重')
+  assert.match(body, /departments: normalized/, '提交给后端的是补齐 id 后的列表（不是原草稿）')
 })
 
 // ── 0.20.5 回归：弹窗必须挂到 body、ESC 稳定、保存结果在弹窗里 ────────────────
@@ -271,14 +280,15 @@ test('★0.20.8 关闭按钮在 mousedown 记住、mouseup 执行（不依赖 cl
   assert.match(body, /onUp2/, '遮罩节点上用门 mouseup 兜底')
 })
 
-test('★0.20.8 弹窗主按钮（取消/保存等）走 data-csb-act 原生兜底', () => {
+test('★0.20.18 部门抽屉的取消/保存仍可直接点（onClick 直连，不依赖 Modal 的动作表）', () => {
   const body = fnBody(CLIENT, 'function Modal(')
-  assert.match(body, /data-csb-act/, '识别动作标记')
-  assert.match(body, /actions\[name\]/, '按名字调用调用方给的动作')
+  assert.match(body, /data-csb-act/, 'Modal 仍保留动作标记（确认框用）')
   const dept = fnBody(CLIENT, 'function DeptManageModal(')
   assert.match(dept, /'data-csb-act': 'cancel'/, '取消按钮带标记')
   assert.match(dept, /'data-csb-act': 'save'/, '保存按钮带标记')
-  assert.match(dept, /actions: \{ cancel: onClose, save: onSave \}/, '要把动作表交给 Modal')
+  // Drawer 没有 actions 表：按钮必须自己 onClick 直连，否则点了没反应
+  assert.match(dept, /onClick: onClose/, '取消按钮 onClick 直连 onClose')
+  assert.match(dept, /onClick: onSave/, '保存按钮 onClick 直连 onSave')
 })
 
 // ── 0.20.9：文档级原生触发（不依赖弹窗自身 effect 与 React onClick）──────────

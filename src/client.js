@@ -3946,6 +3946,34 @@ window.__ModuleLoader__.load({
        *
        * ⇒ 现在结果写进 `manageMsg`，渲染在弹窗内部顶部；成功也留在弹窗里给确认。
        */
+      /**
+       * 给「新增行」生成目录 id（2026-11-21 验收发现）：
+       * 前端新建部门时行只有 name、id 为空，而 `/departments/save` 的契约是
+       * **每一项都必须有非空 id**（id 直接当目录名用）⇒ 首次建部门必 400，
+       * 页面只看到「保存没反应」。这里在提交前补齐 id：
+       *   · 由名字派生（只留字母/数字/中文/-/_，其余压成 -）；
+       *   · 与现有部门 id 冲突时追加 -2/-3；
+       *   · 名字全是符号时退回 dept-<时间戳>。
+       */
+      const ensureDeptIds = (list, existingIds = []) => {
+        const taken = new Set(existingIds.filter(Boolean).map(String))
+        return list.map((d, i) => {
+          const id = String(d?.id ?? '').trim()
+          if (id) { taken.add(id); return { ...d, id } }
+          const name = String(d?.name ?? '').trim()
+          const base = name
+            .replace(/[^\p{L}\p{N}_-]+/gu, '-')
+            .replace(/-+/g, '-')
+            .replace(/^[-_]+|[-_]+$/g, '')
+            .slice(0, 40) || `dept-${Date.now().toString(36)}-${i + 1}`
+          let candidate = base
+          let n = 2
+          while (taken.has(candidate)) { candidate = `${base}-${n}`; n += 1 }
+          taken.add(candidate)
+          return { ...d, id: candidate }
+        })
+      }
+
       const saveDepts = async (list) => {
         // 前端先自查一遍，能本地拦住的就别发请求（发出去也只会 400）
         const bad = []
@@ -3962,8 +3990,11 @@ window.__ModuleLoader__.load({
 
         setManageBusy(true)
         setManageMsg(null)
+        // 新增行（id 为空）在这里补 id —— 否则后端契约直接 400「必须有非空 id」
+        const normalized = ensureDeptIds(list, depts.map((d) => d.id))
+        setDeptDraft(normalized)
         try {
-          const r = await call('/departments/save', { method: 'POST', body: { departments: list, by: 'ui' } })
+          const r = await call('/departments/save', { method: 'POST', body: { departments: normalized, by: 'ui' } })
           if (r.warnings?.length) {
             setManageMsg({ kind: 'err', text: r.warnings.join('；') })
           } else {
@@ -4116,7 +4147,7 @@ window.__ModuleLoader__.load({
           h('div', { className: 'csb-bar', style: { marginTop: 10 } },
             h('button', {
               className: 'csb-btn csb-btn-s',
-              onClick: () => setNewBotDept(deptId),
+              onClick: () => { setNewBotDept(deptId); setManageOpen(false) },
             }, '＋ 在本部门新建 Bot'),
             h('span', { className: 'csb-set-d', style: { fontSize: 11.5 } },
               '退役 ≠ 删除：Bot 只读留档，目录与档案都保留；需要彻底清理请手动处理目录。')))
@@ -4462,7 +4493,7 @@ window.__ModuleLoader__.load({
               if (list.length) setDelBlock({ i, id, name, bots: list })
               else setDelConfirm({ i, id, name })
             },
-            onManageMembers: (deptId) => setMembersFor(deptId),
+            onManageMembers: (deptId) => { setMembersFor(deptId); setManageOpen(false) },
           })
           : null,
 
@@ -4517,10 +4548,9 @@ window.__ModuleLoader__.load({
 
         // ── 部门人员（顶层 Modal：列表 + 增删改查）──────────────────────────────
         membersFor
-          ? h(Modal, {
+          ? h(Drawer, {
             title: `部门人员 · ${depts.find((d) => d.id === membersFor)?.name ?? membersFor}`,
-            onClose: () => setMembersFor(null),
-            wide: true,
+            onClose: () => { setMembersFor(null); setManageOpen(true) },
             footer: [
               h('button', { key: 'b', className: 'csb-btn', 'data-csb-close': '1', onClick: () => setMembersFor(null) }, '返回列表'),
             ],
@@ -4578,8 +4608,8 @@ window.__ModuleLoader__.load({
           ? h(NewBotInDeptModal, {
             deptId: newBotDept,
             deptName: depts.find((d) => d.id === newBotDept)?.name ?? newBotDept,
-            onClose: () => setNewBotDept(null),
-            onDone: () => { setNewBotDept(null); treeQ.reload(); rosterQ.reload() },
+            onClose: () => { setNewBotDept(null); setManageOpen(true) },
+            onDone: () => { setNewBotDept(null); setManageOpen(true); treeQ.reload(); rosterQ.reload() },
           })
           : null,
 
@@ -4673,7 +4703,7 @@ window.__ModuleLoader__.load({
           setBusy(false)
         }
       }
-      return h(Modal, {
+      return h(Drawer, {
         title: `在「${deptName}」新建 Bot`,
         onClose,
         footer: [
@@ -4745,12 +4775,11 @@ window.__ModuleLoader__.load({
         return { mine, orphans: Array.isArray(orphanedBots) ? orphanedBots : [] }
       }
 
-      return h(Modal, {
-        title: '管理部门',
-        wide: true,
+      // 2026-11-21 Boss：「部门管理不要用弹窗，用侧边栏管理」⇒ 改 Drawer。
+      // 弹窗只保留「删除/退役」这类**确认**，不再做管理表单，更没有嵌套弹窗。
+      return h(Drawer, {
+        title: '部门管理',
         onClose,
-        // 原生兜底：宿主下 click 会漂移，这两个按钮用 data-csb-act 走 mouseup 执行
-        actions: { cancel: onClose, save: onSave },
         footer: [
           h('button', { key: 'c', className: 'csb-btn', 'data-csb-act': 'cancel', onClick: onClose }, '取消'),
           h('button', {
@@ -10759,8 +10788,6 @@ window.__ModuleLoader__.load({
       installNativeTrigger()
       // 逃生舱：点遮罩外即可关闭（见 installEscapeHatch）
       installEscapeHatch()
-      // 版本徽标：纯 DOM，用来确认「新代码到底跑没跑」（见 installVersionBadge）
-      installVersionBadge()
       // 每次装配都自报一次版本，便于在控制台一键确认
       try { diagLog({ phase: 'apply', note: 'client bundle loaded' }) } catch {}
       const disposers = []
