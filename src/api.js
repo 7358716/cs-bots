@@ -1,3 +1,14 @@
+/** 插件自身版本（从 package.json 读，**唯一真相源**；不硬编码，避免徽标/自检与实际包版本漂移）。 */
+function pluginVersion() {
+  try {
+    const raw = readFileSync(new URL('../package.json', import.meta.url), 'utf8')
+    return JSON.parse(raw).version
+  } catch {
+    return undefined
+  }
+}
+const PLUGIN_VERSION = pluginVersion()
+
 /**
  * cs-bots /api —— 宿主 HTTP 面（**给 L3 页面层用的数据接口**）。
  *
@@ -2447,7 +2458,7 @@ export function installApi(ctx, { warn } = {}) {
           hierarchy = { error: String(error?.message ?? error) }
         }
 
-        const out = { ok: true, services: {}, compat: services.compat ?? null, host, workspaceGroup, hierarchy }
+        const out = { ok: true, version: PLUGIN_VERSION, services: {}, compat: services.compat ?? null, host, workspaceGroup, hierarchy }
         // 状态面要覆盖**全部**域服务：新增模块若不上报，页面「系统体检」就会
         // 显示「一切正常」而实际某功能没装配 —— 那是本平台最忌讳的静默失败。
         const SERVICE_KEYS = [

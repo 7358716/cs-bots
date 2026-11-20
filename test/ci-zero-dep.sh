@@ -179,6 +179,30 @@ else
   fail=1
 fi
 
+echo "== 检查 7：客户端不得硬编码插件版本号（徽标必须取自 /status）=="
+# 依据（2026-11-21 0.20.16 验收）：client.js 里写死 `cs-bots 0.20.15`，
+# 导致包装到 0.20.16 后右下角徽标还在撒谎 —— 而徽标正是「新版跑没跑」的唯一现成判据。
+badver="$(python3 - <<'PYINNER'
+import pathlib, re
+T = re.compile(r"cs-bots\s+[0-9]+\.(?:[0-9]+\.){1,2}[0-9]+")
+bad = []
+for path in sorted(pathlib.Path('src').rglob('*.js')):
+    for i, line in enumerate(path.read_text(encoding='utf-8').splitlines(), 1):
+        stripped = line.strip()
+        if stripped.startswith('//') or stripped.startswith('*'):
+            continue
+        if T.search(line):
+            bad.append(f'{path}:{i}: {stripped[:90]}')
+print('\n'.join(bad))
+PYINNER
+)"
+if [ -z "$badver" ]; then
+  echo "  OK: 客户端没有硬编码版本号"
+else
+  echo "$badver" | sed 's/^/  违规: /'
+  fail=1
+fi
+
 echo "== 结果 =="
 if [ "$fail" -eq 0 ]; then
   echo "CI PASS"

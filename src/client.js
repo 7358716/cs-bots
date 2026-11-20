@@ -10710,7 +10710,15 @@ window.__ModuleLoader__.load({
         if (document.getElementById('csb-version-badge')) return
         const pill = document.createElement('div')
         pill.id = 'csb-version-badge'
-        pill.textContent = 'cs-bots 0.20.15'
+        // 不硬编码版本：徽标的意义是「跑的是哪个包」。写死会在每次发版后撒谎
+        //（0.20.16 验收时就踩到：包装的是 0.20.16，徽标还写着 0.20.15）。
+        // 先占位，再用 /status 的真实版本改写；取不到就退回 'cs-bots'（不显示错版本）。
+        pill.textContent = 'cs-bots'
+        try {
+          call('/status').then((d) => {
+            if (d && typeof d.version === 'string' && d.version) pill.textContent = 'cs-bots ' + d.version
+          }).catch(() => {})
+        } catch {}
         pill.title = '看到这个说明插件新版本已加载；点它可在控制台输出诊断'
         pill.style.cssText = [
           'position:fixed', 'right:12px', 'bottom:12px', 'z-index:2147483647',
