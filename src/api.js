@@ -3132,6 +3132,14 @@ export function installApi(ctx, { warn } = {}) {
         }
         // 内存态同步（不重启也能立刻看到新部门）
         if (services.settings) services.settings.departments = next
+        // 缺陷 1（2026-11-20）：roster 里的部门字典是**装配期快照**，必须一起更新，
+        // 否则「新建部门 → 建 Bot」会因为 roster 看不到新部门而 BOT_DEPT_UNKNOWN（要重启才行）。
+        try {
+          services.roster?.updateConfig?.({ departments: next })
+        } catch (error) {
+          // 同步失败不阻塞保存本身（设置已落盘，下次保存或重启会再同步一次），但要可诊断。
+          console.warn('[cs-bots/api] 部门保存后同步 roster 目录模型失败：', error?.message ?? error)
+        }
 
         const renameErrors = []
         for (const r of renames) {
@@ -5251,6 +5259,26 @@ export function installApi(ctx, { warn } = {}) {
         if (!saved.ok) {
           sendJson(response, 400, { ok: false, reason: saved.reason })
           return
+        }
+        // 缺陷 1 的另一半：`/settings` 若改了 departments / botWorkspaceRoot，也要立刻
+        // 同步给 roster，否则「设置里加部门 → 建 Bot」同样要重启才生效。
+        // 同时把内存生效值跟上（GET /settings 的 effective 才不会一直显示旧值）。
+        try {
+          // 注意：**不能**把 saved.values 整体 Object.assign 进 services.settings ——
+          // `services.settings` 是「内存生效值」，内核级参数（throttleMs 等）必须保持旧值，
+          // GET /settings 的「磁盘≠生效，需重启」提示正是靠这个差异工作的（有回归用例钉着）。
+          // 这里只同步**目录模型**这两个「改了就该立刻生效」的字段。
+          if (services.settings) {
+            if (Array.isArray(saved.values?.departments)) services.settings.departments = saved.values.departments
+            const savedRoot = saved.values?.botWorkspaceRoot
+            if (typeof savedRoot === 'string' && savedRoot.trim() !== '') services.settings.botWorkspaceRoot = savedRoot
+          }
+          services.roster?.updateConfig?.({
+            departments: saved.values?.departments,
+            botsRoot: saved.values?.botWorkspaceRoot,
+          })
+        } catch (error) {
+          console.warn('[cs-bots/api] 设置保存后同步 roster 目录模型失败：', error?.message ?? error)
         }
         sendJson(response, 200, {
           ok: true,

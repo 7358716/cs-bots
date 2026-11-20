@@ -13,6 +13,45 @@
 
 ---
 
+## [0.20.16] - 2026-11-21
+
+Windows 端 lead 会话做全量测试（62 项黑盒 API + 167/168 UI 回归 + 31 项 Windows 自证）时
+暴露的 4 个缺陷，本版集中修复。其中 2 个是**默认配置下必现的阻断级**故障。
+
+### 缺陷 1（P0）｜新建部门后建 Bot 必失败 `BOT_DEPT_UNKNOWN`
+
+**为什么改**：`createRoster` 只在**装配期**收一次 `settings.departments`；`POST /departments/save`
+之后只更新了 `services.settings.departments`，roster 内的 `config.departments` 仍是启动那一刻
+的快照 ⇒ 新部门对 roster 不可见 ⇒ 建 Bot 必然报「部门不存在」，**必须重启 DSH 才能建**。
+云端与 Windows 桌面实例都实测复现。
+
+### 缺陷 2（P0）｜默认工作区落在 `$DSH_HOME` 下，被 roster 自己拒绝
+
+**为什么改**：2026-11-15 Boss 把默认主目录定为 `<DSH_HOME>/cs-bots`，`settings.js` 里也写明
+「已取消『不得落在 $DSH_HOME 内』这条限制」，但 `roster.assertBotCwd` 仍在无条件拒绝
+`$DSH_HOME` 子树 —— **同一份代码自相矛盾**。缺陷 1 修好后立刻会撞上它（部门派生路径全在
+`$DSH_HOME` 下）。
+
+修复口径（精确到边界）：放行**配置主目录的真子目录**；`$DSH_HOME` 自身、主目录自身、
+`$DSH_HOME` 的其它子树（sessions/storages…）**仍拒绝**，回归测试逐条钉住。
+
+### 缺陷 3（P1）｜`defaultDepartment` 指向不存在的部门
+
+**为什么改**：页面「新建 Bot」的预选链是 `form.department || values.defaultDepartment || dpts[0]`，
+默认值悬空（如内置部门取消后残留的 `dev`）会让表单预选一个不存在的部门，提交必失败。
+读盘与写盘**同一条归一化**：悬空即置空，并写进 `diagnostics.badKeys`。
+
+### 缺陷 4（P2）｜穿透面板把对象型统计渲染成 `[object Object]`
+
+**为什么改**：`src/client.js` 直接 `${k}: ${v}`，`byKind` / `states` / `tiers` 这些对象被 React
+当成 children 渲染成字面量 `[object Object]`，页面看起来像「统计坏了」。新增
+`formatStatValue()`：原始值原样，对象/数组走 `JSON.stringify`。
+
+### 回归
+
+新增 `test/regression-20261120.test.mjs`（4 条）：部门快照 → updateConfig 立刻生效、
+`$DSH_HOME` 子树禁令的三条边界、默认部门悬空置空 + 存在时保留。
+
 ## [0.20.15] - 2026-11-19
 
 Boss：装上 0.20.14 后控制台**连 `[cs-bots 诊断]` 都不再出现**，只有两条 404/500 资源错误。

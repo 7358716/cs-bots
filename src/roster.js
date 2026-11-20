@@ -263,11 +263,19 @@ function dshHomeRoot() {
  * 另加一条**非阻塞**提示：cwd 是 `$DSH_HOME` 的**祖先**时 warn（该 cwd 下的 Bot 理论上能
  * 顺着子路径写进宿主状态目录）——不拒绝，因为那可能正是用户的正常家目录，拒绝属过度拦截。
  *
+ * 例外（2026-11-20 修复缺陷 2）：配置的 **Bot 主目录的真子目录** 必须放行 —— 默认主目录
+ * 本身就是 `<DSH_HOME>/cs-bots`（2026-11-15 Boss 定的默认），部门/Bot 派生路径全部落在
+ * 那里。若不放行，`settings.js` 的「已取消该限制」与 `roster` 的拒绝**自相矛盾**，
+ * 且「新建部门 → 建 Bot」在默认配置下必然失败。
+ * 边界仍守住：主目录自身、`$DSH_HOME` 自身、`$DSH_HOME` 的**其它子树**（sessions/storages…）
+ * 一律照旧拒绝。
+ *
  * @param {unknown} value
  * @param {string} where
+ * @param {string} [allowRoot] 配置的 Bot 主目录；其**真子目录**豁免 `$DSH_HOME` 子树禁令
  * @returns {string} 归一化绝对路径
  */
-function assertBotCwd(value, where) {
+function assertBotCwd(value, where, allowRoot) {
   const raw = requireString(value, 'cwd', where)
   if (!isAbsolute(raw)) {
     throw new RosterError(
@@ -286,7 +294,10 @@ function assertBotCwd(value, where) {
       { cwd, dshHome: home, where },
     )
   }
-  if (cwd.startsWith(home + sep)) {
+  // 配置主目录的**真子目录**豁免（见上文「例外」）。主目录自身不豁免，`$DSH_HOME` 自身也不豁免。
+  const root = typeof allowRoot === 'string' && allowRoot.trim() !== '' ? resolve(allowRoot.trim()) : undefined
+  const insideConfiguredRoot = root !== undefined && root !== home && cwd !== root && cwd.startsWith(root + sep)
+  if (!insideConfiguredRoot && cwd.startsWith(home + sep)) {
     throw new RosterError(
       `roster.${where}：cwd（${cwd}）位于 $DSH_HOME（${home}）子树内——`
       + '宿主状态目录内的写入同样构成污染，请给 Bot 独立的工作目录',
@@ -347,6 +358,38 @@ export function createRoster(ctx, config = {}) {
   /** 状态目录是否可写（不可写只降级 warn，不阻塞装配——与 dispatcher.durable 同语义）。 */
   const durable = ensureDir(stateDir)
   if (!durable) warn(`[cs-bots/roster] 状态目录不可写（${stateDir}）——注册表变更将无法落盘`)
+
+  /**
+   * 目录模型（部门字典 + Bot 主目录）——**运行时可更新**。
+   *
+   * 为什么不能直接读 `config`：`config` 是**装配期快照**。2026-11-20 实测缺陷：
+   * `POST /departments/save` 只改了 `services.settings.departments`，而 roster 里的
+   * `config.departments` 仍是启动那一刻的副本 ⇒ 新建的部门对 roster 不可见 ⇒
+   * 「新建部门后建 Bot」必然 `BOT_DEPT_UNKNOWN`，**必须重启才能建 Bot**。
+   * 所以这里留一份可变的当前值，由 `updateConfig()` 在保存设置后同步。
+   */
+  const dirModel = {
+    departments: Array.isArray(config?.departments) ? config.departments : undefined,
+    botsRoot: typeof config?.botsRoot === 'string' && config.botsRoot.trim() !== ''
+      ? config.botsRoot.trim()
+      : undefined,
+  }
+
+  /**
+   * 运行时更新目录模型（部门字典 / Bot 主目录）。
+   *
+   * 语义：**只接受合法类型**，非法值静默忽略（保持上一次的有效值）——装配参数错了
+   * 不应该把已经在跑的注册表打挂。返回更新后的当前值，供调用方回显。
+   *
+   * @param {{ departments?: object[], botsRoot?: string }} [patch]
+   * @returns {{ departments: object[]|undefined, botsRoot: string|undefined }}
+   */
+  function updateConfig(patch = {}) {
+    if (Array.isArray(patch?.departments)) dirModel.departments = patch.departments
+    if (typeof patch?.botsRoot === 'string' && patch.botsRoot.trim() !== '') dirModel.botsRoot = patch.botsRoot.trim()
+    info(`[cs-bots/roster] 目录模型已更新（部门 ${Array.isArray(dirModel.departments) ? dirModel.departments.length : 0} 个，主目录 ${dirModel.botsRoot ?? '未设置'}）`)
+    return { departments: dirModel.departments, botsRoot: dirModel.botsRoot }
+  }
 
   /** @type {Map<string, object>} bot id → Bot（创建序 = Map 插入序） */
   const bots = new Map()
@@ -711,8 +754,8 @@ export function createRoster(ctx, config = {}) {
     let dir
     if (department !== undefined && department !== null && department !== '') {
       const derived = deriveBotCwd({
-        botsRoot: config?.botsRoot,
-        departments: config?.departments,
+        botsRoot: dirModel.botsRoot,
+        departments: dirModel.departments,
         department,
         botName: displayName,
       })
@@ -724,7 +767,7 @@ export function createRoster(ctx, config = {}) {
         )
       }
       if (cwd !== undefined && cwd !== null && cwd !== '') {
-        const explicit = resolve(assertBotCwd(cwd, 'create'))
+        const explicit = resolve(assertBotCwd(cwd, 'create', dirModel.botsRoot))
         if (explicit !== derived.cwd) {
           throw new RosterError(
             `roster.create：department=${JSON.stringify(department)} 派生目录 ${derived.cwd} `
@@ -734,7 +777,7 @@ export function createRoster(ctx, config = {}) {
           )
         }
       }
-      dir = assertBotCwd(derived.cwd, 'create')
+      dir = assertBotCwd(derived.cwd, 'create', dirModel.botsRoot)
       // ⚠️ 必须先建目录：实测 create 不做 mkdir，目录不存在时 writeAgentsFile 静默失败
       if (!ensureDir(dir)) {
         throw new RosterError(
@@ -744,7 +787,7 @@ export function createRoster(ctx, config = {}) {
         )
       }
     } else {
-      dir = assertBotCwd(cwd, 'create')
+      dir = assertBotCwd(cwd, 'create', dirModel.botsRoot)
     }
     const roleLabel = normalizeLabel(label, 'create')
     const mdl = optionalString(model, 'model', 'create')
@@ -1700,6 +1743,7 @@ export function createRoster(ctx, config = {}) {
     release,
     heartbeat,
     expireLeases,
+    updateConfig,
     replay,
     stats,
     history,

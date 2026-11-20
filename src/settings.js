@@ -279,6 +279,34 @@ export function validateSetting(key, raw) {
  * @param {string} stateDir
  * @returns {{ values: object, diagnostics: object }}
  */
+/**
+ * 跨字段归一化：`defaultDepartment` 必须指向部门字典里**真实存在**的 id。
+ *
+ * 2026-11-20 缺陷 3（P1）：页面「新建 Bot」的预选链是
+ * `form.department || values.defaultDepartment || dpts[0]`。若默认值指向一个
+ * 已不存在的部门（例如内置部门被取消后残留的 `dev`），表单会预选它，
+ * 提交必然 `BOT_DEPT_UNKNOWN` —— 用户看到的是「建 Bot 必失败」，根因却在这。
+ * 所以读盘与写盘都要做同一条归一化：**悬空即置空**。
+ *
+ * @param {object} values 已校验的设置值（会被就地修改）
+ * @param {{ badKeys?: object[] }} [diagnostics] 读盘诊断；写盘时为 undefined
+ * @returns {boolean} 是否发生了修正
+ */
+function normalizeDefaultDepartment(values, diagnostics) {
+  if (!values || typeof values !== 'object') return false
+  const depts = Array.isArray(values.departments) ? values.departments : []
+  const current = typeof values.defaultDepartment === 'string' ? values.defaultDepartment.trim() : ''
+  if (current === '') return false
+  if (depts.some((d) => d && d.id === current)) return false
+  values.defaultDepartment = ''
+  diagnostics?.badKeys?.push({
+    key: 'defaultDepartment',
+    raw: current,
+    reason: `默认部门 ${JSON.stringify(current)} 不在部门字典中——已置空（否则新建 Bot 会预选一个不存在的部门）`,
+  })
+  return true
+}
+
 export function loadSettings(stateDir) {
   const file = statePath(stateDir, 'settings.json')
   const stored = readJson(file, undefined)
@@ -294,6 +322,9 @@ export function loadSettings(stateDir) {
   } else if (stored !== undefined) {
     diagnostics.source = 'invalid'
   }
+
+  // 缺陷 3：默认部门悬空即置空（读盘与写盘同一条规则）
+  normalizeDefaultDepartment(values, diagnostics)
 
   // ── 首次引导标记（2026-11-15 Boss：首次进入要提示选定工作区）──────────────
   //
@@ -330,6 +361,8 @@ export function saveSettings(stateDir, patch) {
   if (!ensureDir(stateDir)) return { ok: false, reason: `状态目录不可写：${stateDir}` }
   const { values } = loadSettings(stateDir)
   const next = { ...values, ...accepted }
+  // 缺陷 3：写盘前同样归一化，避免把悬空的默认部门再次落盘
+  normalizeDefaultDepartment(next, undefined)
   if (!writeJsonAtomic(statePath(stateDir, 'settings.json'), next)) {
     return { ok: false, reason: '写入 settings.json 失败' }
   }

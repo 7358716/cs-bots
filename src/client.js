@@ -10344,6 +10344,23 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * 统计值的展示格式（2026-11-20 缺陷 4）。
+     *
+     * 后端 `stats` 既有原始值（`bots: 0`）也有对象/数组（`byKind`、按状态分布、
+     * `tiers` 列表）。前端原先直接 `${k}: ${v}`，对象会被 React 当成 children
+     * 渲染成字面量 `[object Object]` —— 页面看起来「统计坏了」。
+     * 对象/数组一律走 JSON.stringify；原始值保持原样，避免给数字加引号。
+     *
+     * @param {unknown} v
+     * @returns {string}
+     */
+    function formatStatValue(v) {
+      if (v === null || v === undefined) return String(v)
+      if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') return String(v)
+      try { return JSON.stringify(v) } catch { return String(v) }
+    }
+
+    /**
      * 穿透面板——右侧抽屉，显示 6 个下层区块。
      *
      * 每个区块：概览统计 + 操作按钮 + 展开详情。
@@ -10442,7 +10459,7 @@ window.__ModuleLoader__.load({
         blocks.map((b) => {
           const stats = h('div', { className: 'csb-card-m' },
             Object.entries(b.stats ?? {}).map(([k, v]) =>
-              h('span', { key: k, className: 'csb-b' }, `${k}: ${v}`)))
+              h('span', { key: k, className: 'csb-b' }, `${k}: ${formatStatValue(v)}`)))
           const head = h('div', { className: 'csb-card', style: { cursor: 'pointer' }, onClick: () => openBlock(b.id) },
             h('div', { className: 'csb-card-main' },
               h('div', { className: 'csb-card-t2' }, h('strong', null, b.label ?? b.id)),
