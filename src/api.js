@@ -3418,7 +3418,12 @@ export function installApi(ctx, { warn } = {}) {
           if (typeof fallback === 'string' && fallback.trim() !== '') bodyWithFallback.cwd = fallback.trim()
         }
         const bot = await withService(services, 'roster', (r) =>
-          r.create({ ...bodyWithFallback, byId: body.byId ?? 'ui' }),
+          r.create({
+            ...bodyWithFallback,
+            byId: body.byId ?? 'ui',
+            // 工具策略（模式 + 工具规则）：不传则按 standard 落库
+            ...(body.toolPolicy !== undefined ? { toolPolicy: body.toolPolicy } : {}),
+          }),
         )
         // ── 三级工作区登记（2026-11-18 Boss：「要求三级展示」）────────────────
         // 之前这条路径**一次都不登记** ⇒ 建完 Bot 左侧栏什么都没变，
@@ -3522,6 +3527,9 @@ export function installApi(ctx, { warn } = {}) {
               return r.retire({ id: body.id, reason: body.reason, byId })
             case 'setCwd':
               return r.setCwd({ id: body.id, cwd: body.cwd, expectedRev: body.expectedRev, byId })
+            // 工具策略（2026-11-21）：模式 + 工具使用规则，整份替换
+            case 'setToolPolicy':
+              return r.setToolPolicy({ id: body.id, toolPolicy: body.toolPolicy, expectedRev: body.expectedRev, byId })
             // ── 换部门（2026-11-16）──────────────────────────────────────────
             //
             // ## 为什么放后端拼路径

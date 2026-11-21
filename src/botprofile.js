@@ -322,6 +322,11 @@ export function renderManagedSection(profile) {
   }
   if (p.botName) lines.push(`- 角色名：**${p.botName}**`)
   if (p.preset) lines.push(`- 预设：\`${p.preset}\``)
+  // 工具策略（2026-11-21）：模式 + 工具规则直接进身份上下文，
+  // 让「这个 Bot 该用/不该用哪些工具」成为它每次都读到的显式条款，而不是口头约定。
+  if (Array.isArray(p.policyLines) && p.policyLines.length > 0) {
+    lines.push('', '## 工具使用规则（由 Bot 设置生成）', '', ...p.policyLines)
+  }
   if (p.identity && p.identity.trim()) {
     lines.push('', p.identity.trim())
   } else {

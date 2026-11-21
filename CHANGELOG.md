@@ -13,6 +13,29 @@
 
 ---
 
+## [0.21.0] - 2026-11-21
+
+Boss：「bot 设置可以初始定义使用标准模式或者创造模式或其他，也可以定义工具（工具的使用规则等等）」。
+
+### 新增：Bot 工具策略 `toolPolicy = { mode, rules[] }`
+
+| 模式 | 名称 | 含义 |
+|---|---|---|
+| `standard` | 标准模式 | 预设给的工具面，读写与执行都允许（受 cwd 边界约束） |
+| `creative` | 创造模式 | 同工具面，但**要求先给出可运行/可验收的最小成果再迭代** |
+| `readonly` | 只读模式 | 只读分析；**硬拦截**：permission 自动压成 `read-only` |
+
+`rules[]` 每条 `{ tool, allow, note? }`，tool 取自白名单（bash/pwsh/fs/fs_search/jobs/schedule/skill/subagent/workflow/web/present/office/todo/plan/goal/ask_user）；未知工具、重复工具、allow 非布尔、说明超长**一律可读拒绝**，不静默忽略。
+
+**为什么放在 Bot 设置而不是预设**：预设是组合层（profile 的 Cordis 组合，改一次要重启、且全局共享）；
+而 Boss 要的是**每个 Bot 单独定义**。所以做成运行时策略层：
+- 不动组合 ⇒ **不用重启**；
+- 装配时翻成 `<cwd>/AGENTS.md` 的「工具使用规则」段 ⇒ 每次请求都进上下文（软约束）；
+- 只读模式同时落成 `permission=read-only`（硬约束）。
+
+**接口**：`POST /roster`（建 Bot 时带 `toolPolicy`）、`POST /roster/manage {action:'setToolPolicy'}`（整份替换）。
+**回归**：`test/toolpolicy.test.mjs`（6 条）——含「改档案不会冲掉工具规则段」。
+
 ## [0.20.19] - 2026-11-21
 
 ### 缺陷 6（P1）｜`setCwd` 没跟上 `create` 的「主目录放行」，跨部门搬迁必失败

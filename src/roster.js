@@ -50,6 +50,7 @@ import { randomUUID } from 'node:crypto'
 import { existsSync, mkdirSync, renameSync, writeFileSync } from 'node:fs'
 import { isAbsolute, join, resolve, sep } from 'node:path'
 import { deriveBotCwd, isManagedCwd } from './botdirs.js'
+import { normalizeToolPolicy, permissionForPolicy, policyLines } from './toolpolicy.js'
 
 import {
   appendJsonl,
@@ -908,7 +909,7 @@ export function createRoster(ctx, config = {}) {
    * @throws {RosterError} 缺字段 / 非法 cwd / 重名 / 会话创建失败 / 事件落盘失败
    */
   async function create(input = {}) {
-    const { name, cwd, label, model, instructions, preset, permission, profile, prepareCommand, byId, now, adoptSession, department } = input ?? {}
+    const { name, cwd, label, model, instructions, preset, permission, profile, prepareCommand, byId, now, adoptSession, department, toolPolicy } = input ?? {}
     const by = requireString(byId, 'byId', 'create')
     const displayName = requireString(name, 'name', 'create')
 
@@ -957,7 +958,14 @@ export function createRoster(ctx, config = {}) {
     const roleLabel = normalizeLabel(label, 'create')
     const mdl = optionalString(model, 'model', 'create')
     const inst = optionalString(instructions, 'instructions', 'create')
-    const perm = normalizePermission(permission, 'create')
+    // 工具策略：只读模式会把 permission 硬压成 read-only（软约束之外的硬拦截）
+    const policyRes = normalizeToolPolicy(toolPolicy)
+    if (!policyRes.ok) {
+      throw new RosterError(`roster.create：toolPolicy 不合法 → ${policyRes.hint}`, policyRes.code, { toolPolicy })
+    }
+    const toolPolicyNorm = policyRes.value
+    const policyPerm = permissionForPolicy(toolPolicyNorm)
+    const perm = normalizePermission(permission ?? policyPerm, 'create')
     const at = normalizeNow(now, 'create')
 
     // ── 唯一性（校验通过后才动会话，避免「建了会话才发现重名」的资源泄漏）──
@@ -1048,6 +1056,7 @@ export function createRoster(ctx, config = {}) {
     if (roleLabel !== undefined) bot.label = roleLabel
     if (mdl !== undefined) bot.model = mdl
     if (inst !== undefined) bot.instructions = inst
+    bot.toolPolicy = toolPolicyNorm
     // 改造07：开工准备命令（借鉴 Super-agent 的 prepare command）
     if (prepareCommand !== undefined && prepareCommand !== null && prepareCommand !== '') {
       bot.prepareCommand = String(prepareCommand).trim()
@@ -1058,7 +1067,7 @@ export function createRoster(ctx, config = {}) {
     if (profile !== undefined) {
       try {
         bot.profile = normalizeProfile(profile)
-        const written = writeAgentsFile(bot.cwd, { ...bot.profile, botName: bot.name, preset: bot.preset })
+        const written = writeAgentsFile(bot.cwd, { ...bot.profile, botName: bot.name, preset: bot.preset, policyLines: policyLines(toolPolicyNorm) })
         bot.profilePath = written.path
         // t-46 缺陷#4：空身份如实告警（详见 setProfile 处注释）
         if (written.identityMissing) {
@@ -1401,6 +1410,8 @@ export function createRoster(ctx, config = {}) {
         ...profile,
         botName: current.name,
         preset: current.preset,
+        // 策略条款要一起重写，否则改一次档案就把「工具使用规则」段冲掉了
+        policyLines: policyLines(current.toolPolicy),
       })
     } catch (error) {
       throw new RosterError(
@@ -1668,6 +1679,50 @@ export function createRoster(ctx, config = {}) {
    * @returns {object} Bot
    * @throws {RosterError} 已退役 / CAS 冲突
    */
+  /**
+   * 改一个 Bot 的工具策略（模式 + 工具规则）。
+   *
+   * 语义：整份替换（不是浅合并）——策略是一组互相配合的约束，半份合并容易产生矛盾
+   * （例如删掉「禁止 bash」却留了只读模式）。想微调就先 get 再整体提交。
+   *
+   * 生效点：
+   *   · 注册表字段立即更新（`toolPolicy`）；
+   *   · AGENTS.md 的「工具使用规则」段立即重写 ⇒ **下一次请求就进上下文**；
+   *   · 只读模式同时把 permission 压成 read-only（硬拦截）。
+   */
+  function setToolPolicy(input = {}) {
+    const { toolPolicy, byId, now } = input ?? {}
+    const current = loadForCas(input, 'setToolPolicy')
+    const by = requireString(byId, 'byId', 'setToolPolicy')
+    assertNotRetired(current, 'setToolPolicy', '改工具策略')
+    const res = normalizeToolPolicy(toolPolicy)
+    if (!res.ok) {
+      throw new RosterError(`roster.setToolPolicy：${res.hint}`, res.code, { id: current.id, toolPolicy })
+    }
+    const next = res.value
+    if (JSON.stringify(current.toolPolicy ?? null) === JSON.stringify(next)) {
+      throw new RosterError(
+        `roster.setToolPolicy：Bot ${current.id} 的工具策略没有变化`,
+        'ROSTER_NOTHING_TO_SET_POLICY',
+        { id: current.id },
+      )
+    }
+    const at = normalizeNow(now, 'setToolPolicy')
+    const before = clone(current)
+    const written = writeAgentsFile(current.cwd, {
+      ...(current.profile ?? {}), botName: current.name, preset: current.preset, policyLines: policyLines(next),
+    })
+    const after = clone(current)
+    after.rev = current.rev + 1
+    const policyPerm = permissionForPolicy(next)
+    if (policyPerm) after.permission = policyPerm
+    after.toolPolicy = next
+    after.profilePath = written.path
+    after.updatedAt = at
+    after.updatedBy = by
+    return commit(current.id, 'tool_policy_updated', by, at, before, after)
+  }
+
   function setPrepareCommand(input = {}) {
     const { prepareCommand, byId, now } = input ?? {}
     const current = loadForCas(input, 'setPrepareCommand')
@@ -1912,6 +1967,7 @@ export function createRoster(ctx, config = {}) {
     release,
     heartbeat,
     expireLeases,
+    setToolPolicy,
     updateConfig,
     replay,
     stats,
