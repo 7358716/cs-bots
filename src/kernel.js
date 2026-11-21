@@ -526,11 +526,24 @@ export async function createSession(ctx, options) {
   // 否则会话永远落在「未分组」里（2026-11-09 现场：bot-6b654c19… 就是）。
 
   // 注意顺序：attach 必须在会话创建之后（attach 要读会话 header 的 cwd）。
+  //
+  // ⚠️ 失败**必须留痕**（2026-11-21 修复）：这里原本是空 catch，理由是
+  // 「工作区挂载是锦上添花」。实际后果是「会话建成功、左侧栏永远看不到它」——
+  // 而且不留任何日志，排查时只能靠翻 workspace.json 猜。现在：
+  //   - 失败不影响返回值（会话本身可用，语义不变）；
+  //   - 通过 warn 如实报出 sessionId / cwd / 原因，便于立刻定位。
   if (cwd) {
     try {
       await attachToWorkspace(ctx, cwd, pickSessionId(handle, sessionId))
-    } catch {
-      /* 工作区挂载是「锦上添花」：失败不影响会话可用（只是仍显示未分组） */
+    } catch (error) {
+      try {
+        warn?.(
+          `[cs-bots/kernel] 会话 ${pickSessionId(handle, sessionId)} 未能挂进工作区 ${cwd}`
+          + `（左侧栏会看不到它）→ ${error?.message ?? error}`,
+        )
+      } catch {
+        /* warn 本身失败时绝不二次抛出：挂载失败不能影响会话可用性 */
+      }
     }
   }
   return handle

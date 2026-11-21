@@ -96,6 +96,14 @@ const PERMISSIONS = ['read-only', 'workspace-write', 'full']
 const DEFAULT_PERMISSION = 'workspace-write'
 /** `label` 上限（§3.1）。 */
 const MAX_LABEL = 24
+/**
+ * 单个 Bot 的**附加对话**上限（2026-11-21 Boss 决策「bot 的其他对话，多一个字段」）。
+ *
+ * 为什么设上限：附加对话不进自动归档、不占派活槽位，纯粹是「同一个人开的多个窗口」。
+ * 不设上限的话，长期使用会无限堆积，左侧栏又回到「一堆同名对话」的老问题。
+ * 5 条足够覆盖「主对话 + 几个专项窗口」，超出必须显式淘汰，绝不静默丢弃最旧的。
+ */
+const MAX_EXTRA_SESSIONS = 5
 /** 租约缺省 TTL（ms），与 board 的 300s 对齐。 */
 const DEFAULT_LEASE_MS = 300_000
 /** 事件动作集合（审计流可枚举）。 */
@@ -687,6 +695,15 @@ export function createRoster(ctx, config = {}) {
    *
    * 纯读、**不抛**（非法入参返回 false）。
    *
+   * ## 2026-11-21 扩展：附加对话也算「本 Bot 的会话」
+   *   Boss 决策「bot 的其他对话，多一个字段」⇒ 新增 `extraSessionIds`。
+   *   附加对话**没有派活资格**（不能被 wake/派任务），但它确实属于这个 Bot：
+   *   - 路由判定（是不是体面会话）应该认它，否则附加对话里的模型调用会被
+   *     当成「人类主对话」而拿到 paid_allowed 授权（越权）。
+   *   - 归属判定（它属于哪个 Bot）也应该认它。
+   *   ⇒ `hasSession` 返回 true，但调用方若要区分「能不能派活」，
+   *     必须用 `canReceiveDispatch()`，不能只看 `hasSession`。
+   *
    * @param {string} sessionId
    * @returns {boolean}
    */
@@ -694,9 +711,157 @@ export function createRoster(ctx, config = {}) {
     if (typeof sessionId !== 'string' || sessionId === '') return false
     for (const b of bots.values()) {
       if (b?.sessionId === sessionId) return true
+      if (Array.isArray(b?.extraSessionIds) && b.extraSessionIds.includes(sessionId)) return true
     }
     return false
   }
+
+  /**
+   * 这个会话**能不能被派活**（wake / 任务派发 / 当团队负责人）。
+   *
+   * 只有**主对话**（`bot.sessionId`）可以。附加对话只用于展示与归档，无派活资格
+   * （Boss 2026-11-21 定的边界：多对话是「同一个人开了多个窗口」，不是「多个员工」）。
+   *
+   * @param {string} sessionId
+   * @returns {boolean}
+   */
+  function canReceiveDispatch(sessionId) {
+    if (typeof sessionId !== 'string' || sessionId === '') return false
+    for (const b of bots.values()) {
+      if (b?.sessionId === sessionId) return b.state !== 'retired'
+    }
+    return false
+  }
+
+  /**
+   * 把一个已存在的会话登记为某 Bot 的**附加对话**。
+   *
+   * 语义边界（与 `adoptSession` 区分开）：
+   *   - `adoptSession`（建 Bot 时）：把这个会话变成 **Bot 本人**，id 就是 botId；
+   *   - 本函数（建 Bot 之后）：给已有 Bot **再挂一个对话**，不改主对话、不给派活资格。
+   *
+   * 约束：
+   *   - 该会话不能是**任何** Bot 的主对话或附加对话（一个会话只属于一个 Bot）；
+   *   - 附加对话有上限 `MAX_EXTRA_SESSIONS`，超出必须显式指定淘汰谁，绝不静默丢弃；
+   *   - 主对话 `sessionId` 不能同时出现在 `extraSessionIds` 里（冗余且会误导）。
+   *
+   * @param {{ id?: string, name?: string, sessionId: string, byId?: string, now?: number }} input
+   * @returns {object} 更新后的 Bot 记录
+   */
+  function attachExtraSession(input = {}) {
+    const { sessionId, byId, now } = input
+    const at = normalizeNow(now, 'attachExtraSession')
+    const sid = optionalString(sessionId, 'sessionId', 'attachExtraSession')
+    if (sid === undefined) {
+      throw new RosterError(
+        'roster.attachExtraSession：sessionId 必填',
+        'ROSTER_MISSING_FIELD', { field: 'sessionId' },
+      )
+    }
+    // 定位 Bot：给 id 或 name 都行
+    const target = (input.id !== undefined ? bots.get(optionalString(input.id, 'id', 'attachExtraSession')) : undefined)
+      ?? (input.name !== undefined
+        ? [...bots.values()].find((b) => b.name === optionalString(input.name, 'name', 'attachExtraSession'))
+        : undefined)
+      ?? (() => {
+        // 都不给：按会话反查（附加对话场景下常见
+        for (const b of bots.values()) {
+          if (b?.sessionId === sid) return b
+          if (Array.isArray(b?.extraSessionIds) && b.extraSessionIds.includes(sid)) return b
+        }
+        return undefined
+      })()
+    if (!target) {
+      throw new RosterError(
+        `roster.attachExtraSession：找不到 Bot（id=${JSON.stringify(input.id)}，name=${JSON.stringify(input.name)}）`,
+        'ROSTER_NOT_FOUND', { id: input.id ?? null, name: input.name ?? null },
+      )
+    }
+    // 已经是它自己的主对话 / 附加对话 ⇒ 幂等返回
+    if (target.sessionId === sid) return clone(target)
+    if (Array.isArray(target.extraSessionIds) && target.extraSessionIds.includes(sid)) return clone(target)
+
+    // 该会话不能被**别的** Bot 占用
+    for (const other of bots.values()) {
+      if (other.id === target.id) continue
+      if (other.sessionId === sid) {
+        throw new RosterError(
+          `roster.attachExtraSession：会话 ${sid} 是 Bot「${other.name}」的主对话——不能同时挂给「${target.name}」`,
+          'ROSTER_SESSION_TAKEN', { sessionId: sid, occupiedBy: other.id },
+        )
+      }
+      if (Array.isArray(other.extraSessionIds) && other.extraSessionIds.includes(sid)) {
+        throw new RosterError(
+          `roster.attachExtraSession：会话 ${sid} 已是 Bot「${other.name}」的附加对话`,
+          'ROSTER_SESSION_TAKEN', { sessionId: sid, occupiedBy: other.id },
+        )
+      }
+    }
+
+    const current = Array.isArray(target.extraSessionIds) ? target.extraSessionIds : []
+    if (current.length >= MAX_EXTRA_SESSIONS) {
+      // ⚠️ 绝不静默丢最旧的：让调用方明确说淘汰谁，否则用户会发现对话莫名消失
+      throw new RosterError(
+        `roster.attachExtraSession：Bot「${target.name}」的附加对话已达上限 ${MAX_EXTRA_SESSIONS} 条`
+        + `（${current.join('、')}）——请先 detachExtraSession 移走一条，或显式指定淘汰对象`,
+        'ROSTER_EXTRA_LIMIT', { bot: target.id, limit: MAX_EXTRA_SESSIONS, current },
+      )
+    }
+
+    const by = optionalString(byId, 'byId', 'attachExtraSession') ?? 'ui'
+    const next = clone(target)
+    next.rev = target.rev + 1
+    next.extraSessionIds = [...current, sid]
+    next.extraSessionsUpdatedAt = at
+    next.extraSessionsUpdatedBy = by
+    commit(next.id, 'attachExtraSession', by, at, target, next)
+    return next
+  }
+
+  /**
+   * 把一个会话从某 Bot 的附加对话里摘掉（**只摘登记，不动会话本身**）。
+   *
+   * @param {{ id?: string, name?: string, sessionId: string, byId?: string, now?: number }} input
+   * @returns {object} 更新后的 Bot 记录
+   */
+  function detachExtraSession(input = {}) {
+    const at = normalizeNow(now0(input), 'detachExtraSession')
+    const sid = optionalString(input.sessionId, 'sessionId', 'detachExtraSession')
+    if (sid === undefined) {
+      throw new RosterError(
+        'roster.detachExtraSession：sessionId 必填', 'ROSTER_MISSING_FIELD', { field: 'sessionId' },
+      )
+    }
+    const target = (input.id !== undefined ? bots.get(optionalString(input.id, 'id', 'detachExtraSession')) : undefined)
+      ?? (input.name !== undefined
+        ? [...bots.values()].find((b) => b.name === optionalString(input.name, 'name', 'detachExtraSession'))
+        : undefined)
+      ?? [...bots.values()].find((b) => Array.isArray(b?.extraSessionIds) && b.extraSessionIds.includes(sid))
+    if (!target) {
+      throw new RosterError(
+        `roster.detachExtraSession：找不到 Bot（id=${JSON.stringify(input.id)}，name=${JSON.stringify(input.name)}）`,
+        'ROSTER_NOT_FOUND', { id: input.id ?? null, name: input.name ?? null },
+      )
+    }
+    const current = Array.isArray(target.extraSessionIds) ? target.extraSessionIds : []
+    if (!current.includes(sid)) {
+      throw new RosterError(
+        `roster.detachExtraSession：会话 ${sid} 不在 Bot「${target.name}」的附加对话里`,
+        'ROSTER_NOT_ATTACHED', { bot: target.id, sessionId: sid },
+      )
+    }
+    const by = optionalString(input.byId, 'byId', 'detachExtraSession') ?? 'ui'
+    const next = clone(target)
+    next.rev = target.rev + 1
+    next.extraSessionIds = current.filter((x) => x !== sid)
+    next.extraSessionsUpdatedAt = at
+    next.extraSessionsUpdatedBy = by
+    commit(next.id, 'detachExtraSession', by, at, target, next)
+    return next
+  }
+
+  /** 取 `now` 字段（`optionalNumber` 的小包装，仅为消掉重复的 normalizeNow 参数名）。 */
+  function now0(input) { return input?.now }
 
   /**
    * 注册表统计。
@@ -1434,7 +1599,7 @@ export function createRoster(ctx, config = {}) {
     const { cwd, byId, now } = input ?? {}
     const current = loadForCas(input, 'setCwd')
     const by = requireString(byId, 'byId', 'setCwd')
-    const dir = assertBotCwd(cwd, 'setCwd')
+    const dir = assertBotCwd(cwd, 'setCwd', dirModel.botsRoot)
     assertNotRetired(current, 'setCwd', '换目录')
 
     if (current.cwd === dir) {
@@ -1728,6 +1893,10 @@ export function createRoster(ctx, config = {}) {
     list,
     listRetired,
     hasSession,
+    // 2026-11-21 Boss 决策：Bot 的附加对话（多一个字段）
+    canReceiveDispatch,
+    attachExtraSession,
+    detachExtraSession,
     rename,
     retire,
     purge,
@@ -1755,6 +1924,7 @@ export function createRoster(ctx, config = {}) {
       PERMISSIONS: Object.freeze([...PERMISSIONS]),
       ACTIONS: Object.freeze([...ACTIONS]),
       MAX_LABEL,
+      MAX_EXTRA_SESSIONS,
       DEFAULT_PERMISSION,
       DEFAULT_LEASE_MS: leaseMsDefault,
     }),

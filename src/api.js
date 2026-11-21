@@ -28,7 +28,7 @@ import { createHash } from 'node:crypto'
 import { join, resolve, sep as pathSep } from 'node:path'
 import { isInsideDir, firstSegmentUnder } from './botdirs.js'
 import { registerRoute, service, stateDir as kernelStateDir, listPresets, ensureWorkspaceDir, listWorkspaceRecords, removeWorkspaceByPath, defaultPreset, getAgent, resumeSession, readSessionMessages, attachToWorkspace, readSessionWatermark, sessionMeta, capabilities } from './kernel.js'
-import { ensureBotHierarchy, inspectHierarchy, repairHierarchy } from './ws-hierarchy.js'
+import { ensureBotHierarchy, inspectHierarchy, repairHierarchy, withWsLock } from './ws-hierarchy.js'
 import { createLibrary } from './library.js'
 import { createDirBrowser } from './dirbrowse.js'
 import { getServices } from './registry.js'
@@ -3153,6 +3153,40 @@ export function installApi(ctx, { warn } = {}) {
         }
 
         const renameErrors = []
+        // ── 新建部门 ⇒ 自动建目录 + 登记分组（Boss 2026-11-21 14:26）──────────
+        //
+        // Boss 原话：「创建部门自动创建目录，在 csbots 主目录下」。
+        //
+        // 原来 `/departments/save` **只写 settings.json，一个文件夹都不建**。
+        // 于是新建部门后左侧栏没有它的分组，得等「建第一个 Bot」才顺带把目录带出来 ——
+        // 中间这段时间部门是个「有配置、没实体」的幽灵。
+        //
+        // 这里补上：对**本次新增**的部门，建 `<主目录>/<部门id>/` 并登记为分组。
+        // · 只处理新增的（改名/删除在别处已各自处理，不重复动）
+        // · 单条失败不阻断保存（设置已落盘是事实），但要如实回报
+        // · 主目录未设置就跳过并说明原因（BOT_ROOT_UNSET 那种场景）
+        const createdDirs = []
+        const dirErrors = []
+        const prevIds = new Set(current.map((d) => d?.id).filter(Boolean))
+        const addedDepts = next.filter((d) => d && d.id && !prevIds.has(d.id))
+        if (addedDepts.length > 0) {
+          const rootAbs = String(services.settings?.botWorkspaceRoot ?? '').replace(/[\\/]+$/, '')
+          if (!rootAbs) {
+            dirErrors.push({ reason: '主目录未设置 —— 部门目录没建，先到「设置 → Bot 主目录」指定' })
+          } else {
+            for (const d of addedDepts) {
+              try {
+                // 用 ws-hierarchy 导出的全局锁（与「重建分组」同一把），避免并发建同一条登记
+                const r = await withWsLock(() => ensureWorkspaceDir(ctx, join(rootAbs, d.id), d.name || d.id))
+                if (r?.ok) createdDirs.push({ id: d.id, path: join(rootAbs, d.id), created: r.created === true })
+                else dirErrors.push({ id: d.id, reason: r?.reason ?? '未知原因' })
+              } catch (error) {
+                dirErrors.push({ id: d.id, reason: String(error?.message ?? error) })
+              }
+            }
+          }
+        }
+
         for (const r of renames) {
           try {
             const teams = services.teams?.list?.({ type: 'big' }) ?? []
@@ -3207,6 +3241,9 @@ export function installApi(ctx, { warn } = {}) {
           departments: saved.values?.departments ?? next,
           renames,
           removed: removedNames,
+          // Boss 2026-11-21：新建部门自动建目录 —— 如实回报建了哪些、哪些没建成
+          ...(createdDirs.length ? { createdDirs } : {}),
+          ...(dirErrors.length ? { dirErrors } : {}),
           ...(linkWarnings.length ? { warnings: linkWarnings } : {}),
         })
         return

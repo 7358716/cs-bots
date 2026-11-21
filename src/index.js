@@ -38,6 +38,7 @@ import { loadSettings } from './settings.js'
 import { join } from 'node:path'
 import { ensureDeptSession } from './depttree.js'
 import { probeHost, formatReport } from './compat.js'
+import { withWsLock } from './ws-hierarchy.js'
 
 export const name = 'cs-bots'
 
@@ -327,11 +328,83 @@ function applyInner(ctx, config, { log, warn }) {
   }
 
   try {
-    services.room = createRoom(ctx, { stateDir: config.stateDir })
+    services.room = createRoom(ctx, {
+      stateDir: config.stateDir,
+      // 2026-11-21：让「Bot 的附加对话」也算房间成员。
+      // 不注入的话，Bot 换了主对话之后在群里发言会被拒 ROOM_NOT_MEMBER
+      // （实测：主管的主对话是 8c5bd670，实际在跑 2d997c9e，发言直接被拒）。
+      //
+      // 解析器只回 botId，不暴露 roster 的其他能力 —— room 模块不因此依赖 roster。
+      // roster 未装配（降级态）时返回 undefined ⇒ room 退回「只认 id 精确相等」。
+      resolveBotOf: (sessionId) => {
+        const r = services.roster
+        if (!r || typeof r.list !== 'function') return undefined
+        try {
+          for (const b of r.list()) {
+            if (b?.sessionId === sessionId) return b.id
+            if (Array.isArray(b?.extraSessionIds) && b.extraSessionIds.includes(sessionId)) return b.id
+          }
+        } catch { /* 解析失败：当作未知会话，room 侧按「非成员」处理 */ }
+        return undefined
+      },
+    })
     log(`[cs-bots] RoomService 就绪（stateDir=${services.room.paths?.stateDir ?? '?'}）`)
   } catch (error) {
     warn(`[cs-bots] RoomService 装配失败 → 降级（无房间/群聊）：${error?.message ?? error}`)
     services.room = undefined
+  }
+
+  // ── 主目录分组兜底登记（2026-11-21 Boss 排查出的问题）──────────────────────
+  //
+  // ## 问题是什么
+  //   Boss：「csbots 作为主目录，我本来就是让他做主目录的，你排查一下哪里出问题了」
+  //
+  //   配置没问题（`settings.botWorkspaceRoot = /home/ubuntu/.dsh/cs-bots`），
+  //   目录也建了，**但主目录从来没被登记成左侧栏分组**。
+  //   于是按 Boss 要的规则「没有部门的对话放在 bots 主目录下，未分组」——
+  //   放进去也看不见，因为那个文件夹在左侧栏根本不存在。
+  //
+  // ## 为什么之前没登记到（三个阶段叠加）
+  //   ① 2026-11-16：启动时**主动删掉**了「主目录 + 部门」的登记
+  //      （原因见上面那段注释：并发 create 导致 `workspace domain is inconsistent`，
+  //        5 个组件 pending、页面登录不了 —— 那是一个真实且严重的事故）
+  //   ② 改成「按需登记」后，只有**建 Bot**（`/bots` 的 `ensureBotHierarchy`）会登记，
+  //      而它登记的是「主目录 + 部门 + Bot」三级……
+  //   ③ 但当前部门是在**UI 里建部门**时创建的，那条路径（`/departments/save`）
+  //      当时**只写 settings 不建目录**（我 2026-11-21 才补上自动建目录），
+  //      更没有登记 —— ⇒ 主目录与部门都漏登记，只有建 Bot 时那个 Bot 自己被登记了。
+  //
+  //   证据：`workspace.json` 里有 3 条（两个 Bot 目录 + 部门目录），**没有主目录**。
+  //   部门那条还是我 2026-11-21 手工补的。
+  //
+  // ## 为什么现在敢在启动时登记（不会重演 11-16 事故）
+  //   当年的事故根因是「**并发** 对 14 个 Bot 逐个 attachSession」，在 workspace 域
+  //   初始化期间把同一路径登记两次。这次：
+  //     · 只登记 **1 个**路径（主目录本身），不循环
+  //     · **不挂任何 session**（只建分组容器）
+  //     · 走 `ctx.inject('workspaceRegistry')` 等域**真正就绪**再动手（不是定时器猜）
+  //     · 走 `withWsLock` 全局串行锁，和「重建分组」按钮同一把锁
+  //     · 磁盘优先判重（`ensureWorkspaceDir` 内部读 workspace.json）
+  //     · 失败只 warn，绝不影响插件其他功能和启动
+  //   ⇒ 幂等、串行、单次、可降级。满足 11-16 事故后定下的全部约束。
+  try {
+    ctx.inject(['workspaceRegistry'], () => {
+      const root = String(settings.botWorkspaceRoot ?? '').trim()
+      if (!root) {
+        log('[cs-bots] 未设置主目录 ⇒ 不登记主目录分组（按需登记）')
+        return
+      }
+      void withWsLock(() => ensureWorkspaceDir(ctx, root, 'cs-bots'))
+        .then((r) => {
+          if (r?.ok) log(`[cs-bots] 主目录分组已就绪（cs-bots → ${root}${r.created ? '，本次新建' : '，已存在'}）`)
+          else warn(`[cs-bots] 主目录分组登记失败（不影响使用）：${r?.reason ?? '未知原因'}`)
+        })
+        .catch((error) => {
+          warn(`[cs-bots] 主目录分组登记异常（不影响使用）：${error?.message ?? error}`)
+        })
+    })
+  } catch (error) {
+    warn(`[cs-bots] 主目录分组登记不可用：${error?.message ?? error}`)
   }
 
   try {

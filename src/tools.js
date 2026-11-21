@@ -42,11 +42,23 @@ function callerOf(exec) {
   return exec?.agent?.id ?? exec?.agent?.session?.id ?? 'unknown'
 }
 
-/** 从唤醒去重键反推任务 id：`task-assigned:t-3` / `task-unblocked:t-3` / `tasks-assigned:t-3`。 */
+/**
+ * 从唤醒去重键反推任务 id。
+ *
+ * 支持两种 id 格式（2026-11-21 编号改版后必须都认，否则新任务反推不到）：
+ *   - 老格式 `t-3`             → `task-assigned:t-3` / `task-unblocked:t-3` / `tasks-assigned:t-3`
+ *   - 新格式 `Ts-202611001` 等  → `task-assigned:Ts-202611001`
+ * 另外兼容平台内部实际发出的 `task-assigned:<id>:<rev>`（带 rev 后缀）。
+ *
+ * ⚠️ 原来的正则写死 `t-\d+`，编号改版后**新任务一律反推失败** ⇒ 唤醒拿不到路由 hint，
+ *    复杂档位/付费授权都跟着丢。这是真实缺陷，不只是测试断言过时。
+ */
 function taskIdFromDedup(dedupKey) {
   if (typeof dedupKey !== 'string') return undefined
-  const m = /^tasks?-(?:assigned|unblocked):(t-\d+)$/.exec(dedupKey.trim())
-  return m ? m[1] : undefined
+  const m = /^tasks?-(?:assigned|unblocked):((?:t|Ts|Ai|X)-\d+(?::\d+)?)$/.exec(dedupKey.trim())
+  if (!m) return undefined
+  // 去掉可选的 `:<rev>` 尾巴
+  return m[1].replace(/:\d+$/, '')
 }
 
 /**

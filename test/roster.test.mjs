@@ -16,7 +16,7 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync, readFileSync, existsSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync, readFileSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 
@@ -332,6 +332,38 @@ test('retire：不存在 / 缺 byId 抛错；setCwd / claim 对退役 Bot 一律
     (e) => e instanceof RosterError && e.code === 'ROSTER_RETIRED')
   assert.throws(() => roster.claim({ id: bot.id, owner: 'x', expectedRev: retired.rev }),
     (e) => e instanceof RosterError && e.code === 'ROSTER_RETIRED')
+})
+
+test('★0.20.18 setCwd 同样放行「配置主目录的真子目录」（与 create 同口径）', async (t) => {
+  // 2026-11-21 实测缺陷：create 已放行，但 setCwd 仍用不带 allowRoot 的老判定 ⇒
+  // 改 Bot 目录到 <主目录>/<部门> 一律被 ROSTER_CWD_IN_DSH_HOME 拒，跨部门搬迁不可用。
+  const root = mkdtempSync(join(tmpdir(), 'csb-setcwd-'))
+  const home = join(root, 'home')
+  const botsRoot = join(home, 'cs-bots')
+  mkdirSync(botsRoot, { recursive: true })
+  const stateDir = join(root, 'state')
+  process.env.DSH_HOME = home
+  // 必须给 agents 服务替身：create 会真的去建会话
+  const ctx = {
+    logger: { info() {}, warn() {} },
+    get: (k) => k === 'agents' ? {
+      async create(req) { return { id: req.sessionId, sessionId: req.sessionId } },
+      get: () => undefined,
+      list: () => [],
+    } : undefined,
+  }
+  const roster = createRoster(ctx, { stateDir, botsRoot })
+  t.after(() => { delete process.env.DSH_HOME; rmSync(root, { recursive: true, force: true }) })
+
+  const bot = await roster.create({ name: 'alpha', cwd: join(botsRoot, 'dev', 'alpha'), byId: 'lead' })
+  const moved = roster.setCwd({ id: bot.id, cwd: join(botsRoot, 'qa'), expectedRev: bot.rev, byId: 'lead' })
+  assert.ok(String(moved.cwd).startsWith(join(botsRoot, 'qa')), `应允许改到主目录内，实际 ${moved.cwd}`)
+
+  // 边界不变：主目录自身 / $DSH_HOME 自身 仍拒绝
+  assert.throws(() => roster.setCwd({ id: bot.id, cwd: botsRoot, expectedRev: moved.rev, byId: 'lead' }),
+    (e) => e.code === 'ROSTER_CWD_IN_DSH_HOME')
+  assert.throws(() => roster.setCwd({ id: bot.id, cwd: home, expectedRev: moved.rev, byId: 'lead' }),
+    (e) => e.code === 'ROSTER_CWD_IN_DSH_HOME')
 })
 
 // ── 6. setCwd ────────────────────────────────────────────────────────────────

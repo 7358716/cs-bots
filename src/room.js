@@ -1803,14 +1803,57 @@ export function createRoom(ctx, config = {}) {
   // ── API：消息 ──────────────────────────────────────────────────────────────
 
   /**
+   * 「这个会话是否等同于房间成员 `member`」—— 把 **Bot 的附加对话**也算进去。
+   *
+   * ## 为什么需要（2026-11-21 实测踩到）
+   *
+   *   房间成员登记的是**建房间当时**那个 `sessionId`。Bot 后来换了主对话
+   *   （或同一岗位起了第二个对话），新会话 id 不在 `room.members` 里 ⇒ 发言被拒
+   *   `ROOM_NOT_MEMBER`，而这个人（这个 Bot）明明就在房间里。
+   *
+   *   实测现场：部门群聊登记 `session-8c5bd670…`，但实际在跑的是 `session-2d997c9e…`，
+   *   主管想在部门群说话直接被拒。
+   *
+   * ## 判定口径
+   *
+   *   1. 完全相等 ⇒ 是（原路径，零成本）
+   *   2. `member` 是某个 Bot 的主对话，且 `sender` 是该 Bot 的附加对话（或反之）⇒ 是
+   *   3. 通过注入的 `resolveBotOf(sessionId)` 判定；拿不到解析器就只认 1（降级不误判）
+   *
+   * ⚠️ **只放宽「是不是成员」，不放宽 `admin` 模式的发言权**：
+   *   附加对话可以说话，但不能代管理员改房间设置（`mode==='admin'` 那条仍按 id 严判）。
+   *
+   * @param {object} room
+   * @param {string} sender
+   * @returns {boolean}
+   */
+  function isEffectiveMember(room, sender) {
+    if (room.members.includes(sender)) return true
+    const resolve = config.resolveBotOf
+    if (typeof resolve !== 'function') return false
+    try {
+      // sender 所属的 Bot，与房间成员里某个 id 所属的 Bot 是同一个 ⇒ 视为成员
+      const mine = resolve(sender)
+      if (!mine) return false
+      for (const m of room.members) {
+        const theirs = resolve(m)
+        if (theirs && theirs === mine) return true
+      }
+    } catch { /* 解析失败按「不是成员」处理，保持拒绝语义 */ }
+    return false
+  }
+
+  /**
    * 发言权校验。
    *
    * 规则（见文件头「`mode` 的语义」）：`'user'` 永远可发言；其余必须是成员；
    * `mode:'admin'` 时只有 `adminId` 能发言。**任何一条不满足都抛错，不静默接受。**
+   *
+   * 2026-11-21：成员判定改走 `isEffectiveMember`（含 Bot 附加对话）。
    */
   function assertCanPost(room, sender) {
     if (sender === USER) return
-    if (!room.members.includes(sender)) {
+    if (!isEffectiveMember(room, sender)) {
       throw new RoomError(
         `room.post：${sender} 不是房间 ${room.id} 的成员（房间共 ${room.members.length} 名成员）`
         + ' —— 非成员发言被拒，绝不静默接受',

@@ -191,10 +191,53 @@ function clone(value) {
   return JSON.parse(JSON.stringify(value))
 }
 
-/** 取 `t-<n>` 里的 n；非本格式返回 0。 */
+/**
+ * 解析任务 id。
+ *
+ * 同时认**两种格式**：
+ *   - 老格式 `t-<n>`（`t-1`~`t-53`）—— 存量，永不再产生新号
+ *   - 新格式 `<前缀>-<YYYYMM><NNN>`（`Ts-202611001` / `Ai-202611003` / `X-202611001`）
+ *
+ * @param {string} id
+ * @returns {{ legacy: true, n: number } | { legacy: false, prefix: string, ym: string, seq: number } | null}
+ */
+function parseTaskId(id) {
+  const raw = String(id ?? '')
+  const mOld = /^t-(\d+)$/.exec(raw)
+  if (mOld) return { legacy: true, n: Number(mOld[1]) }
+  const mNew = /^(Ts|Ai|X)-(\d{6})(\d{3,})$/.exec(raw)
+  if (mNew) return { legacy: false, prefix: mNew[1], ym: mNew[2], seq: Number(mNew[3]) }
+  return null
+}
+
+/**
+ * 取任务 id 的序号（跨格式的粗粒度量）。
+ *
+ * ⚠️ 只用于「跳过已被占用的号」这类穷举兜底，**不用于跨格式比较**：
+ *   老格式的 7 和新格式的 7 毫无关系。按 (前缀,年月) 分桶请看 `parseTaskId`。
+ *
+ * @param {string} id
+ * @returns {number}
+ */
 function idNumber(id) {
-  const m = /^t-(\d+)$/.exec(String(id ?? ''))
-  return m ? Number(m[1]) : 0
+  const p = parseTaskId(id)
+  if (!p) return 0
+  return p.legacy ? p.n : p.seq
+}
+
+/**
+ * 取任务 id 的**计数桶键**：老格式统一归 `legacy`，新格式按 `前缀:年月` 分桶。
+ *
+ * 为什么要分桶：`Ts-202611001` 和 `Ai-202611001` 的前缀不同、
+ * `Ts-202611001` 和 `Ts-202612001` 的年月不同 —— 三类 × 各月都各有自己的水位线。
+ *
+ * @param {string} id
+ * @returns {string} 例如 `Ts:202611` / `legacy` / `''`（认得时）
+ */
+function idBucketOf(id) {
+  const p = parseTaskId(id)
+  if (!p) return ''
+  return p.legacy ? 'legacy' : `${p.prefix}:${p.ym}`
 }
 
 /** 非空字符串字段校验。 */
@@ -375,6 +418,80 @@ function normalizeRequiresPaid(value, where) {
  * 拼错的值会永久留在事件流里，之后所有按渠道统计都是错的。
  */
 const TASK_CHANNELS = Object.freeze(['user', 'session', 'external'])
+
+/**
+ * 任务编号规则 —— **前缀 + 年月 + 三位顺序号**（Boss 2026-11-21 15:34 决策）。
+ *
+ * ## Boss 原话
+ *   「任务编号是年份+月份+三位顺序号，例如 Ai-202611001，
+ *     用户创建是 Ts-，智能体任务前缀是 Ai，其他的暂定 X，后续可扩展」
+ *
+ * ## 格式
+ *   `<前缀>-<YYYYMM><NNN>`，例如 `Ts-202611001`（2026 年 11 月第 1 号用户任务）
+ *
+ * ## 三类前缀（可扩展）
+ *   - `Ts` 用户（Boss/页面手工建）
+ *   - `Ai` 智能体（Bot 自建）
+ *   - `X`  其他引入（导入/桥接/外部系统），**暂定**，后续可扩展成 `X-` 之外的具体前缀
+ *
+ * ## 为什么带年月
+ *   按月分段后，「这个月干了多少任务」直接从编号就能读出来，
+ *   而且跨月自动重新计数，不会出现 `t-5327` 这种吓人的大数字。
+ *
+ * ## 顺序号的语义
+ *   **按 (前缀, 年月) 各自计数**，每月从 001 起。
+ *   `Ts-202611003` 就是「2026 年 11 月第 3 个用户任务」——
+ *   注意它**不等于**全局第 3 个任务，因为 Ai- 和 X- 各自独立计数。
+ *
+ * ## 存量兼容（重要）
+ *   老数据是 `t-1`~`t-53`，**绝不改号**（改号会断掉所有引用，且事件流里全是旧号）。
+ *   新旧两套格式并存：老号按原样显示，新号按新规则分配。
+ *   判定一个任务属于哪类，**看它的 `source`/`channel` 字段，不要靠解析编号**。
+ */
+const TASK_ID_PREFIX = Object.freeze({ human: 'Ts', ai: 'Ai', external: 'X' })
+
+/** 顺序号位数（三位，超 999 自然进位成四位，不截断）。 */
+const TASK_SEQ_DIGITS = 3
+
+/**
+ * 由来源推出编号前缀。
+ *
+ * 为什么不直接看 `source`：`source` 只有 human/ai 两个值，而「外部引入」是第三类。
+ * 它落在 `channel === 'external'` 上（该值一直在 `TASK_CHANNELS` 里，此前没有生产方）。
+ * ⇒ 判定顺序：先看 channel 是否 external，再看 source。
+ *
+ * @param {'human'|'ai'} source
+ * @param {'user'|'session'|'external'} channel
+ * @returns {'Ts'|'Ai'|'X'}
+ */
+function taskIdPrefixFor(source, channel) {
+  if (channel === 'external') return TASK_ID_PREFIX.external
+  return source === 'human' ? TASK_ID_PREFIX.human : TASK_ID_PREFIX.ai
+}
+
+/**
+ * 取某个时间点的年月段 `YYYYMM`（**本地时区**，与 Boss 看日期的习惯一致）。
+ *
+ * @param {number} at epoch ms
+ * @returns {string} 例如 `202611`
+ */
+function yearMonthOf(at) {
+  const d = new Date(at)
+  const y = d.getFullYear()
+  const m = d.getMonth() + 1
+  return `${y}${String(m).padStart(2, '0')}`
+}
+
+/**
+ * 拼出完整任务编号。
+ * @param {'Ts'|'Ai'|'X'} prefix
+ * @param {string} ym `YYYYMM`
+ * @param {number} seq 顺序号（从 1 起）
+ * @returns {string} 例如 `Ai-202611001`
+ */
+function formatTaskId(prefix, ym, seq) {
+  return `${prefix}-${ym}${String(seq).padStart(TASK_SEQ_DIGITS, '0')}`
+}
 
 /** 归一 `source`：显式给了就只接受 human/ai；没给就按 byId 推断（人是 ui/user/person）。 */
 function normalizeSource(value, byId, where) {
@@ -738,7 +855,17 @@ export function createBoard(ctx, config = {}) {
   /** 已 warn 过的缺失依赖 id（防刷屏） */
   const warnedMissingDeps = new Set()
 
-  let idCounter = 0
+  /**
+   * 任务编号水位线 —— **按 `<前缀>:<YYYYMM>` 分桶**（Boss 2026-11-21 15:34 决策）。
+   *
+   * 桶键示例：`Ts:202611` / `Ai:202611` / `X:202611` / `legacy`（老 `t-<n>`）。
+   * 每个桶各自从 1 起，所以「每月每类」都是 001 开头，不会互相推进。
+   *
+   * ⚠️ `legacy` 桶只读：老格式不再产生新号，它存在的唯一目的是**遇到 `t-<n>` 时知道
+   * 已经用到几号**，避免穷举兜底时误判。
+   * @type {Map<string, number>}
+   */
+  const idCounters = new Map()
 
   const diagnostics = {
     stateDir,
@@ -756,11 +883,30 @@ export function createBoard(ctx, config = {}) {
 
   // ── 持久化 ────────────────────────────────────────────────────────────────
 
+  /**
+   * 把某个任务 id 的序号计入对应前缀的水位线。
+   *
+   * 为什么回放/恢复时逐条调用而不是取整体 max：
+   *   三类前缀各自独立计数。`t-53` 不该把 `a` 的水位线推到 53，
+   *   否则「智能体的第一个任务」会莫名其妙叫 `a-54`。
+   *
+   * @param {string} id
+   */
+  function bumpCounter(id) {
+    const bucket = idBucketOf(id)
+    if (!bucket) return
+    const n = idNumber(id)
+    if (Number.isFinite(n) && n > (idCounters.get(bucket) ?? 0)) idCounters.set(bucket, n)
+  }
+
   /** 快照内容（落盘形态）。 */
   const snapshot = () => ({
     version: 1,
     savedAt: Date.now(),
-    idCounter,
+    // 老格式水位线仍写成数字 `idCounter`（存 legacy 桶）——老版本插件只认这个，
+    // 写成对象会让它算不出水位线。新格式各桶在 `idCounters` 里。
+    idCounter: idCounters.get('legacy') ?? 0,
+    idCounters: Object.fromEntries(idCounters),
     tasks: [...tasks.values()],
   })
 
@@ -871,7 +1017,7 @@ export function createBoard(ctx, config = {}) {
     sourceSeqIndex.clear()
     idem.keys.clear()
     warnedMissingDeps.clear()
-    idCounter = 0
+    idCounters.clear()
 
     const { rows, bad } = readJsonl(jsonlPath)
     diagnostics.badLines = bad
@@ -889,10 +1035,17 @@ export function createBoard(ctx, config = {}) {
           const t = clone(raw)
           normalizeLegacyTask(t)
           tasks.set(t.id, t)
-          idCounter = Math.max(idCounter, idNumber(t.id))
+          bumpCounter(t.id)
           if (t.sourceSeq) sourceSeqIndex.set(t.sourceSeq, t.id)
         }
-        if (Number.isFinite(snap?.idCounter)) idCounter = Math.max(idCounter, snap.idCounter)
+        // 新格式优先（分桶对象）；老快照只有数字 idCounter，归到 legacy 桶。
+        if (snap?.idCounters && typeof snap.idCounters === 'object') {
+          for (const [k, v] of Object.entries(snap.idCounters)) {
+            if (Number.isFinite(v) && v > (idCounters.get(k) ?? 0)) idCounters.set(k, v)
+          }
+        } else if (Number.isFinite(snap?.idCounter)) {
+          idCounters.set('legacy', Math.max(idCounters.get('legacy') ?? 0, snap.idCounter))
+        }
         idem.rebuildFrom([...sourceSeqIndex.keys()].map((k) => ({ dedupKey: k })), 'dedupKey')
         diagnostics.hydratedFrom = 'snapshot'
         info(`[cs-bots/board] 回放完成：无事件流 → 由快照恢复 ${tasks.size} 个任务`)
@@ -912,12 +1065,8 @@ export function createBoard(ctx, config = {}) {
     // 所以：**凡是出现在事件流里的 taskId，无论该事件是否被应用，都要计入水位。**
     for (const ev of rows) {
       if (!ev || typeof ev.taskId !== 'string') continue
-      const n = idNumber(ev.taskId)
-      if (Number.isFinite(n) && n > idCounter) idCounter = n
-      if (ev.after && typeof ev.after.id === 'string') {
-        const n2 = idNumber(ev.after.id)
-        if (Number.isFinite(n2) && n2 > idCounter) idCounter = n2
-      }
+      bumpCounter(ev.taskId)
+      if (ev.after && typeof ev.after.id === 'string') bumpCounter(ev.after.id)
     }
 
     // 事件流是真相源：只接受 rev 递增的事件（同 rev 重放幂等，容忍重复投递）
@@ -936,7 +1085,7 @@ export function createBoard(ctx, config = {}) {
       normalizeLegacyTask(t)
       tasks.set(ev.taskId, t)
       events.push(clone(ev))
-      idCounter = Math.max(idCounter, idNumber(ev.taskId))
+      bumpCounter(ev.taskId)
       // 老数据没有 channel（本字段 2026-11-12 才有）：回放时按 source 补默认值，
       // 保证「读侧永远非空」，而不是让 UI 到处判空。
       if (t && t.channel === undefined) t.channel = t.source === 'human' ? 'user' : 'session'
@@ -1212,15 +1361,20 @@ export function createBoard(ctx, config = {}) {
     }
 
     const at = normalizeNow(now, 'create')
-    // ── id 分配的兜底（2026-11-09）────────────────────────────────────────────
-    // 主口径是 `idCounter + 1`，但内存计数器与事件流可能被**外部写入者**拉开距离
-    // （例如脚本/另一个进程直接往 board.jsonl 追加）。此时分配到的 id 会在重启回放时
-    // 被 `ev.rev <= before.rev` 判成「重复投递」而跳过 ⇒ 任务凭空消失（静默覆盖）。
+    // ── id 分配：`<前缀>-<YYYYMM><NNN>`（Boss 2026-11-21 15:34 决策）──────────
+    //
+    // 主口径是「该 (前缀,年月) 桶的水位线 + 1」，但内存计数器与事件流可能被
+    // **外部写入者**拉开距离（例如脚本/另一个进程直接往 board.jsonl 追加）。
+    // 此时分配到的 id 会在重启回放时被 `ev.rev <= before.rev` 判成「重复投递」而跳过
+    // ⇒ 任务凭空消失（静默覆盖）。
     // 这里加一道极便宜的兜底：**跳过任何已存在于当前任务表的 id**。
     // 它不解决「多写者」这个根问题（那需要文件锁），但保证不会撞到**已知**的 id。
-    let nextCounter = idCounter + 1
-    while (tasks.has(`t-${nextCounter}`)) nextCounter += 1
-    const taskId = `t-${nextCounter}`
+    const prefix = taskIdPrefixFor(src, chan)
+    const ym = yearMonthOf(at)
+    const bucket = `${prefix}:${ym}`
+    let nextSeq = (idCounters.get(bucket) ?? 0) + 1
+    while (tasks.has(formatTaskId(prefix, ym, nextSeq))) nextSeq += 1
+    const taskId = formatTaskId(prefix, ym, nextSeq)
     assertDependencyGraph(taskId, deps)
 
     /** @type {Record<string, unknown>} */
@@ -1256,12 +1410,21 @@ export function createBoard(ctx, config = {}) {
     if (mandateNorm !== undefined) task.mandate = mandateNorm
     else task.mandate = { sender: by } // 事实留痕：谁建的（`byId`），不是判断
 
-    idCounter = nextCounter
+    idCounters.set(bucket, nextSeq)
     try {
       const committed = commit(taskId, 'create', by, at, null, task)
       return committed
     } catch (error) {
-      idCounter = nextCounter - 1
+      // ⚠️ **不回退**（2026-11-21 修 t-32/t-33 撞号）。
+      //
+      // 原来的写法是 `idCounter = nextCounter - 1`：提交失败就把水位线退回去，
+      // 下一个任务于是复用刚失败的那个号。实测后果是真的撞了号 ——
+      //   t-32: 先是 human 的 "t1"，删除后又被 ai 的 "__idcounter_probe__" 复用
+      //   t-33: 先是 human 的 "t3"，删除后又被 ai 的 "__id_burn_33__" 复用
+      // 同号两条任务在事件流里 rev 各自递增，回放时后者会把前者判成「重复投递」跳过
+      // ⇒ 任务静默消失。
+      //
+      // 号一旦发出就作废（最多留个空洞），这是「编号永不复用」的代价，也是唯一安全的做法。
       throw error
     }
   }

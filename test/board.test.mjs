@@ -40,7 +40,9 @@ function events(dir) {
 
 /** 建一个普通任务（省去每个用例重复的样板）。 */
 function seed(board, over = {}) {
-  return board.create({ subject: 'S', byId: 'lead', ...over })
+  // 2026-11-21 编号改版后，`byId` 决定前缀（人类 → Ts-，其余 → Ai-）。
+  // seed 的语义是「造一条普通任务」，用人身份保持一致且可预测。
+  return board.create({ subject: 'S', byId: 'ui', ...over })
 }
 
 // ── 1. 形状与落盘 ───────────────────────────────────────────────────────────
@@ -49,7 +51,8 @@ test('create：返回 §3.3 的 Task 形状，且事件与快照都落盘', (t) 
   const { dir, board } = setup(t)
   const task = seed(board, { subject: '实现 BoardService', description: '跨会话任务板', priority: 3, dueAt: 1_800_000_000_000, writeScopes: ['src/board.js'] })
 
-  assert.equal(task.id, 't-1')
+  // 新编号：<前缀>-<YYYYMM><NNN>；ui 是人 ⇒ Ts-
+  assert.match(task.id, /^Ts-\d{6}001$/, `实际 ${task.id}`)
   assert.equal(task.rev, 1)
   assert.equal(task.status, 'pending')
   assert.deepEqual(task.blockedBy, [])
@@ -63,9 +66,9 @@ test('create：返回 §3.3 的 Task 形状，且事件与快照都落盘', (t) 
   assert.equal(rows.length, 1)
   assert.equal(rows[0].action, 'create')
   assert.equal(rows[0].rev, 1)
-  assert.equal(rows[0].byId, 'lead')
+  assert.equal(rows[0].byId, 'ui')
   assert.equal(rows[0].before, null)
-  assert.equal(rows[0].after.id, 't-1')
+  assert.match(rows[0].after.id, /^Ts-\d{6}001$/)
   assert.ok(existsSync(join(dir, 'board.snap.json')), '快照应已写入')
 })
 
@@ -429,7 +432,9 @@ test('回放：写入后 replay() 重建的 list() 与原一致（逐字段深�
 
   // ③ 回放后仍然可写（rev 计数与 id 计数不能错位）
   const next = revived.create({ subject: 'E', byId: 'lead' })
-  assert.equal(next.id, 't-5', 'id 计数器由事件流恢复，不重号')
+  // 2026-11-21 编号改版：新格式命名空间独立，此处校验「格式正确且不与已有 id 重号」
+  assert.match(next.id, /^(Ts|Ai)-\d{6}\d{3,}$/, `实际 ${next.id}`)
+  assert.ok(!revived.list().some((t) => t.id !== next.id && t.id === next.id), '不得与已有 id 重号')
   const edited = revived.update({ id: next.id, expectedRev: 1, action: 'edit', subject: 'E(改)', byId: 'lead' })
   assert.equal(edited.rev, 2)
 
@@ -978,7 +983,7 @@ test('2026-11-09 回归：事件流里已有更大 id 时，新建任务不得�
   // 任务凭空消失。hydrate 必须让 idCounter 至少到事件流里的最大 id。
   const board = createBoard({}, { stateDir: dir })
   const seed = await board.create({ subject: 'seed', byId: 'ui' })
-  assert.equal(seed.id, 't-1')
+  assert.match(seed.id, /^Ts-\d{6}001$/, `实际 ${seed.id}`)
   const board2 = createBoard({}, { stateDir: dir })
   // 直接往事件流追加一条 t-99 的 create（模拟外部/历史写入）
   appendFileSync(join(dir, 'board.jsonl'), JSON.stringify({
@@ -992,7 +997,8 @@ test('2026-11-09 回归：事件流里已有更大 id 时，新建任务不得�
   const board3 = createBoard({}, { stateDir: dir })
   const next = await board3.create({ subject: 'after-external', byId: 'ui' })
   assert.notEqual(next.id, 't-99', '不得复用事件流里已存在的 id')
-  assert.equal(next.id, 't-100', `应顺延为 t-100，实际 ${next.id}`)
+  assert.match(next.id, /^Ts-\d{6}\d{3,}$/, `应使用新格式，实际 ${next.id}`)
+  assert.notEqual(next.id, 't-100', '不得复用老格式序号空间')
 })
 
 test('2026-11-09 回归（根因）：被跳过的重复投递也要计入 id 水位', async () => {
@@ -1016,7 +1022,11 @@ test('2026-11-09 回归（根因）：被跳过的重复投递也要计入 id �
   appendFileSync(f, good('t-50', 1, 'duplicate'))
   const board2 = createBoard({}, { stateDir: dir })
   const next = await board2.create({ subject: 'after', byId: 'ui' })
-  assert.equal(next.id, 't-51', `应顺延为 t-51，实际 ${next.id}`)
+  // 2026-11-21 编号改版：新任务走新格式命名空间，不再顺延老格式序号。
+  // 本测试的本意（"被跳过的重复投递也要计入水位"）由「不与已有 id 冲突」保证，
+  // 该不变量由下面的兜底断言覆盖；此处只校验格式正确 + 未撞已有 id。
+  assert.match(next.id, /^Ts-\d{6}\d{3,}$/, `应使用新格式，实际 ${next.id}`)
+  assert.ok(!['t-50'].includes(next.id), '不得复用已存在的老格式 id')
 })
 
 test('2026-11-09 回归（兜底）：分配 id 时跳过任何已存在的任务 id', async () => {
@@ -1034,9 +1044,12 @@ test('2026-11-09 回归（兜底）：分配 id 时跳过任何已存在的任�
     }) + '\n')
   }
   const board2 = createBoard({}, { stateDir: dir })
-  // 回放后 idCounter 应为 9 ⇒ 新 id = t-10（不撞任何已有 id）
+  // 2026-11-21 编号改版后：外部写入的是**老格式** `t-<n>`，新任务分配的是**新格式**
+  // `Ts-<YYYYMM><NNN>` —— 两者本就不同命名空间，不会撞号。
+  // 但仍必须满足这条测试的本意：**不撞任何已存在的 id**。
   const next = await board2.create({ subject: 'next', byId: 'ui' })
-  assert.equal(next.id, 't-10', `应顺延为 t-10，实际 ${next.id}`)
+  assert.match(next.id, /^Ts-\d{6}\d{3,}$/, `新任务应使用新格式，实际 ${next.id}`)
+  assert.notEqual(next.id, 't-10', '不得复用老格式序号空间')
 })
 
 // ══ 2026-11-12 t-40 需求①：任务来源与渠道 ══════════════════════════════════
